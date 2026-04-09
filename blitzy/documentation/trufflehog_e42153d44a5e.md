@@ -407,6 +407,8 @@ The `adjustableSpanCalculator` (lines 65-111) computes a match span of ±512 byt
 
 This means that even within a 13KB chunk, a detector's regex typically only evaluates a window of ~1KB centered on each keyword occurrence — further reducing the data processed per regex invocation.
 
+> **Note:** A hidden CLI flag `--scan-entire-chunk` (default: `false`) can override span narrowing by substituting the `EntireChunkSpanCalculator` (Source: `pkg/engine/ahocorasick/ahocorasickcore.go:55-63`) in place of the default `adjustableSpanCalculator`. When enabled (Source: `pkg/engine/engine.go:523-527`, `main.go:68`), detectors receive the full chunk data rather than the ±512 byte window. Even in this mode, the **13KB chunk-size hard limit still applies**, so the maximum input to any single regex evaluation remains bounded. This flag is used primarily for debug comparison scans and is not exposed in normal operation.
+
 ### Match Permutation Cap
 
 For custom detectors with multiple regex groups, the match permutation logic is capped to prevent combinatorial explosion.
@@ -459,7 +461,7 @@ Source: `pkg/engine/engine.go` lines 330-331:
 func SetDetectorTimeout(timeout time.Duration) { detectionTimeout = timeout }
 ```
 
-The default detection timeout is `DefaultResponseTimeout = 10 * time.Second` (Source: `pkg/detectors/http.go:18`). Custom detectors explicitly check for context cancellation during processing (Source: `pkg/custom_detectors/custom_detectors.go` lines 185 and 224: `common.IsDone(ctx)`). If a detector exceeds its timeout, the context is cancelled and the detector returns immediately.
+The default detection timeout is `DefaultResponseTimeout = 10 * time.Second` (Source: `pkg/detectors/http.go:18`). This timeout primarily guards against slow HTTP verification calls (credential validation against external APIs), not regex execution — as indicated by its name (`DefaultResponseTimeout`), its definition in the HTTP module (`pkg/detectors/http.go`), and its application wrapping `verificationCache.FromData()` at `pkg/engine/engine.go:1066`. Since RE2 guarantees linear-time regex matching, regex operations do not need timeout protection; the timeout's practical value is preventing network I/O from stalling the pipeline. Custom detectors explicitly check for context cancellation during processing (Source: `pkg/custom_detectors/custom_detectors.go` lines 185 and 224: `common.IsDone(ctx)`). If a detector exceeds its timeout, the context is cancelled and the detector returns immediately.
 
 ### Worker Pool Concurrency Model
 
@@ -796,9 +798,9 @@ The chunker limits each detector invocation to at most 13KB of data (Source: `pk
 
 The Aho-Corasick prefilter (Source: `pkg/engine/ahocorasick/ahocorasickcore.go:141-168`) ensures only chunks containing relevant keywords are processed by detectors. A crafted file without the right keywords won't even trigger regex evaluation. An attacker would need to know the exact keywords for each detector they're trying to overwhelm.
 
-**4. Detector timeouts (failsafe)**
+**4. Detector timeouts (failsafe for HTTP verification)**
 
-The engine applies timeouts to detector execution via context cancellation (Source: `pkg/engine/engine.go:330-331`), with a default timeout of 10 seconds (Source: `pkg/detectors/http.go:18`). Even if a detector somehow took longer than expected (which cannot happen for regex matching under RE2), it would be terminated after the timeout period.
+The engine applies timeouts to detector execution via context cancellation (Source: `pkg/engine/engine.go:330-331`), with a default timeout of 10 seconds (Source: `pkg/detectors/http.go:18`). This timeout primarily guards against slow HTTP verification calls to external APIs rather than regex execution (which is already guaranteed linear-time by RE2). Nevertheless, it provides a general-purpose safeguard ensuring no single detector invocation can stall the pipeline indefinitely.
 
 **5. Worker pool isolation (containment)**
 
@@ -808,18 +810,30 @@ Individual slow detectors don't block the overall pipeline due to the concurrent
 
 TruffleHog's immunity to ReDoS is a direct consequence of being written in Go and using RE2-based regex engines. This immunity would NOT exist if TruffleHog were written in a language with a backtracking regex engine:
 
-| Ecosystem | Regex Engine | Algorithm | Backreferences | ReDoS Vulnerable? |
-|-----------|-------------|-----------|----------------|-------------------|
-| **Go** (`regexp`) | RE2 (Go impl) | DFA/NFA hybrid | ❌ Not supported | **No** |
-| **Go** (`wasilibs/go-re2`) | RE2 (C++ via WASM) | DFA/NFA hybrid | ❌ Not supported | **No** |
-| Python (`re`) | NFA backtracking | Recursive NFA | ✅ Supported | **Yes** |
-| JavaScript (`RegExp`) | NFA backtracking | Recursive NFA | ✅ Supported | **Yes** |
-| Java (`java.util.regex`) | NFA backtracking | Recursive NFA | ✅ Supported | **Yes** |
-| .NET (`System.Text.RegularExpressions`) | NFA backtracking | Recursive NFA | ✅ Supported | **Yes** |
-| Ruby (`Regexp`) | NFA backtracking (Oniguruma) | Recursive NFA | ✅ Supported | **Yes** |
-| PHP (PCRE) | NFA backtracking | Recursive NFA | ✅ Supported | **Yes** |
+| Ecosystem | Regex Engine | Algorithm | Backreferences | ReDoS Vulnerable (Default)? | Mitigations Available |
+|-----------|-------------|-----------|----------------|----------------------------|-----------------------|
+| **Go** (`regexp`) | RE2 (Go impl) | DFA/NFA hybrid | ❌ Not supported | **No** | N/A — immune by design |
+| **Go** (`wasilibs/go-re2`) | RE2 (C++ via WASM) | DFA/NFA hybrid | ❌ Not supported | **No** | N/A — immune by design |
+| Python (`re`) | NFA backtracking | Recursive NFA | ✅ Supported | **Yes** | None built-in¹ |
+| JavaScript (`RegExp`) | NFA backtracking | Recursive NFA | ✅ Supported | **Yes** | V8 Thompson-style engine (2020, opt-in, experimental)² |
+| Java (`java.util.regex`) | NFA backtracking | Recursive NFA | ✅ Supported | **Yes** | Bounded memoization since Java 9 (2016) — mitigates but does not eliminate³ |
+| .NET (`System.Text.RegularExpressions`) | NFA backtracking | Recursive NFA | ✅ Supported | **Yes** | `RegexOptions.NonBacktracking` since .NET 7 (2022, opt-in)⁴ |
+| Ruby (`Regexp`) | NFA backtracking (Onigmo) | Recursive NFA | ✅ Supported | **Yes** | Memoization ON BY DEFAULT since Ruby 3.2 (2022) — covers ~90% of patterns⁵ |
+| PHP (PCRE) | NFA backtracking | Recursive NFA | ✅ Supported | **Yes** | None built-in¹ |
 
-TruffleHog's choice of Go — with its RE2-based regex engines — provides inherent immunity that would not exist if the tool were written in Python, JavaScript, Java, or any other language that defaults to a backtracking regex engine.
+> **Footnotes:**
+>
+> ¹ No built-in ReDoS mitigations as of the latest stable release. Third-party libraries (e.g., `google-re2` for Python) exist but are not part of the standard library.
+>
+> ² V8's non-backtracking engine is experimental with partial pattern coverage. It is not the default engine and does not cover all regex features.
+>
+> ³ OpenJDK Java 9 (2016) added bounded memoization caching to `java.util.regex`. Academic research confirms that exponential behavior can still persist for certain pattern classes.
+>
+> ⁴ .NET 7 (2022) introduced `RegexOptions.NonBacktracking`, which uses a DFA-based engine. This must be explicitly opted into per regex instance; the default engine remains backtracking.
+>
+> ⁵ Ruby 3.2 (2022) added memoization-based ReDoS defense enabled by default for approximately 90% of patterns. Patterns using backreferences or look-around assertions are not covered and fall back to timeout-based protection.
+
+TruffleHog's choice of Go — with its RE2-based regex engines — provides inherent, unconditional immunity that does not depend on opt-in flags, partial mitigations, or per-pattern coverage. While several ecosystems have adopted ReDoS defenses since 2016, none achieves the same unconditional guarantee as RE2's architectural exclusion of backreferences.
 
 ---
 
@@ -851,7 +865,7 @@ TruffleHog's immunity to computational complexity attacks is built on three inde
 **Layer 3 — Application-Level (Safeguards):**
 
 - Match permutation cap of 100 prevents combinatorial explosion in custom detectors (Source: `pkg/custom_detectors/custom_detectors.go:23`)
-- Detector timeouts via context cancellation terminate any detector exceeding 10 seconds (Source: `pkg/engine/engine.go:330-331`, `pkg/detectors/http.go:18`)
+- Detector timeouts via context cancellation terminate any detector exceeding 10 seconds, primarily guarding against slow HTTP verification (Source: `pkg/engine/engine.go:330-331`, `pkg/detectors/http.go:18`)
 - Worker pool isolation ensures no single detector blocks the pipeline (Source: `docs/concurrency.md`)
 
 ### Recommendations
@@ -865,6 +879,20 @@ Even though TruffleHog is immune to ReDoS, the following recommendations can fur
 3. **Monitor for accidental backtracking engine imports.** While Go's standard `regexp` is also RE2-based (so there is no risk today), future contributors might inadvertently import a third-party PCRE or backtracking regex library. A CI check (e.g., `grep -rn 'pcre\|pcre2\|oniguruma' --include="*.go"`) could catch this.
 
 4. **Consider migrating remaining standard `regexp` users to `go-re2`.** The few detectors using standard `regexp` — JDBC (`pkg/detectors/jdbc/jdbc.go:8`), Azure CosmosDB (`pkg/detectors/azure_cosmosdb/azure_cosmosdb.go:13`), and Azure Entra (`pkg/detectors/azure_entra/serviceprincipal/v2/spv2.go:7`) — are already safe but could be migrated to `go-re2` for consistency and to benefit from the C++ RE2 engine's performance optimizations for complex patterns.
+
+### Scope and Limitations
+
+This analysis specifically addresses **regex-based denial of service (ReDoS)** — the class of computational complexity attacks where crafted input causes a regex engine to exhibit exponential or super-linear processing time. All conclusions, including the verdict that "a malicious actor CANNOT block CI security scans by committing crafted files," apply specifically to regex-based attacks.
+
+The following potential denial-of-service vectors against TruffleHog are **outside the scope** of this investigation and are not addressed:
+
+- **Memory exhaustion from extremely large repositories** — Processing repositories with millions of files or extremely large individual files may consume significant memory, independent of regex behavior.
+- **Disk resource consumption** — Large scan targets may require substantial temporary disk space during processing.
+- **Network-based DoS during HTTP verification calls** — Detectors that verify credentials against external APIs (the primary use case for the 10-second `DefaultResponseTimeout`) could be affected by slow or unresponsive remote servers.
+- **Linear-time resource scaling** — While each individual regex operation runs in O(n) time, scanning a repository with millions of files still requires processing each file. The total scan time scales linearly with repository size, which could be significant for very large targets.
+- **Concurrency resource pressure** — Running many concurrent TruffleHog scans simultaneously could exhaust system resources (CPU, memory, file descriptors), though this is an operational concern rather than an algorithmic vulnerability.
+
+These vectors represent distinct threat categories that would require separate analysis. The absence of their discussion in this document should not be interpreted as an assertion of immunity to all forms of denial of service.
 
 ---
 
@@ -907,8 +935,11 @@ Even though TruffleHog is immune to ReDoS, the following recommendations can fur
 | `pkg/engine/ahocorasick/ahocorasickcore.go` | 65-111 | `adjustableSpanCalculator` — keyword-relative span calculation |
 | `pkg/engine/ahocorasick/ahocorasickcore.go` | 121-136 | `Core` struct definition |
 | `pkg/engine/ahocorasick/ahocorasickcore.go` | 141-168 | `NewAhoCorasickCore()` — trie construction and detector mapping |
+| `pkg/engine/ahocorasick/ahocorasickcore.go` | 55-63 | `EntireChunkSpanCalculator` — full-chunk span strategy |
 | `pkg/engine/ahocorasick/ahocorasickcore.go` | 155 | `const defaultOffsetRadius int64 = 512` |
 | `pkg/engine/engine.go` | 37 | `var detectionTimeout = detectors.DefaultResponseTimeout` |
+| `pkg/engine/engine.go` | 523-527 | `EntireChunkSpanCalculator` activation when `scanEntireChunk` is true |
+| `main.go` | 68 | `--scan-entire-chunk` CLI flag (hidden, default: `false`) |
 | `pkg/engine/engine.go` | 144-151 | Worker multiplier fields (`DetectorWorkerMultiplier`, etc.) |
 | `pkg/engine/engine.go` | 330-331 | `SetDetectorTimeout()` — configurable detector timeout |
 | `pkg/engine/engine.go` | 343-353 | Default worker multipliers (detector=8, notification=1, verificationOverlap=1) |
