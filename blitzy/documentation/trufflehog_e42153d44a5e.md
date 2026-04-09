@@ -6,7 +6,7 @@
 
 This investigation conclusively demonstrates that TruffleHog's regex-based secret detection pipeline is immune to computational complexity attacks (ReDoS) through three independent layers of defense:
 
-1. **Engine-level immunity**: All 867 detector files import `wasilibs/go-re2` v1.9.0 (Source: `go.mod:100`), which wraps Google's RE2 C++ engine via WebAssembly. The ~25 non-detector files use Go's standard `regexp` package (Source: `go.mod:3`). **Both engines implement RE2 semantics and guarantee linear-time matching.** Neither engine supports backreferences — the root cause of ReDoS in other languages.
+1. **Engine-level immunity**: All 865 detector files import `wasilibs/go-re2` v1.9.0 (Source: `go.mod:100`), which wraps Google's RE2 C++ engine via WebAssembly. The ~25 non-detector files use Go's standard `regexp` package (Source: `go.mod:3`). **Both engines implement RE2 semantics and guarantee linear-time matching.** Neither engine supports backreferences — the root cause of ReDoS in other languages.
 
 2. **Architecture-level defense-in-depth**: Input data is bounded by chunk-size limits (10KB + 3KB peek = 13KB max per chunk, Source: `pkg/sources/chunker.go:14-18`), filtered by Aho-Corasick keyword prefiltering (Source: `pkg/engine/ahocorasick/ahocorasickcore.go:141-168`), and narrowed by span calculation (±512 bytes around keyword matches, Source: `pkg/engine/ahocorasick/ahocorasickcore.go:155`).
 
@@ -89,14 +89,14 @@ TruffleHog uses two distinct regex engines, both of which implement RE2 semantic
 
 ### Detector Engine Usage
 
-A codebase-wide audit reveals that **867 detector source files** import `wasilibs/go-re2` aliased as `regexp`:
+A codebase-wide audit reveals that **865 detector source files** import `wasilibs/go-re2` aliased as `regexp`:
 
 ```bash
 $ grep -rln 'go-re2' pkg/detectors/ --include="*.go" | wc -l
-867
+865
 ```
 
-The import pattern used across all 867 detector files is:
+The import pattern used across all 865 detector files is:
 
 ```go
 regexp "github.com/wasilibs/go-re2"
@@ -167,7 +167,7 @@ Approximately **25 non-detector Go source files** (excluding test files) use Go'
 flowchart LR
     A["`**Go Source File in TruffleHog**`"] --> B{"`Is it a detector
     implementation?`"}
-    B -->|Yes, 867 files| C["`**wasilibs/go-re2 v1.9.0**
+    B -->|Yes, 865 files| C["`**wasilibs/go-re2 v1.9.0**
     RE2 C++ via WebAssembly`"]
     B -->|No, ~25 files| D["`**Go standard regexp**
     RE2 in pure Go`"]
@@ -837,7 +837,7 @@ TruffleHog's immunity to computational complexity attacks is built on three inde
 
 **Layer 1 — Engine-Level (Fundamental Guarantee):**
 
-- All 867 detector files use `wasilibs/go-re2` v1.9.0, which wraps Google's RE2 C++ engine via WebAssembly
+- All 865 detector files use `wasilibs/go-re2` v1.9.0, which wraps Google's RE2 C++ engine via WebAssembly
 - All ~25 non-detector files use Go's standard `regexp`, which is also RE2-based
 - Both engines guarantee O(n) linear-time matching for all patterns and inputs
 - Neither engine supports backreferences — the root cause of ReDoS
