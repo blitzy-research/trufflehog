@@ -51,16 +51,15 @@ flowchart TD
     K -->|"ID ≥ 3.0 AND\nSecret ≥ 4.25"| L["Entropy-Validated\nCredentials"]
     K -.->|"Below threshold"| DROP4["❌ Dropped:\nLow entropy"]
     
-    L --> M{"Hex False Positive\nPattern Check"}
-    M -->|"Secret is NOT pure\nlowercase hex"| N["Non-Hex Credentials"]
-    M -.->|"Unverified AND matches\n[a-f0-9]{40}"| DROP5["❌ Dropped:\nLooks like git hash"]
+    L --> M{"Verification\n(optional, calls AWS STS)"}
+    M --> N{"Hex False Positive\nPattern Check"}
+    N -->|"Secret is NOT pure\nlowercase hex OR verified"| O["Non-Hex Credentials"]
+    N -.->|"Unverified AND matches\n[a-f0-9]{40}"| DROP5["❌ Dropped:\nLooks like git hash"]
     
-    N --> O{"Verification\n(optional, calls AWS STS)"}
-    O --> P{"Known False Positive\nFiltering (engine-level)"}
-    P -->|"No FP word match"| Q["Result Cleaning\n& Deduplication"]
-    P -.->|"Contains FP word\n(e.g., 'example', 'token')"| DROP6["❌ Dropped:\nKnown false positive"]
-    
-    Q --> R["✅ Reported Finding"]
+    O --> P["Result Cleaning\n& Deduplication"]
+    P --> Q{"Known False Positive\nFiltering (engine-level)"}
+    Q -->|"No FP word match"| R["✅ Reported Finding"]
+    Q -.->|"Contains FP word\n(e.g., 'example', 'token')"| DROP6["❌ Dropped:\nKnown false positive"]
     
     VOW --> |"Duplicate secret across\ndetectors → errOverlap"| S["Result with\nverification disabled"]
     VOW --> |"Unique to one detector\n→ normal path"| H
@@ -86,9 +85,10 @@ flowchart TD
 | Verification Overlap Check | Routes multi-detector chunks to safety worker | `pkg/engine/engine.go`, line 796 |
 | Regex Extraction | Detector-specific ID and secret patterns | `pkg/detectors/aws/access_keys/accesskey.go`, line 65; `pkg/detectors/aws/common.go`, line 10 |
 | Shannon Entropy Filtering | ID ≥ 3.0, Secret ≥ 4.25 | `pkg/detectors/aws/common.go`, lines 6–7 |
-| Hex FP Pattern | Rejects unverified secrets matching `[a-f0-9]{40}` | `pkg/detectors/aws/utils.go`, line 47 |
-| Known FP Filtering | Aho-Corasick trie from 4 word lists + DefaultFalsePositives map | `pkg/detectors/falsepositives.go`, lines 17–19, 32–67, 85–109 |
-| Result Cleaning | Deduplication preferring verified results | `pkg/detectors/aws/utils.go`, lines 89–114 |
+| Verification | Calls AWS STS `GetCallerIdentity` to confirm credential validity | `pkg/detectors/aws/access_keys/accesskey.go`, lines 185–200 |
+| Hex FP Pattern | Rejects unverified secrets matching `[a-f0-9]{40}` (runs after verification) | `pkg/detectors/aws/utils.go`, line 47; `pkg/detectors/aws/access_keys/accesskey.go`, lines 202–205 |
+| Result Cleaning | Deduplication preferring verified results (runs before FP filtering) | `pkg/detectors/aws/utils.go`, lines 89–114; `pkg/engine/engine.go`, line 1138 |
+| Known FP Filtering | Aho-Corasick trie from 4 word lists + DefaultFalsePositives map (runs after cleaning) | `pkg/detectors/falsepositives.go`, lines 17–19, 32–67, 85–109; `pkg/engine/engine.go`, line 1142 |
 
 ---
 
@@ -96,11 +96,11 @@ flowchart TD
 
 ### Thinking / Rationale
 
-To understand why the same AWS credential pattern might be detected in one file but missed in another, the investigation traced the complete detection pipeline from chunk ingestion through every filtering stage. The key insight is that TruffleHog's pipeline has **six distinct filtering layers**, and a credential must survive ALL of them to produce a finding. Each layer is deterministic — the same input always produces the same output — so the "inconsistency" across files is actually consistent behavior: different file contexts cause credentials to fail at different pipeline stages.
+To understand why the same AWS credential pattern might be detected in one file but missed in another, the investigation traced the complete detection pipeline from chunk ingestion through every filtering stage. The key insight is that TruffleHog's pipeline has **seven distinct filtering layers**, and a credential must survive ALL of them to produce a finding. Each layer is deterministic — the same input always produces the same output — so the "inconsistency" across files is actually consistent behavior: different file contexts cause credentials to fail at different pipeline stages.
 
-### The Six-Layer Detection Gauntlet
+### The Seven-Layer Detection Gauntlet
 
-TruffleHog's AWS access key detection pipeline applies six filtering stages sequentially. A credential must pass **every single layer** to be reported. Failure at any one layer means silent non-detection.
+TruffleHog's AWS access key detection pipeline applies seven filtering stages sequentially. A credential must pass **every single layer** to be reported. Failure at any one layer means silent non-detection.
 
 #### Layer 1: Aho-Corasick Keyword Prefiltering
 
@@ -141,7 +141,7 @@ const defaultOffsetRadius int64 = 512
 The detector applies two regex patterns to extract candidate credential components:
 
 **Access Key ID Pattern:**
-```
+```text
 \b((?:AKIA|ABIA|ACCA)[A-Z0-9]{16})\b
 ```
 *Source: `pkg/detectors/aws/access_keys/accesskey.go`, line 65*
@@ -152,7 +152,7 @@ Requirements:
 - **Only uppercase letters and digits** are allowed after the prefix — mixed-case IDs like `AKIAs9L8MS5iPHTZPPUQ` will **not** match because lowercase letters fail the `[A-Z0-9]{16}` character class
 
 **Secret Key Pattern:**
-```
+```text
 (?:[^A-Za-z0-9+/]|\A)([A-Za-z0-9+/]{40})(?:[^A-Za-z0-9+/]|\z)
 ```
 *Source: `pkg/detectors/aws/common.go`, line 10*
@@ -209,9 +209,27 @@ if detectors.StringShannonEntropy(secretMatch) < aws.RequiredSecretEntropy {
 ```
 *Source: `pkg/detectors/aws/access_keys/accesskey.go`, lines 132–133*
 
-#### Layer 4: Hex False Positive Pattern
+#### Layer 4: Verification (AWS STS Call)
 
-If a result is **unverified** and its secret matches the pattern `[a-f0-9]{40}` (looks like a git SHA-1 hash), it is dropped:
+If `verify=true`, the detector calls AWS STS `GetCallerIdentity` to confirm the credential is a real, active AWS key:
+
+```go
+if verify && !isCanary {
+    isVerified, extraData, verificationErr := s.verifyMatch(ctx, idMatch, secretMatch, len(secretMatches) > 1)
+    s1.Verified = isVerified
+    // ...
+    s1.SetVerificationError(verificationErr, secretMatch)
+}
+```
+*Source: `pkg/detectors/aws/access_keys/accesskey.go`, lines 185–200*
+
+Verification sets `s1.Verified = true` if the credential is valid. This status is used by the **next** layer (Hex FP check) to decide whether to filter the result — verified results are never dropped by the Hex FP check.
+
+**Important:** Verification is optional. When running with `--no-verification`, this layer is skipped and all results remain unverified, making them subject to the Hex FP filter in Layer 5.
+
+#### Layer 5: Hex False Positive Pattern
+
+If a result is **unverified** and its secret matches the pattern `[a-f0-9]{40}` (looks like a git SHA-1 hash), it is dropped. This check runs **after** verification so that verified credentials are preserved even if they happen to be pure lowercase hex:
 
 ```go
 var FalsePositiveSecretPat = regexp.MustCompile(`[a-f0-9]{40}`)
@@ -226,11 +244,51 @@ if !s1.Verified && aws.FalsePositiveSecretPat.MatchString(secretMatch) {
 ```
 *Source: `pkg/detectors/aws/access_keys/accesskey.go`, lines 202–205*
 
-This specifically targets the 40-character overlap between the AWS secret key pattern and git commit hashes.
+This specifically targets the 40-character overlap between the AWS secret key pattern and git commit hashes. The `!s1.Verified` guard ensures that a real AWS secret key that happens to consist of lowercase hex characters is not incorrectly filtered if verification confirmed it.
 
-#### Layer 5: Known False Positive Filtering (Engine-Level)
+#### Layer 6: Result Cleaning & Deduplication
 
-After detection, the engine's `filterResults()` function applies additional false positive filtering:
+In the engine's `filterResults()` function, `CleanResults()` runs **first** — before false positive filtering. It keeps at most one result per redacted ID, preferring verified results:
+
+```go
+if e.filterUnverified || ignoreConfig {
+    results = clean(results)
+}
+```
+*Source: `pkg/engine/engine.go`, lines 1137–1138*
+
+The AWS detector implements `CustomResultsCleaner` with `ShouldCleanResultsIrrespectiveOfConfiguration()` returning `true`, which means `CleanResults` always runs for AWS results regardless of the `--filter-unverified` flag:
+
+```go
+func (s scanner) ShouldCleanResultsIrrespectiveOfConfiguration() bool {
+    return true
+}
+```
+*Source: `pkg/detectors/aws/access_keys/accesskey.go`, line 218*
+
+The cleaning logic deduplicates by redacted ID:
+
+```go
+func CleanResults(results []detectors.Result) []detectors.Result {
+    // ...
+    idResults := map[string]detectors.Result{}
+    for _, result := range results {
+        if result.Verified {
+            idResults[result.Redacted] = result
+            continue
+        }
+        if _, exist := idResults[result.Redacted]; !exist {
+            idResults[result.Redacted] = result
+        }
+    }
+    // ...
+}
+```
+*Source: `pkg/detectors/aws/utils.go`, lines 89–114*
+
+#### Layer 7: Known False Positive Filtering (Engine-Level)
+
+After result cleaning, the engine applies known false positive filtering:
 
 ```go
 if !e.retainFalsePositives {
@@ -255,7 +313,7 @@ This checks against two data sources:
    - `fp_programmingbooks.txt` — programming book title words
    - `fp_uuids.txt` — known false positive UUID strings
    
-   *Source: `pkg/detectors/falsepositives.go`, lines 32–61*
+   *Source: `pkg/detectors/falsepositives.go`, lines 32–67*
 
 The check is case-insensitive and uses **substring matching** — if the lowercased raw value contains any of these terms, it is flagged:
 
@@ -285,28 +343,6 @@ if e.filterEntropy != 0 {
 ```
 *Source: `pkg/engine/engine.go`, lines 1145–1147*
 
-#### Layer 6: Result Deduplication / Cleaning
-
-`CleanResults()` keeps at most one result per redacted ID, preferring verified results:
-
-```go
-func CleanResults(results []detectors.Result) []detectors.Result {
-    // ...
-    idResults := map[string]detectors.Result{}
-    for _, result := range results {
-        if result.Verified {
-            idResults[result.Redacted] = result
-            continue
-        }
-        if _, exist := idResults[result.Redacted]; !exist {
-            idResults[result.Redacted] = result
-        }
-    }
-    // ...
-}
-```
-*Source: `pkg/detectors/aws/utils.go`, lines 89–114*
-
 ### Why Results Are Deterministic
 
 The detection pipeline is **entirely deterministic** — no randomness is involved anywhere:
@@ -324,56 +360,64 @@ The only variable factor is chunk boundaries: how the source is decomposed into 
 
 #### Example 1: Detected — Credential Passes All Layers
 
-Consider a file `config.env` containing:
-```
-AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE
-AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+Consider a file `config.env` containing a credential with high-entropy random characters and no false positive trigger words:
+```ini
+AWS_ACCESS_KEY_ID=AKIAZ3MRHLLKZZ4GZN5Q
+AWS_SECRET_ACCESS_KEY=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
 ```
 
 **Layer 1 — Keyword Prefilter:** The chunk contains `AKIA` → keyword match found ✓
 
 **Layer 2 — Regex Matching:**
-- ID: `AKIAIOSFODNN7EXAMPLE` → matches `\b(AKIA[A-Z0-9]{16})\b` (4 prefix + 16 uppercase alphanumeric = 20 chars) ✓
-- Secret: `wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY` → 40 characters from `[A-Za-z0-9+/]` with `=` boundary on left side ✓
+- ID: `AKIAZ3MRHLLKZZ4GZN5Q` → matches `\b(AKIA[A-Z0-9]{16})\b` (4 prefix + 16 uppercase alphanumeric = 20 chars) ✓
+- Secret: `wJalrXUtnFEMI/K7MDENG/bPxRfiCYzQ9h2jL4W5` → 40 characters from `[A-Za-z0-9+/]` with `=` boundary on left side ✓
 
 **Layer 3 — Entropy Filtering:**
 
-*ID entropy calculation for `AKIAIOSFODNN7EXAMPLE`:*
+*ID entropy calculation for `AKIAZ3MRHLLKZZ4GZN5Q`:*
 
 | Character | Count | Probability (p) | p × log₂(p) |
 |-----------|-------|-----------------|--------------|
-| 7 | 1 | 1/20 = 0.0500 | −0.216096 |
-| A | 3 | 3/20 = 0.1500 | −0.410545 |
-| D | 1 | 1/20 = 0.0500 | −0.216096 |
-| E | 2 | 2/20 = 0.1000 | −0.332193 |
-| F | 1 | 1/20 = 0.0500 | −0.216096 |
-| I | 2 | 2/20 = 0.1000 | −0.332193 |
-| K | 1 | 1/20 = 0.0500 | −0.216096 |
-| L | 1 | 1/20 = 0.0500 | −0.216096 |
+| 3 | 1 | 1/20 = 0.0500 | −0.216096 |
+| 4 | 1 | 1/20 = 0.0500 | −0.216096 |
+| 5 | 1 | 1/20 = 0.0500 | −0.216096 |
+| A | 2 | 2/20 = 0.1000 | −0.332193 |
+| G | 1 | 1/20 = 0.0500 | −0.216096 |
+| H | 1 | 1/20 = 0.0500 | −0.216096 |
+| I | 1 | 1/20 = 0.0500 | −0.216096 |
+| K | 2 | 2/20 = 0.1000 | −0.332193 |
+| L | 2 | 2/20 = 0.1000 | −0.332193 |
 | M | 1 | 1/20 = 0.0500 | −0.216096 |
-| N | 2 | 2/20 = 0.1000 | −0.332193 |
-| O | 2 | 2/20 = 0.1000 | −0.332193 |
-| P | 1 | 1/20 = 0.0500 | −0.216096 |
-| S | 1 | 1/20 = 0.0500 | −0.216096 |
-| X | 1 | 1/20 = 0.0500 | −0.216096 |
+| N | 1 | 1/20 = 0.0500 | −0.216096 |
+| Q | 1 | 1/20 = 0.0500 | −0.216096 |
+| R | 1 | 1/20 = 0.0500 | −0.216096 |
+| Z | 4 | 4/20 = 0.2000 | −0.464386 |
 
-**H = −(sum) = 3.684 bits** → 3.684 ≥ 3.0 ✓
+**H = −(sum) = 3.622 bits** → 3.622 ≥ 3.0 ✓ (14 unique characters across 20)
 
-*Secret entropy for `wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY`:*
-- 29 unique characters across 40 characters → **H = 4.663 bits** → 4.663 ≥ 4.25 ✓
+*Secret entropy for `wJalrXUtnFEMI/K7MDENG/bPxRfiCYzQ9h2jL4W5`:*
+- 37 unique characters across 40 characters → **H = 5.172 bits** → 5.172 ≥ 4.25 ✓
 
-**Layer 4 — Hex FP Check:**
-The secret `wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY` contains uppercase letters and `/` — it does **not** match `[a-f0-9]{40}` ✓
+**Layer 4 — Verification:**
+If `verify=true`, TruffleHog calls AWS STS `GetCallerIdentity`. For this fabricated key, verification would fail (not a real key). The result remains `s1.Verified = false`. ✓ (proceeds regardless)
 
-**Layer 5 — Known FP Check:**
-The ID `AKIAIOSFODNN7EXAMPLE` lowercased is `akiaiosfodnn7example`. This **contains the substring "example"**, which is in `DefaultFalsePositives`. **However**, the false positive check is applied to `result.Raw`, which is set to the ID bytes — `[]byte(idMatch)` (*Source: `pkg/detectors/aws/access_keys/accesskey.go`, line 138*). Since the ID contains "example", this result **would be filtered** by `FilterKnownFalsePositives`.
+**Layer 5 — Hex FP Check:**
+The secret `wJalrXUtnFEMI/K7MDENG/bPxRfiCYzQ9h2jL4W5` contains uppercase letters, `/`, and mixed case — it does **not** match `[a-f0-9]{40}` ✓
 
-> **Important correction**: The well-known AWS example key `AKIAIOSFODNN7EXAMPLE` is actually **caught by the false positive filter** because it contains the word "example". This is intentional — it is a documented example key, not a real credential. A real AWS key with high-entropy random characters would pass this check.
+**Layer 6 — Result Cleaning:**
+Only one ID/secret pair — deduplication has no effect ✓
+
+**Layer 7 — Known FP Check:**
+The ID `AKIAZ3MRHLLKZZ4GZN5Q` lowercased is `akiaz3mrhllkzz4gzn5q`. This does **not** contain any `DefaultFalsePositives` substring ("example", "sample", "xxxxxx", "aaaaaa", "abcde", "00000", "*****"), nor does it match any term in the Aho-Corasick trie (fp_badlist.txt, fp_words.txt, etc.) ✓
+
+**Result: ✅ DETECTED** — the credential survives all 7 layers and is reported as an unverified finding.
+
+> **Note on `AKIAIOSFODNN7EXAMPLE`**: The well-known AWS documentation example key is actually **caught by the Layer 7 false positive filter** because it contains the substring "example", which is in `DefaultFalsePositives`. This is intentional — it is a documented example key, not a real credential. Despite passing Layers 1–6, it is silently dropped at Layer 7.
 
 #### Example 2: Missed — Credential Fails at Layer 2 (Regex)
 
 Consider a file containing a mixed-case access key ID:
-```
+```ini
 aws_access_key_id = AKIAs9L8MS5iPHTZPPUQ
 aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYzQ9h2jL4W
 ```
@@ -387,17 +431,19 @@ The ID `AKIAs9L8MS5iPHTZPPUQ` contains lowercase letters (`s`, `i`). The regex `
 
 *Source: `pkg/detectors/aws/access_keys/accesskey.go`, line 65 — the regex `[A-Z0-9]{16}` strictly requires uppercase.*
 
-#### Example 3: Missed — Credential Fails at Layer 4 (Hex FP)
+#### Example 3: Missed — Credential Fails at Layer 5 (Hex FP)
 
 Consider a file containing:
-```
+```ini
 AKIA_KEY=AKIAZ3MRHLLKZZ4GZN5Q
 SECRET=a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0
 ```
 
 **Layers 1–3:** The ID passes keyword, regex, and entropy checks. The secret `a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0` is 40 characters of `[A-Za-z0-9+/]` and has sufficient entropy ✓
 
-**Layer 4 — Hex FP Check:**
+**Layer 4 — Verification:** Verification runs but fails (not a real key), leaving `s1.Verified = false`.
+
+**Layer 5 — Hex FP Check:**
 The secret `a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0` consists entirely of lowercase hex characters (`[a-f0-9]`). It matches `FalsePositiveSecretPat`:
 
 ```go
@@ -405,9 +451,51 @@ var FalsePositiveSecretPat = regexp.MustCompile(`[a-f0-9]{40}`)
 ```
 *Source: `pkg/detectors/aws/utils.go`, line 47*
 
-Since the result is unverified (verification would confirm it's not a real key, but verification hasn't happened yet in this pipeline stage), it is dropped:
+Since the result is unverified (`s1.Verified == false` after the Layer 4 verification attempt failed), and it matches the hex false positive pattern, it is dropped:
 
 **Result: ✗ FAIL** — the credential looks like a git commit hash and is silently dropped.
+
+### Representative Scan Output
+
+To illustrate what detection and non-detection look like in practice, the following shows representative `trufflehog filesystem` output for the examples above.
+
+#### Scan Output — Detected Credential (Example 1)
+
+Running `trufflehog filesystem ./config.env` on a file containing the high-entropy credential from Example 1 produces output similar to:
+
+```text
+🐷🔑🐷  TruffleHog. Unearth your secrets. 🐷🔑🐷
+
+Found unverified result 🐷🔑❓
+Detector Type: AWS
+Decoder Type: PLAIN
+Raw result: AKIAZ3MRHLLKZZ4GZN5Q
+Account: 3XXXXX4XXXXX
+Resource Type: Access key
+File: config.env
+Line: 1
+```
+
+The key fields in the output:
+- **Detector Type: AWS** — the AWS access key detector identified this credential
+- **Raw result** — shows the access key ID (the secret key is not printed for security)
+- **Found unverified result 🐷🔑❓** — the `❓` indicates the credential was not verified against AWS STS (either `--no-verification` was set, or verification failed because the key is fabricated)
+- **Account** — the AWS account number decoded from the access key ID via `GetAccountNumFromID()`
+
+*Source: Result formatting in `pkg/engine/engine.go`, result output via `pkg/output/`*
+
+#### Scan Output — Missed Credential (Examples 2 and 3)
+
+Running `trufflehog filesystem ./test_creds.env` on a file containing the mixed-case ID (Example 2) or the hex-pattern secret (Example 3) produces:
+
+```text
+🐷🔑🐷  TruffleHog. Unearth your secrets. 🐷🔑🐷
+
+```
+
+**No findings are printed.** TruffleHog silently drops the credential at the failing layer and produces no output for that credential. There is no "skipped" or "filtered" message — the absence of output **is** the indication of non-detection. To diagnose why a credential was missed, you must trace through the 7-layer pipeline manually (as demonstrated in the examples above).
+
+> **Tip:** Running with the `--debug` flag provides verbose logging that can help identify at which pipeline stage a credential is being dropped.
 
 ---
 
@@ -542,21 +630,17 @@ var UrlEncodedReplacer = strings.NewReplacer(
 
 This only handles the 3 Base64 special characters (`+`, `/`, `=`) that are commonly URL-encoded. It does not handle general URL encoding of arbitrary characters.
 
-### Iterative Decoding Depth
-
-TruffleHog supports iterative decoding (e.g., double-Base64) via the `--max-decode-depth` CLI flag (default: 5). Each iteration requires the decoded result to still exceed the 20-character threshold and produce valid ASCII.
-
 ### Concrete Examples
 
 #### Example 1: Base64-Encoded Credential — DETECTED
 
 A config file contains the following Base64-encoded block:
-```
-credentials = QVDTX0FDQ0VTU19LRVlfSUQ9QUtJQVo3WDNNUkhMTDJHWk40TTgKQVdTX1NFQ1JFVF9BQ0NFU1NfS0VZPXdKYWxyWFV0bkZFTUkvSzdNREVORy9iUHhSZmlDWXpROWgyakw0VzU=
+```text
+credentials = QVdTX0FDQ0VTU19LRVlfSUQ9QUtJQVo3WDNNUkhMTDJHWk40TTgKQVdTX1NFQ1JFVF9BQ0NFU1NfS0VZPXdKYWxyWFV0bkZFTUkvSzdNREVORy9iUHhSZmlDWXpROWgyakw0VzU=
 ```
 
-The Base64-encoded string is 100 characters long (> 20 threshold ✓). When decoded, it produces valid ASCII:
-```
+The Base64-encoded string is 136 characters long (> 20 threshold ✓). When decoded, it produces valid ASCII:
+```text
 AWS_ACCESS_KEY_ID=AKIAZ7X3MRHLL2GZN4M8
 AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYzQ9h2jL4W5
 ```
@@ -564,14 +648,14 @@ AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYzQ9h2jL4W5
 The Base64 decoder replaces the encoded string with the decoded content. The decoded chunk then passes through the normal detection pipeline:
 - Layer 1: Contains "AKIA" → ✓
 - Layer 2: ID and secret match regex patterns → ✓
-- Layers 3–6: Standard filtering applies
+- Layers 3–7: Standard filtering applies
 
 **Result: DETECTED** — the Base64 decoder successfully reveals the embedded credential.
 
 #### Example 2: Hex-Encoded Credential — EVADES Detection
 
 The same credential hex-encoded:
-```
+```text
 credentials = 414b49415a375833-4d52484c4c32475a4e344d38
 ```
 
@@ -586,7 +670,7 @@ credentials = 414b49415a375833-4d52484c4c32475a4e344d38
 #### Example 3: Short Base64 — EVADES Detection
 
 A file contains a short Base64-encoded snippet:
-```
+```text
 key = QUtJQTEyMzQ1Njc4
 ```
 
@@ -671,10 +755,10 @@ func init() {
     filter = builder.Build()
 }
 ```
-*Source: `pkg/detectors/falsepositives.go`, lines 45–61*
+*Source: `pkg/detectors/falsepositives.go`, lines 45–68*
 
 The word lists contain:
-- **`fp_badlist.txt`**: Programming and crypto terms — "value", "token", "config", "export", "auth", "hash", "sha256", "module", "import", "package", "crypto", "secret", "password", etc.
+- **`fp_badlist.txt`**: Programming and crypto terms — "value", "token", "config", "export", "auth", "hash", "sha256", "module", "import", "package", "crypto", "buffer", "return", etc.
 - **`fp_words.txt`**: Common English words — "number", "people", "through", "weather", "school", "between", etc.
 - **`fp_programmingbooks.txt`**: Programming book title words
 - **`fp_uuids.txt`**: Known false positive UUID strings
@@ -740,14 +824,14 @@ if !s1.Verified && aws.FalsePositiveSecretPat.MatchString(secretMatch) {
 #### Example 1: Fixture with "example" in the Credential
 
 The well-known AWS documentation example:
-```go
+```ini
 AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE
 AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
 ```
 
 **Why it's filtered:**
 
-The ID `AKIAIOSFODNN7EXAMPLE` passes Layers 1–4 (keyword present, regex matches, entropy = 3.684 ≥ 3.0, not pure hex). However, at Layer 5:
+The ID `AKIAIOSFODNN7EXAMPLE` passes Layers 1–6 (keyword present, regex matches, entropy = 3.684 ≥ 3.0, verification attempted, not pure hex, deduplication). However, at Layer 7:
 
 1. The `Raw` field is set to `[]byte(idMatch)` = `AKIAIOSFODNN7EXAMPLE`
    
@@ -767,7 +851,7 @@ The ID `AKIAIOSFODNN7EXAMPLE` passes Layers 1–4 (keyword present, regex matche
 #### Example 2: Fixture with Low-Entropy Secret
 
 A test file contains:
-```
+```ini
 TEST_AWS_KEY=AKIAZ3MRHLLKZZ4GZN5Q
 TEST_AWS_SECRET=AAAAAABBBBBBCCCCCCDDDDDDEEEEEEFFFFFFFFGG
 ```
@@ -939,16 +1023,30 @@ To map the exact detection boundaries, the investigation catalogued every thresh
 
 ### Boundary Map: Complete Detection Criteria
 
+The ID and Secret regex patterns contain pipe characters. For clarity, they are shown in code blocks below and referenced in the table by name.
+
+ID regex pattern:
+```text
+\b((?:AKIA|ABIA|ACCA)[A-Z0-9]{16})\b
+```
+
+Secret regex pattern:
+```text
+(?:[^A-Za-z0-9+/]|\A)([A-Za-z0-9+/]{40})(?:[^A-Za-z0-9+/]|\z)
+```
+
 | # | Criterion | Threshold / Pattern | Pass (Detected) | Fail (Missed) | Source |
 |---|-----------|-------------------|-----------------|---------------|--------|
 | 1 | Keyword present | `AKIA`, `ABIA`, `ACCA` in chunk | Keyword found (case-insensitive) | Keyword absent | `pkg/detectors/aws/access_keys/accesskey.go`, lines 70–76 |
-| 2 | ID regex | `\b((?:AKIA\|ABIA\|ACCA)[A-Z0-9]{16})\b` | All uppercase + digits, exactly 20 chars | Mixed case, wrong length, or missing boundaries | `pkg/detectors/aws/access_keys/accesskey.go`, line 65 |
-| 3 | Secret regex | `(?:[^A-Za-z0-9+/]\|\A)([A-Za-z0-9+/]{40})(?:[^A-Za-z0-9+/]\|\z)` | Exactly 40 Base64 chars with boundary chars | Wrong length, invalid chars, or missing boundaries | `pkg/detectors/aws/common.go`, line 10 |
-| 4 | ID entropy | ≥ 3.0 bits | High character variety (14 unique in 20 → 3.68) | Repetitive patterns (6 unique in 20 → 2.35) | `pkg/detectors/aws/common.go`, line 6 |
+| 2 | ID regex | See ID regex pattern above | All uppercase + digits, exactly 20 chars | Mixed case, wrong length, or missing boundaries | `pkg/detectors/aws/access_keys/accesskey.go`, line 65 |
+| 3 | Secret regex | See Secret regex pattern above | Exactly 40 Base64 chars with boundary chars | Wrong length, invalid chars, or missing boundaries | `pkg/detectors/aws/common.go`, line 10 |
+| 4 | ID entropy | ≥ 3.0 bits | High character variety (14 unique in 20 → 3.62) | Repetitive patterns (6 unique in 20 → 2.35) | `pkg/detectors/aws/common.go`, line 6 |
 | 5 | Secret entropy | ≥ 4.25 bits | High character variety (20+ unique in 40) | Repetitive patterns (7 unique in 40 → 2.73) | `pkg/detectors/aws/common.go`, line 7 |
-| 6 | Hex FP pattern | `[a-f0-9]{40}` (unverified only) | Contains uppercase, `+`, or `/` | Pure lowercase hex | `pkg/detectors/aws/utils.go`, line 47 |
-| 7 | FP word list | Aho-Corasick trie from 4 lists | No substring match | Contains "value", "token", "auth", etc. | `pkg/detectors/falsepositives.go`, lines 102–106 |
-| 8 | DefaultFP map | 7 placeholder terms | Not contained as substring | Contains "example", "sample", "xxxxxx", etc. | `pkg/detectors/falsepositives.go`, lines 17–19 |
+| 6 | Verification | AWS STS `GetCallerIdentity` | Credential valid (sets `Verified=true`) | Credential invalid (remains unverified) | `pkg/detectors/aws/access_keys/accesskey.go`, lines 185–200 |
+| 7 | Hex FP pattern | `[a-f0-9]{40}` (unverified only) | Contains uppercase, `+`, or `/` | Pure lowercase hex | `pkg/detectors/aws/utils.go`, line 47 |
+| 8 | Result cleaning | Deduplication by redacted ID | First or verified result kept | Duplicate unverified results removed | `pkg/detectors/aws/utils.go`, lines 89–114 |
+| 9 | FP word list | Aho-Corasick trie from 4 lists | No substring match | Contains "value", "token", "auth", etc. | `pkg/detectors/falsepositives.go`, lines 102–106 |
+| 10 | DefaultFP map | 7 placeholder terms | Not contained as substring | Contains "example", "sample", "xxxxxx", etc. | `pkg/detectors/falsepositives.go`, lines 17–19 |
 
 ### Entropy Threshold Boundary Examples
 
@@ -1022,7 +1120,8 @@ The margin is razor-thin: **4.322 vs. 4.222** — a difference of just 0.1 bits 
 | `AKIAIOSFODNN7EXAMPL` | 19 | 15 chars | ✗ FAIL | Only 15 chars after prefix (needs 16) |
 | `AKIAIOSFODNN7EXAMPLES` | 21 | 17 chars | ✗ FAIL | 17 chars after prefix — regex matches first 20, but `\b` may not be at position 20 |
 | `AKIAIOSFODNN7EXAMP+E` | 20 | Includes `+` | ✗ FAIL | `+` is not in `[A-Z0-9]` |
-| `xAKIAIOSFODNN7EXAMPLE` | — | — | ✓ PASS | `\b` matches at word boundary before `AKIA` |
+| `xAKIAIOSFODNN7EXAMPLE` | — | — | ✗ FAIL | No word boundary between `x` and `A` — both are word characters (`\w`), so `\b` does not match |
+| `.AKIAIOSFODNN7EXAMPLE` | — | — | ✓ PASS | `.` is a non-word character, so `\b` matches between `.` and `A` |
 
 *Source: `pkg/detectors/aws/access_keys/accesskey.go`, line 65*
 
@@ -1052,7 +1151,7 @@ For AWS session keys (`ASIA` prefix), additional constraints apply:
 
 ## Summary: Key Takeaways
 
-1. **Inconsistent detection is caused by the six-layer detection gauntlet** — a credential must survive keyword prefiltering, regex matching, entropy filtering, hex false positive checking, known false positive word list filtering, and result deduplication. Failure at **any single layer** means silent non-detection. The behavior is deterministic: the same file always produces the same result.
+1. **Inconsistent detection is caused by the seven-layer detection gauntlet** — a credential must survive keyword prefiltering, regex matching, entropy filtering, verification, hex false positive checking, result cleaning and deduplication, and known false positive word list filtering. Failure at **any single layer** means silent non-detection. The behavior is deterministic: the same file always produces the same result.
 
 2. **Base64 encoding is handled by the decoder chain** but only for substrings strictly longer than 20 characters that produce valid ASCII when decoded. Other encodings (hex, ROT13, custom obfuscation) are **not** in the decoder chain and will evade detection entirely.
    *Source: `pkg/decoders/base64.go`, line 36*
