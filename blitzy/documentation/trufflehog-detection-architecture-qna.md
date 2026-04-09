@@ -70,7 +70,7 @@ The `init()` function executes before `main()` and performs the following steps:
 
 3. **Version string** (line 270): `cli.Version("trufflehog " + version.BuildVersion)` registers the version for `--version` output.
 
-4. **TUI check** (lines 280-299): If stdout is a terminal and no subcommand is provided, `tui.Run()` launches an interactive terminal UI. This allows users who invoke `trufflehog` with no arguments to get a guided experience.
+4. **TUI check** (lines 280-299): If stdout is a terminal and either no subcommand is provided or the `analyze` subcommand is invoked, `tui.Run()` launches an interactive terminal UI. The exact condition is `isatty.IsTerminal(os.Stdout.Fd()) && (len(os.Args) <= 1 || os.Args[1] == analyzeCmd.FullCommand())` (`Source: main.go:280`). This allows users who invoke `trufflehog` with no arguments (or with `analyze`) to get a guided experience.
 
 5. **CLI parsing** (line 301): `cmd = kingpin.MustParse(cli.Parse(os.Args[1:]))` parses all command-line flags using the Kingpin CLI framework (`Source: main.go:18`, `github.com/alecthomas/kingpin/v2`).
 
@@ -342,10 +342,12 @@ Default transport settings (`Source: pkg/detectors/http.go:81-91`):
 
 | Setting | Value |
 |---------|-------|
+| `Proxy` | `http.ProxyFromEnvironment` |
 | `MaxIdleConns` | 100 |
 | `MaxIdleConnsPerHost` | 5 |
 | `IdleConnTimeout` | 90 seconds |
 | `TLSHandshakeTimeout` | 3 seconds |
+| `ExpectContinueTimeout` | 1 second |
 | Dial `Timeout` | 2 seconds |
 | Dial `KeepAlive` | 5 seconds |
 
@@ -468,7 +470,7 @@ When `--json` is used, the `JSONPrinter.Print()` method marshals an anonymous st
 |---|-------|---------|----------|-------------|
 | 1 | `SourceMetadata` | `*source_metadatapb.MetaData` | `"SourceMetadata"` | Source-specific contextual information (protobuf oneof) |
 | 2 | `SourceID` | `sources.SourceID` (int64) | `"SourceID"` | ID mapping secrets to specific sources |
-| 3 | `SourceType` | `sourcespb.SourceType` (int32 enum) | `"SourceType"` | Numeric source type (Git=0, GitHub=1, etc.) |
+| 3 | `SourceType` | `sourcespb.SourceType` (int32 enum) | `"SourceType"` | Numeric source type enum (`Source: proto/sources.proto:14-55`); e.g., AzureStorage=0, Bitbucket=1, GitHub=7, Filesystem=15, Git=16 |
 | 4 | `SourceName` | `string` | `"SourceName"` | Name of the source |
 | 5 | `DetectorType` | `detectorspb.DetectorType` (int32 enum) | `"DetectorType"` | Numeric detector type from protobuf enum |
 | 6 | `DetectorName` | `string` | `"DetectorName"` | String name of `DetectorType` (e.g., `"AWS"`, `"GitHub"`) |
@@ -564,7 +566,7 @@ The `SourceMetadata` field is a protobuf `oneof` (`Source: proto/source_metadata
   "SourceName": "trufflehog - git",
   "DetectorType": 2,
   "DetectorName": "AWS",
-  "DetectorDescription": "Amazon Web Services",
+  "DetectorDescription": "AWS (Amazon Web Services) is a comprehensive cloud computing platform... (truncated for brevity; actual value is the full string returned by the detector's Description() method)",
   "DecoderName": "PLAIN",
   "Verified": true,
   "VerificationFromCache": false,
@@ -601,9 +603,13 @@ TruffleHog's data pipeline follows a three-tier decomposition model documented i
 2. **Unit** — Natural subdivisions of sources (individual git repos, directories)
 3. **Chunk** — The smallest data blocks passed to detection (file contents, git diff hunks)
 
-The `Source` interface (`Source: pkg/sources/sources.go:61-78`) defines:
-- `Type()` — returns the source type
-- `Chunks(ctx, chunksChan, targets...)` — emits data over a channel
+The `Source` interface (`Source: pkg/sources/sources.go:61-78`) defines six methods:
+- `Type()` — returns the source type (`sourcespb.SourceType`)
+- `SourceID()` — returns the initialized source ID for DB relationship tracking
+- `JobID()` — returns the initialized job ID for DB relationship tracking
+- `Init(aCtx, name, jobId, sourceId, verify, connection, concurrency)` — initializes the source
+- `Chunks(ctx, chunksChan, targets...)` — emits data over a channel for decoding and scanning
+- `GetProgress()` — returns the completion progress (percentage) for the scanned source
 
 The `Chunk` struct (`Source: pkg/sources/sources.go:25-46`) contains the data bytes, source metadata, and a `Verify` flag.
 
@@ -631,7 +637,7 @@ This function performs multi-stage file type detection:
 2. **MIME type detection** (line 127): `mimetype.DetectReader()` from `github.com/gabriel-vasile/mimetype` (`Source: go.mod:47`) examines magic bytes
 3. **APK check** (lines 139-147): If `feature.EnableAPKHandler` is true AND the file extension is `.apk` AND the MIME is zip/jar, treats it as an APK
 4. **skipArchiverMimeTypes bypass** (lines 151-153): If the MIME type is in the known-text-type set, returns immediately without calling the archiver library (I/O optimization)
-5. **Archive format identification** (line 156): `archives.Identify()` from `github.com/mholt/archives` (`Source: go.mod:13-14`) attempts to identify archive formats (zip, tar, gz, etc.)
+5. **Archive format identification** (line 156): `archives.Identify()` from `github.com/mholt/archives` (`Source: go.mod:76`) attempts to identify archive formats (zip, tar, gz, etc.)
 
 ### 4.4 Handler Selection: `selectHandler()`
 
@@ -653,7 +659,7 @@ selectHandler(mimeType, isGenericArchive) → FileHandler
 
 `Source: pkg/handlers/handlers.go:266-297`
 
-The `skipArchiverMimeTypes` set contains **28 MIME types** that skip the `archives.Identify()` call because they are known to be either text-based content or handled by specialized handlers:
+The `skipArchiverMimeTypes` set contains **30 MIME types** that skip the `archives.Identify()` call because they are known to be either text-based content or handled by specialized handlers:
 
 **Text/Data formats:**
 - `text/plain; charset=utf-8`
@@ -686,7 +692,7 @@ The `skipArchiverMimeTypes` set contains **28 MIME types** that skip the `archiv
 
 `Source: pkg/feature/feature.go:5-10`
 
-All feature flags are `atomic.Bool` variables (thread-safe):
+Four feature flags are `atomic.Bool` variables; `UserAgentSuffix` is a custom `AtomicString` type wrapping `atomic.Value` (also thread-safe) (`Source: pkg/feature/feature.go:10,13-15`):
 
 | Flag | CLI Flag | Effect | Default |
 |------|----------|--------|---------|
@@ -782,18 +788,18 @@ flowchart TD
     Empty -- No --> APK
     APK -- Yes --> APKHandler
     APK -- No --> Skip
-    Skip -- Yes --> |"Known text type,
-    skip archiver I/O"| SkipArchiveFlag
+    Skip -- "Yes, AR/Deb MIME" --> ARHandler
+    Skip -- "Yes, RPM/CPIO MIME" --> RPMHandler
+    Skip -- "Yes, other (text types)" --> DefaultHandler
     Skip -- No --> Archive
     Archive --> IsArchive
     IsArchive -- Yes --> SkipArchiveFlag
     IsArchive -- No --> DefaultHandler
     SkipArchiveFlag -- Yes --> SkipFile
-    SkipArchiveFlag -- No, AR/Deb MIME --> ARHandler
-    SkipArchiveFlag -- No, RPM/CPIO MIME --> RPMHandler
-    SkipArchiveFlag -- No, generic archive --> ArchiveHandler
-    SkipArchiveFlag -- No, other --> DefaultHandler
+    SkipArchiveFlag -- No --> ArchiveHandler
 ```
+
+> **Note on diagram routing:** Files matching `skipArchiverMimeTypes` return early from `newFileReader()` (line 151-153) with `isGenericArchive=false`, so they **bypass** both the `archives.Identify()` call and the `skipArchives` flag check (line 379). They proceed directly to `selectHandler()` which routes by MIME type to their respective handlers. The `skipArchives` option only affects files identified as generic archives via `archives.Identify()`.
 
 ---
 
@@ -949,7 +955,7 @@ Available scan subcommands (`Source: main.go:93-254`):
 | `gcs` | Find credentials in GCS buckets |
 | `syslog` | Scan syslog |
 | `circleci` | Scan CircleCI |
-| `docker` | Scan Docker images |
+| `docker` | Scan Docker Image |
 | `travisci` | Scan TravisCI |
 | `postman` | Scan Postman |
 | `elasticsearch` | Scan Elasticsearch |
