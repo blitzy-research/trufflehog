@@ -261,7 +261,7 @@ for _, decoder := range e.decoders {
 | >1 detector matches **AND** `verificationOverlap` flag is `false` | Overlap handling | `verificationOverlapChunksChan` |
 | ≤1 detector matches **OR** `verificationOverlap` flag is `true` | Normal detection | `detectableChunksChan` |
 
-The `e.verificationOverlap` field corresponds to the `--allow-verification-overlap` CLI flag (Source: `pkg/engine/engine.go:142, 240`). When set to `true`, it bypasses overlap handling entirely, sending all chunks directly to detector workers regardless of how many detectors match.
+The `e.verificationOverlap` field corresponds to the `--allow-verification-overlap` CLI flag (Source: `pkg/engine/engine.go:180, 240`). When set to `true`, it bypasses overlap handling entirely, sending all chunks directly to detector workers regardless of how many detectors match.
 
 ```mermaid
 flowchart TD
