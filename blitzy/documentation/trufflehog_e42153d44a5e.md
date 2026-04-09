@@ -8,7 +8,7 @@ This document explains how **TruffleHog v3** actually behaves at runtime — fro
 
 - **Configuration handling** — how CLI flags, log levels, feature flags, and YAML custom detectors are processed before scanning begins
 - **Scanning engine initialization** — how the engine assembles its defaults, builds the Aho-Corasick keyword trie, allocates channels, and prepares for work
-- **Detector preparation** — how 845+ secret detectors are instantiated, filtered, and organized for efficient matching
+- **Detector preparation** — how ~830 secret detectors are instantiated, filtered, and organized for efficient matching
 - **Component communication during a basic run** — how source chunks flow through scanner workers, detector workers, verification overlap workers, and notifier workers via buffered channels
 
 ### Methodology
@@ -212,7 +212,7 @@ feature.EnableAPKHandler.Store(true) // Always on in OSS
 
 > Source: `pkg/config/config.go:L17-L45`
 
-**Printer selection** — At `main.go:L486-L495`, the output printer is chosen based on flags:
+**Printer selection** — At `main.go:L485-L495`, the output printer is chosen based on flags:
 - `--json-legacy` → `LegacyJSONPrinter`
 - `--json` → `JSONPrinter`
 - `--github-actions` → `GitHubActionsPrinter`
@@ -334,7 +334,7 @@ The strict YAML parsing ensures that any unrecognized fields cause an error, pre
 | `notificationWorkerMultiplier` | `1` | Notification is lightweight (just printing) |
 | `verificationOverlapWorkerMultiplier` | `1` | Overlap resolution is infrequent |
 | `decoders` | `decoders.DefaultDecoders()` | UTF-8, Base64, UTF-16, EscapedUnicode |
-| `detectors` | `defaults.DefaultDetectors()` | 845+ built-in secret detectors |
+| `detectors` | `defaults.DefaultDetectors()` | ~830 built-in secret detectors |
 | `dispatcher` | `PlainPrinter` | Console output |
 | Notify flags | all `true` | Show verified, unverified, and unknown results |
 
@@ -423,12 +423,12 @@ func (e *Engine) startWorkers(ctx context.Context) {
 
 Each worker type has a formula based on `concurrency` (which defaults to `runtime.NumCPU()`):
 
-| Worker Type | Formula | Multiplier | Observed Count (128 CPU) | Log Message (V2) |
-|-------------|---------|------------|--------------------------|-------------------|
-| Scanner | `concurrency × 1` | 1 | 128 | `starting scanner workers {"count": 128}` |
-| Detector | `concurrency × detectorWorkerMultiplier` | 8 | 1024 | `starting detector workers {"count": 1024}` |
-| VerificationOverlap | `concurrency × verificationOverlapWorkerMultiplier` | 1 | 128 | `starting verificationOverlap workers {"count": 128}` |
-| Notifier | `concurrency × notificationWorkerMultiplier` | 1 | 128 | `starting notifier workers {"count": 128}` |
+| Worker Type | Formula | Multiplier | Observed Count (128 CPU) | Observed Count (8 CPU) | Log Message (V2) |
+|-------------|---------|------------|--------------------------|------------------------|-------------------|
+| Scanner | `concurrency × 1` | 1 | 128 | 8 | `starting scanner workers {"count": N}` |
+| Detector | `concurrency × detectorWorkerMultiplier` | 8 | 1024 | 64 | `starting detector workers {"count": N}` |
+| VerificationOverlap | `concurrency × verificationOverlapWorkerMultiplier` | 1 | 128 | 8 | `starting verificationOverlap workers {"count": N}` |
+| Notifier | `concurrency × notificationWorkerMultiplier` | 1 | 128 | 8 | `starting notifier workers {"count": N}` |
 
 All four worker log messages appear at V(2) and include a `"count"` field showing the number of workers launched. On an 8-CPU system, the counts would be 8, 64, 8, and 8 respectively.
 
@@ -458,9 +458,9 @@ The other channels are allocated in `initialize()` at `engine.go:L515-L519`.
 
 ## 7. Detector Preparation
 
-### 7.1 `DefaultDetectors()` — 845+ Scanner Instantiation
+### 7.1 `DefaultDetectors()` — ~830 Scanner Instantiation
 
-`defaults.DefaultDetectors()` from `pkg/engine/defaults/defaults.go` returns a slice of 845+ detector instances. The `buildDetectorList()` function instantiates each detector scanner, including special initialization for detectors implementing two key interfaces:
+`defaults.DefaultDetectors()` from `pkg/engine/defaults/defaults.go` returns a slice of ~830 detector instances. The `buildDetectorList()` function instantiates each detector scanner, including special initialization for detectors implementing two key interfaces:
 
 - **`detectors.EndpointCustomizer`** — Allows detectors to accept custom verification endpoints (e.g., for self-hosted API instances)
 - **`detectors.CloudProvider`** — Enables cloud-specific initialization for detectors that verify against cloud APIs
@@ -495,7 +495,7 @@ After instantiation, detectors pass through a filtering pipeline:
 
 ### 7.3 Aho-Corasick Core Construction
 
-The Aho-Corasick prefilter is the critical optimization that makes scanning 845+ detectors efficient. Instead of running every detector's regex against every chunk, TruffleHog first performs a **keyword scan** using an Aho-Corasick automaton to determine which detectors are potentially relevant.
+The Aho-Corasick prefilter is the critical optimization that makes scanning ~830 detectors efficient. Instead of running every detector's regex against every chunk, TruffleHog first performs a **keyword scan** using an Aho-Corasick automaton to determine which detectors are potentially relevant.
 
 `NewAhoCorasickCore()` at `pkg/engine/ahocorasick/ahocorasickcore.go:L141-L168`:
 
@@ -598,6 +598,20 @@ info-0  trufflehog  running source       {"source_manager_worker_id": "...", "wi
 info-2  trufflehog  enumerating source   {"source_manager_worker_id": "..."}
 ```
 
+The following additional messages appear when scanning directories containing files:
+
+```
+info-3  trufflehog  chunking unit        {"source_manager_worker_id": "..."}
+info-3  trufflehog  scanning file        {"path": "/tmp/test-scan/example.txt"}
+info-5  trufflehog  dataErrChan closed, all chunks processed
+```
+
+- **`chunking unit`** — Logged at V(3) from `source_manager.go:L557` and `source_manager.go:L603` when the source manager begins processing an enumerated unit (e.g., a directory). This appears once per unit.
+- **`scanning file`** — Logged at V(3) from `filesystem.go:L179` when a filesystem source begins reading an individual file's contents into chunks. This appears once per scanned file.
+- **`dataErrChan closed, all chunks processed`** — Logged at V(5) from `handlers.go:L413` when the data/error channel for a handler is fully drained. This appears only at ultimate trace verbosity (`--log-level=5`).
+
+These messages are absent from the annotated trace in Section 10 because that trace uses an empty directory. In a non-empty scan, they appear between `"enumerating source"` and `"finished scanning chunks"`.
+
 ### 8.2 Scanner Workers — Decoding and Keyword Matching
 
 `scannerWorker()` at `pkg/engine/engine.go:L777-L841` is the first processing stage for each chunk:
@@ -674,10 +688,10 @@ Notifier workers are the final stage of the pipeline:
 When scanning files that contain common patterns (like test data with placeholder secrets), both detector and verification overlap workers produce observable log messages:
 
 ```
-info-2  trufflehog  Skipping result: false positive  {"reason": "contains term: abcde"}
+info-4  trufflehog  Skipping result: false positive  {"reason": "contains term: abcde"}
 ```
 
-The `reason` field indicates the specific false positive filter that triggered. Common filters include matching against known placeholder terms and entropy checks.
+This message is logged at V(4) (`ctx.Logger().V(4).Info(...)` at `pkg/detectors/falsepositives.go:L194`), so it only appears with `--log-level=4` or higher. The `reason` field indicates the specific false positive filter that triggered. Common filters include matching against known placeholder terms and entropy checks.
 
 ---
 
@@ -793,7 +807,7 @@ The following is a complete trace-level log output from a filesystem dry-run sca
 ```
 ↳ **Source**: `pkg/engine/engine.go:L529`, `initialize()`
 ↳ **Phase**: Engine initialization — trie construction start
-↳ **Significance**: The Aho-Corasick prefilter trie construction is about to begin. This involves collecting keywords from all 845+ detectors and building the automaton.
+↳ **Significance**: The Aho-Corasick prefilter trie construction is about to begin. This involves collecting keywords from all ~830 detectors and building the automaton.
 
 ```
 2026-04-09T22:31:36Z  info-4  trufflehog  set up aho-corasick core
@@ -926,16 +940,16 @@ sequenceDiagram
     Note over Main: e.startWorkers()<br/>Launches worker pools<br/>sized by concurrency × multiplier
 
     create participant ScannerWorkers
-    Main->>ScannerWorkers: startScannerWorkers()<br/>count = concurrency × 1
-
-    create participant VerificationOverlapWorkers
-    Main->>VerificationOverlapWorkers: startVerificationOverlapWorkers()<br/>count = concurrency × 1
+    Main->>ScannerWorkers: startScannerWorkers() [L648]<br/>count = concurrency × 1
 
     create participant DetectorWorkers
-    Main->>DetectorWorkers: startDetectorWorkers()<br/>count = concurrency × 8
+    Main->>DetectorWorkers: startDetectorWorkers() [L651]<br/>count = concurrency × 8
+
+    create participant VerificationOverlapWorkers
+    Main->>VerificationOverlapWorkers: startVerificationOverlapWorkers() [L655]<br/>count = concurrency × 1
 
     create participant NotifierWorkers
-    Main->>NotifierWorkers: startNotifierWorkers()<br/>count = concurrency × 1
+    Main->>NotifierWorkers: startNotifierWorkers() [L659]<br/>count = concurrency × 1
 
     par Source scanning and chunk routing
         Note over Main,ScannerWorkers: SourceManager produces chunks<br/>via outputChunks channel (buffer: 64)
@@ -1064,7 +1078,7 @@ If channels were closed out of order (e.g., closing `detectableChunksChan` befor
 
 ### Why Does the Aho-Corasick Prefilter Exist?
 
-With 845+ detectors, running every detector's regex against every chunk would be computationally prohibitive. The Aho-Corasick algorithm provides **O(n + m)** multi-pattern matching (where n is the chunk length and m is the total match output), compared to **O(n × k)** for k individual regex scans.
+With ~830 detectors, running every detector's regex against every chunk would be computationally prohibitive. The Aho-Corasick algorithm provides **O(n + m)** multi-pattern matching (where n is the chunk length and m is the total match output), compared to **O(n × k)** for k individual regex scans.
 
 Each detector provides keywords (e.g., `"AKIA"` for AWS, `"ghp_"` for GitHub). These keywords are compiled into a single trie at initialization (`NewAhoCorasickCore()` at `ahocorasickcore.go:L141-L168`). During scanning, a single pass over each chunk identifies which detectors have matching keywords, and only those detectors are activated.
 
