@@ -103,7 +103,7 @@ Sample shared keywords:
 **Key observations:**
 - 831 detectors contribute 955 total keyword entries, but only 914 are unique after case-normalized deduplication
 - 32 keywords are shared by 2 or more detectors (e.g., `github` is shared by 3 detectors — likely GitHub OAuth, GitHub App, and GitHub Personal Access Token detectors)
-- The majority of detectors (799 out of 831) have keywords unique to themselves
+- The majority of detectors (764 out of 831) have keywords unique to themselves; 67 detectors share at least one keyword with another detector
 
 **Source:** `pkg/engine/ahocorasick/ahocorasickcore.go:141-168`, `pkg/engine/defaults/defaults.go:839-1702`
 
