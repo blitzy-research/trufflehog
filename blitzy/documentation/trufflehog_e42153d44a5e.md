@@ -150,7 +150,7 @@ Approximately **25 non-detector Go source files** (excluding test files) use Go'
 |------|------|---------------|
 | `pkg/common/patterns.go` | 5 | Shared regex patterns (`EmailPattern`, `UsernameRegexCheck`, `PasswordRegexCheck`) |
 | `pkg/custom_detectors/custom_detectors.go` | 9 | Custom detector user-supplied regex compilation |
-| `pkg/custom_detectors/validation.go` | 4 | Regex pattern validation (`ValidateRegex()`) |
+| `pkg/custom_detectors/validation.go` | 5 | Regex pattern validation (`ValidateRegex()`) |
 | `pkg/detectors/jdbc/jdbc.go` | 8 | JDBC connection string pattern matching |
 | `pkg/detectors/azure_cosmosdb/azure_cosmosdb.go` | 13 | Azure CosmosDB key pattern matching |
 | `pkg/detectors/azure_entra/serviceprincipal/v2/spv2.go` | 7 | Azure Entra service principal detection |
@@ -164,18 +164,19 @@ Approximately **25 non-detector Go source files** (excluding test files) use Go'
 ### Regex Engine Decision Tree
 
 ```mermaid
-flowchart TD
-    A["Go Source File<br/>in TruffleHog"] --> B{"Is it a detector<br/>implementation?"}
-    B -->|"Yes<br/>(867 files)"| C["wasilibs/go-re2 v1.9.0<br/>(RE2 C++ via WebAssembly)"]
-    B -->|"No<br/>(~25 files)"| D["Go standard regexp<br/>(RE2 in pure Go)"]
-    C --> E["✅ Linear-time matching<br/>guaranteed O(n)"]
-    D --> F["✅ Linear-time matching<br/>guaranteed O(n)"]
-    E --> G["🛡️ ReDoS Immune"]
+flowchart LR
+    A["`**Go Source File in TruffleHog**`"] --> B{"`Is it a detector
+    implementation?`"}
+    B -->|Yes, 867 files| C["`**wasilibs/go-re2 v1.9.0**
+    RE2 C++ via WebAssembly`"]
+    B -->|No, ~25 files| D["`**Go standard regexp**
+    RE2 in pure Go`"]
+    C --> E["`Linear-time matching
+    guaranteed O(n)`"]
+    D --> F["`Linear-time matching
+    guaranteed O(n)`"]
+    E --> G["`**ReDoS Immune**`"]
     F --> G
-    
-    style G fill:#22c55e,color:#fff,stroke:#16a34a
-    style E fill:#3b82f6,color:#fff,stroke:#2563eb
-    style F fill:#3b82f6,color:#fff,stroke:#2563eb
 ```
 
 ---
@@ -221,12 +222,12 @@ The following table catalogs representative detector patterns across different c
 | Slack User Token | `pkg/detectors/slack/slack.go:29` | `xoxp\-[0-9]{10,13}\-[0-9]{10,13}[a-zA-Z0-9\-]*` | go-re2 | Safe: Same structure as above |
 | Slack Workspace Access | `pkg/detectors/slack/slack.go:30` | `xoxa\-[0-9]{10,13}\-[0-9]{10,13}[a-zA-Z0-9\-]*` | go-re2 | Safe: Same structure as above |
 | Slack Workspace Refresh | `pkg/detectors/slack/slack.go:31` | `xoxr\-[0-9]{10,13}\-[0-9]{10,13}[a-zA-Z0-9\-]*` | go-re2 | Safe: Same structure as above |
-| AWS Secret Key | `pkg/detectors/aws/common.go:10` | `(?:[^A-Za-z0-9+/]∣\A)([A-Za-z0-9+/]{40})(?:[^A-Za-z0-9+/]∣\z)` | go-re2 | Safe: RE2; fixed-length match `{40}` |
-| AWS Access Key ID | `pkg/detectors/aws/access_keys/accesskey.go:65` | `\b((?:AKIA∣ABIA∣ACCA)[A-Z0-9]{16})\b` | go-re2 | Safe: RE2; fixed prefix + fixed-length `{16}` |
+| AWS Secret Key | `pkg/detectors/aws/common.go:10` | `(?:[^A-Za-z0-9+/]\|\A)([A-Za-z0-9+/]{40})(?:[^A-Za-z0-9+/]\|\z)` | go-re2 | Safe: RE2; fixed-length match `{40}` |
+| AWS Access Key ID | `pkg/detectors/aws/access_keys/accesskey.go:65` | `\b((?:AKIA\|ABIA\|ACCA)[A-Z0-9]{16})\b` | go-re2 | Safe: RE2; fixed prefix + fixed-length `{16}` |
 | AWS Session Key | `pkg/detectors/aws/session_keys/sessionkey.go:61` | `\b((?:ASIA)[A-Z0-9]{16})\b` | go-re2 | Safe: RE2; fixed prefix + fixed-length `{16}` |
-| AWS Session Token | `pkg/detectors/aws/session_keys/sessionkey.go:62` | `(?:[^A-Za-z0-9+/]∣\A)([a-zA-Z0-9+/]{100,}={0,3})(?:...)` | go-re2 | Safe: RE2 linear time; open-ended but bounded by chunk size |
+| AWS Session Token | `pkg/detectors/aws/session_keys/sessionkey.go:62` | `(?:[^A-Za-z0-9+/]\|\A)([a-zA-Z0-9+/]{100,}={0,3})(?:...)` | go-re2 | Safe: RE2 linear time; open-ended but bounded by chunk size |
 | Azure CosmosDB | `pkg/detectors/azure_cosmosdb/azure_cosmosdb.go:30` | `PrefixRegex(["azure","cosmos"]) + ([A-Za-z0-9]{86}==)` | standard regexp | Safe: Standard Go regexp is RE2-based; fixed-length `{86}` |
-| Generic Excludes | `pkg/detectors/generic/generic.go:18-33` | 13 exclude patterns (UUID, URL, filepath, MAC, date, version, IP, hex, function) | go-re2 | Safe: All compiled under go-re2; simple character classes |
+| Generic Excludes | `pkg/detectors/generic/generic.go:18-33` | 14 exclude patterns (UUID, UUIDv4, issue tracker, hex color, hex hash, URL, filepath, MAC, date, version x2, IP/OID, hex encoding, function) | go-re2 | Safe: All compiled under go-re2; simple character classes |
 
 ### Custom Detector (User-Supplied Regex) Handling
 
@@ -440,7 +441,7 @@ If regex group A matches 50 times and regex group B matches 50 times, the Cartes
 
 Every detector's `FromData` method receives a `context.Context` parameter that supports cancellation and deadlines.
 
-Source: `pkg/detectors/detectors.go` lines 19-22 (Detector interface):
+Source: `pkg/detectors/detectors.go` lines 19-29 (Detector interface):
 
 ```go
 type Detector interface {
@@ -515,6 +516,7 @@ func init() {
     uuidList := bytesToCleanWordList(uuidList)
     builder.AddStrings(uuidList)
     filter = builder.Build()
+    // ... UUID false positive map initialization continues ...
 }
 ```
 
@@ -525,21 +527,24 @@ The `IsKnownFalsePositive()` function (lines 85-109) uses this trie for efficien
 The following diagram shows the complete scanning pipeline with resource bounds annotated at each stage:
 
 ```mermaid
-flowchart TD
-    A["📥 Source Data<br/>(Git, GitHub, Filesystem, etc.)"] --> B["📦 Chunker<br/><i>Max 13KB per chunk</i><br/>ChunkSize=10KB + PeekSize=3KB"]
-    B --> C["🔍 Aho-Corasick Prefilter<br/><i>Only keyword-matching chunks pass</i><br/>O(n + m) trie matching"]
-    C --> D["📏 Span Calculator<br/><i>±512 bytes around keyword</i><br/>defaultOffsetRadius=512"]
-    D --> E["🔎 Detector Regex Matching<br/><i>RE2 engine: O(n) guaranteed</i><br/>wasilibs/go-re2 or standard regexp"]
-    E --> F["🚫 False Positive Filter<br/><i>O(n) Aho-Corasick trie</i><br/>+ Shannon entropy check"]
-    F --> G["📋 Results"]
-
-    style A fill:#f8fafc,stroke:#94a3b8
-    style B fill:#fef3c7,stroke:#f59e0b
-    style C fill:#dbeafe,stroke:#3b82f6
-    style D fill:#e0e7ff,stroke:#6366f1
-    style E fill:#dcfce7,stroke:#22c55e
-    style F fill:#fce7f3,stroke:#ec4899
-    style G fill:#f0fdf4,stroke:#16a34a
+flowchart LR
+    A["`**Source Data**
+    Git, GitHub, Filesystem, etc.`"] --> B["`**Chunker**
+    Max 13KB per chunk
+    ChunkSize=10KB + PeekSize=3KB`"]
+    B --> C["`**Aho-Corasick Prefilter**
+    Only keyword-matching chunks pass
+    O(n + m) trie matching`"]
+    C --> D["`**Span Calculator**
+    ±512 bytes around keyword
+    defaultOffsetRadius=512`"]
+    D --> E["`**Detector Regex Matching**
+    RE2 engine: O(n) guaranteed
+    wasilibs/go-re2 or standard regexp`"]
+    E --> F["`**False Positive Filter**
+    O(n) Aho-Corasick trie
+    + Shannon entropy check`"]
+    F --> G["`**Results**`"]
 ```
 
 ### Attack Surface Map
@@ -547,24 +552,26 @@ flowchart TD
 The following diagram traces a hypothetical adversarial input through the pipeline, showing how each defense layer neutralizes the attack:
 
 ```mermaid
-flowchart TD
-    A["🔴 Malicious Commit<br/>(crafted to trigger ReDoS)"] --> B["Git Source<br/>Ingestion"]
-    B --> C["Chunker<br/><b>13KB cap per chunk</b>"]
-    C --> D{"Aho-Corasick<br/>Keyword Check"}
-    D -->|"No keywords found"| E["❌ Chunk Ignored<br/><i>Attack fails: no detector triggered</i>"]
-    D -->|"Keywords found"| F["Span Calculation<br/><b>±512B window</b>"]
-    F --> G["RE2 Regex Engine<br/><b>O(n) linear time</b>"]
-    G --> H{"Match Found?"}
-    H -->|"No"| I["No result emitted"]
-    H -->|"Yes"| J["False Positive Filter<br/><b>O(n) trie lookup</b>"]
-    J --> K["Result Output"]
-
-    L["⚠️ At no point can<br/>processing time<br/>become exponential"]
-
-    style A fill:#fecaca,stroke:#ef4444
-    style E fill:#fecaca,stroke:#ef4444
-    style G fill:#dcfce7,stroke:#22c55e
-    style L fill:#fef9c3,stroke:#eab308
+flowchart LR
+    A["`**Malicious Commit**
+    crafted to trigger ReDoS`"] --> B["`**Git Source Ingestion**`"]
+    B --> C["`**Chunker**
+    13KB cap per chunk`"]
+    C --> D{"`**Aho-Corasick Keyword Check**`"}
+    D -->|No keywords found| E["`**Chunk Ignored**
+    Attack fails: no detector triggered`"]
+    D -->|Keywords found| F["`**Span Calculation**
+    ±512B window`"]
+    F --> G["`**RE2 Regex Engine**
+    O(n) linear time`"]
+    G --> H{"`Match Found?`"}
+    H -->|No| I["`No result emitted`"]
+    H -->|Yes| J["`**False Positive Filter**
+    O(n) trie lookup`"]
+    J --> K["`**Result Output**`"]
+    E --> L["`At no point can processing time become exponential`"]
+    I --> L
+    K --> L
 ```
 
 ---
@@ -649,7 +656,7 @@ benign := make([]byte, len(adversarial))
 rand.Read(benign)
 ```
 
-### Timing Measurements: Crafted vs. Normal Input
+### Expected Timing Characteristics: Crafted vs. Normal Input
 
 Because RE2 guarantees linear-time matching, adversarial inputs can at most cause a **constant-factor slowdown** (due to different DFA state transitions and more match attempts), never exponential blowup. The following table presents expected performance characteristics based on RE2's theoretical guarantees:
 
@@ -887,7 +894,7 @@ Even though TruffleHog is immune to ReDoS, the following recommendations can fur
 | `pkg/custom_detectors/custom_detectors.go` | 185 | `common.IsDone(ctx)` — context cancellation check |
 | `pkg/custom_detectors/custom_detectors.go` | 224 | `common.IsDone(ctx)` — second context cancellation check |
 | `pkg/custom_detectors/custom_detectors.go` | 287-297 | `productIndices()` — permutation cap logic |
-| `pkg/custom_detectors/validation.go` | 4 | Standard `regexp` import |
+| `pkg/custom_detectors/validation.go` | 5 | Standard `regexp` import |
 | `pkg/custom_detectors/validation.go` | 23-33 | `ValidateRegex()` — validates user-supplied patterns via `regexp.Compile()` |
 | `pkg/common/patterns.go` | 5 | Standard `regexp` import |
 | `pkg/common/patterns.go` | 10 | `EmailPattern` constant |
@@ -913,7 +920,7 @@ Even though TruffleHog is immune to ReDoS, the following recommendations can fur
 | `pkg/detectors/jdbc/jdbc.go` | 8 | Standard `regexp` import |
 | `pkg/detectors/jdbc/jdbc.go` | 53 | `keyPat` — JDBC pattern with `{0,512}` quantifier |
 | `pkg/detectors/generic/generic.go` | 11 | `wasilibs/go-re2` import |
-| `pkg/detectors/generic/generic.go` | 18-33 | 13 exclude patterns (UUID, URL, filepath, MAC, date, version, IP, hex, function) |
+| `pkg/detectors/generic/generic.go` | 18-33 | 14 exclude patterns (UUID, UUIDv4, issue tracker, hex color, hex hash, URL, filepath, MAC, date, version x2, IP/OID, hex encoding, function) |
 | `pkg/detectors/generic/generic.go` | 56 | `keyPat` using `PrefixRegex()` + `[\x21-\x7e]{16,64}` |
 | `pkg/detectors/slack/slack.go` | 9 | `wasilibs/go-re2` import |
 | `pkg/detectors/slack/slack.go` | 28 | Slack Bot Token pattern: `xoxb\-[0-9]{10,13}\-[0-9]{10,13}[a-zA-Z0-9\-]*` |
@@ -923,7 +930,7 @@ Even though TruffleHog is immune to ReDoS, the following recommendations can fur
 | `pkg/detectors/aws/common.go` | 3 | `wasilibs/go-re2` import |
 | `pkg/detectors/aws/common.go` | 10 | `SecretPat` — AWS secret pattern `[A-Za-z0-9+/]{40}` |
 | `pkg/detectors/aws/access_keys/accesskey.go` | 17 | `wasilibs/go-re2` import |
-| `pkg/detectors/aws/access_keys/accesskey.go` | 65 | AWS access key ID pattern `((?:AKIA∣ABIA∣ACCA)[A-Z0-9]{16})` |
+| `pkg/detectors/aws/access_keys/accesskey.go` | 65 | AWS access key ID pattern `((?:AKIA\|ABIA\|ACCA)[A-Z0-9]{16})` |
 | `pkg/detectors/aws/session_keys/sessionkey.go` | 13 | `wasilibs/go-re2` import |
 | `pkg/detectors/aws/session_keys/sessionkey.go` | 61 | Session key ID pattern `((?:ASIA)[A-Z0-9]{16})` |
 | `pkg/detectors/aws/session_keys/sessionkey.go` | 62 | Session token pattern `([a-zA-Z0-9+/]{100,}={0,3})` |
