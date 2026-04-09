@@ -48,7 +48,7 @@ The keyword aggregation process is implemented in `NewAhoCorasickCore` at `pkg/e
 
 The `keywords` slice fed to the trie builder may contain duplicates (the same keyword contributed by multiple detectors), but the `BobuSumisu/aho-corasick` trie builder handles deduplication internally. The `keywordsToDetectors` map's key count gives the unique keyword count, and entries where `len(value) >= 2` identify shared keywords.
 
-The default detector list is produced by `buildDetectorList()` in `pkg/engine/defaults/defaults.go:839-1702`, which returns a slice of 831 active (uncommented) detector instances. Some entries like `// &abstract.Scanner{}` are commented out and thus excluded. `DefaultDetectors()` at line 1704 wraps this with endpoint customization post-processing but does not change the detector count.
+The default detector list is produced by `buildDetectorList()` in `pkg/engine/defaults/defaults.go:839-1702`, which returns a slice of 831 active (uncommented) detector instances. Of these, 829 use the `&package.Scanner{}` pattern and 2 use factory functions (`aws_access_keys.New()` and `aws_session_keys.New()` at lines 906-907). Some entries like `// &abstract.Scanner{}` are commented out and thus excluded. `DefaultDetectors()` at line 1704 wraps this with endpoint customization post-processing but does not change the detector count.
 
 The engine invokes this at `pkg/engine/engine.go:530`:
 
@@ -303,12 +303,13 @@ if !*noVerificationCache {
 }
 ```
 
-The `simple.NewCache` from `pkg/cache/simple/simple.go:10-13` creates a new in-memory go-cache instance with default 12-hour expiration and 13-hour purge interval:
+The `simple.NewCache` from `pkg/cache/simple/simple.go:10-14` creates a new in-memory go-cache instance with default 12-hour expiration and 13-hour purge interval:
 
 ```go
 const (
     defaultExpirationInterval = 12 * time.Hour
     defaultPurgeInterval      = 13 * time.Hour
+    defaultExpiration         = cache.DefaultExpiration
 )
 ```
 
@@ -395,7 +396,7 @@ $ /tmp/trufflehog filesystem --no-update --results=verified,unverified,unknown \
 - With `--no-verification-cache`, `Misses` drops to 0 because the cache is not instantiated at all (the `resultCache` field is nil, so the code path in `FromData` at `verification_cache.go:58-67` bypasses all cache logic)
 - `VerificationTimeSpentMS` is still tracked even without the cache (294ms vs 338ms) because the timing measurement wraps the `detector.FromData` call regardless
 
-**Source:** `pkg/verificationcache/in_memory_metrics.go:9-15`, `pkg/verificationcache/metrics_reporter.go:7-28`, `main.go:511-574`, `pkg/cache/simple/simple.go:10-13`, `pkg/verificationcache/verification_cache.go:50-147`
+**Source:** `pkg/verificationcache/in_memory_metrics.go:9-15`, `pkg/verificationcache/metrics_reporter.go:7-28`, `main.go:511-574`, `pkg/cache/simple/simple.go:10-14`, `pkg/verificationcache/verification_cache.go:50-147`
 
 ---
 
@@ -725,7 +726,7 @@ AWS: 139.03264ms
 
 **Key observations:**
 - Only `AWS` appears in the output because it was the only detector that produced results (the test data contained AWS keys)
-- The 831 other detectors are **not listed** because they did not produce results (the `len(results) > 0` guard filters them out)
+- The other 830 detectors (out of 831 total) are **not listed** because they did not produce results (the `len(results) > 0` guard filters them out)
 - The 139ms duration **includes** the time spent on remote verification (attempting to validate the AWS key against AWS endpoints), confirming that verification time is part of the measurement
 - Output goes to `stderr` (not `stdout`), per `fmt.Fprintln(os.Stderr, ...)` at line 1022
 
@@ -757,7 +758,7 @@ All source code references used in this document:
 | `pkg/verificationcache/verification_cache.go` | 136-147 | `getResultCacheKey` — Blake2B hash of Raw+RawV2+DetectorType |
 | `pkg/verificationcache/in_memory_metrics.go` | 9-15 | `InMemoryMetrics` — five atomic metric counters |
 | `pkg/verificationcache/metrics_reporter.go` | 7-28 | `MetricsReporter` interface — metric semantic contracts |
-| `pkg/cache/simple/simple.go` | 10-13 | Default expiration (12h) and purge (13h) intervals |
+| `pkg/cache/simple/simple.go` | 10-14 | Default expiration (12h), purge (13h) intervals, and default expiration constant |
 | `pkg/cache/lru/lru.go` | 43-71 | LRU cache wrapper (128,000 default size) |
 | `main.go` | 85 | `--no-verification-cache` CLI flag definition |
 | `main.go` | 511-574 | Verification cache metrics instantiation and logging |
