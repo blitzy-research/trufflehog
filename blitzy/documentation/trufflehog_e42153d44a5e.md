@@ -338,7 +338,7 @@ This sentinel error is:
 
 ### 2.5 Re-send Path for Non-Duplicates
 
-After overlap checking completes for a chunk, detectors that were **not** flagged as duplicates are re-sent to `detectableChunksChan` for full detection with verification enabled:
+After overlap checking completes for a chunk, detectors that were **not** flagged as duplicates are re-sent to `detectableChunksChan` for full detection with verification re-evaluated via `shouldVerifyChunk()`:
 
 ```go
 for _, detector := range detectorKeysWithResults {
@@ -444,7 +444,7 @@ result.SourceType == sourcespb.SourceType_SOURCE_TYPE_POSTMAN
 
 > Source: `pkg/engine/engine.go:1218`
 
-For Postman sources, **all** duplicates are suppressed regardless of `DecoderType` — even same-decoder duplicates. This is a source-specific override that aggressively deduplicates Postman results, likely because Postman collections can contain the same secret in multiple requests/environments, and even same-decoder duplicates are considered redundant.
+For Postman sources, **all** duplicates are suppressed regardless of `DecoderType` — even same-decoder duplicates. The code does not document the motivation for this Postman-specific override. The effect is that all duplicates are suppressed for Postman sources, regardless of DecoderType.
 
 ```mermaid
 flowchart TD
@@ -573,7 +573,7 @@ The number of results depends on several interacting factors. We trace four repr
 
 1. **UTF8**: Returns `PLAIN` `DecodableChunk` with original data. Chunk contains both the raw key and the Base64 string.
 2. **Base64**: Finds a valid Base64 substring (28 chars > 20 threshold). Decodes it. **Mutates** `chunk.Data` (line 67) — the Base64-encoded portion is replaced with decoded bytes (which is the same key `AKIAIOSFODNN7EXAMPLE`). Returns `BASE64` `DecodableChunk`.
-3. **UTF16**: Now seeing mutated data. Unlikely to match UTF-16 patterns. Returns `nil`. ✗
+3. **UTF16**: Now seeing mutated data. ASCII text does not contain the zero-byte patterns that `utf16ToUTF8()` (`pkg/decoders/utf16.go:39`) scans for, so `bufBE` and `bufLE` remain empty and the decoder returns `nil`. ✗
 4. **EscapedUnicode**: Clones the (now-mutated) data. No escape patterns. Returns `nil`. ✗
 
 **Two `DecodableChunks`** enter the pipeline: one PLAIN, one BASE64. Assuming only the AWS detector keyword-matches each (≤1 detector match), both go directly to `detectableChunksChan`.
@@ -607,7 +607,7 @@ The number of results depends on several interacting factors. We trace four repr
 **Decoder pass-through:**
 
 1. **UTF8**: Returns `PLAIN` with original data. ✓
-2. **Base64**: May or may not find valid Base64 substrings depending on exact content. For this scenario, assume no qualifying Base64 (the escape sequences contain `\u` which breaks Base64 character runs). Returns `nil`. ✗
+2. **Base64**: The backslash character `\` in `\uXXXX` escape sequences is not in the Base64 character set (`pkg/decoders/base64.go:17`), so it breaks consecutive Base64-character runs. No substring exceeds the 20-character threshold. Returns `nil`. ✗
 3. **UTF16**: Returns `nil` (no zero-byte patterns). ✗
 4. **EscapedUnicode**: Clones `chunk.Data` (line 39), finds `\uXXXX` patterns, decodes them to the same key. Returns `ESCAPED_UNICODE` with a **new** `Chunk` struct (lines 54–63). ✓
 
