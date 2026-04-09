@@ -48,7 +48,7 @@ The keyword aggregation process is implemented in `NewAhoCorasickCore` at `pkg/e
 
 The `keywords` slice fed to the trie builder may contain duplicates (the same keyword contributed by multiple detectors), but the `BobuSumisu/aho-corasick` trie builder handles deduplication internally. The `keywordsToDetectors` map's key count gives the unique keyword count, and entries where `len(value) >= 2` identify shared keywords.
 
-The default detector list is produced by `buildDetectorList()` in `pkg/engine/defaults/defaults.go:839-1701`, which returns a slice of 831 active (uncommented) detector instances. Some entries like `// &abstract.Scanner{}` are commented out and thus excluded. `DefaultDetectors()` at line 1704 wraps this with endpoint customization post-processing but does not change the detector count.
+The default detector list is produced by `buildDetectorList()` in `pkg/engine/defaults/defaults.go:839-1702`, which returns a slice of 831 active (uncommented) detector instances. Some entries like `// &abstract.Scanner{}` are commented out and thus excluded. `DefaultDetectors()` at line 1704 wraps this with endpoint customization post-processing but does not change the detector count.
 
 The engine invokes this at `pkg/engine/engine.go:530`:
 
@@ -80,7 +80,7 @@ func NewAhoCorasickCore(allDetectors []detectors.Detector, opts ...CoreOption) *
 
 A custom Go program was executed that imports `pkg/engine/defaults` and iterates all default detectors, counting unique and shared keywords:
 
-```
+```bash
 $ go run /tmp/count_keywords.go
 Total detectors: 831
 Total keywords (with duplicates): 955
@@ -214,7 +214,7 @@ flowchart TD
 
 Verbose scan with `--log-level=5` showing the decoder processing pipeline, worker startup, and detection flow:
 
-```
+```bash
 $ /tmp/trufflehog filesystem --no-update --log-level=5 --concurrency=2 \
     --no-verification --results=verified,unverified,unknown,filtered_unverified \
     /tmp/trufflehog_test_data/verbose_test.txt
@@ -351,7 +351,7 @@ func (v *VerificationCache) getResultCacheKey(result detectors.Result) ([]byte, 
 
 **Scan 1 — With verification cache enabled (default):**
 
-```
+```bash
 $ /tmp/trufflehog filesystem --no-update --results=verified,unverified,unknown \
     /tmp/trufflehog_test_data/
 
@@ -364,7 +364,7 @@ $ /tmp/trufflehog filesystem --no-update --results=verified,unverified,unknown \
 
 **Scan 2 — Consecutive identical scan (cache enabled):**
 
-```
+```bash
 $ /tmp/trufflehog filesystem --no-update --results=verified,unverified,unknown \
     /tmp/trufflehog_test_data/
 
@@ -377,7 +377,7 @@ $ /tmp/trufflehog filesystem --no-update --results=verified,unverified,unknown \
 
 **Scan 3 — With verification cache DISABLED:**
 
-```
+```bash
 $ /tmp/trufflehog filesystem --no-update --results=verified,unverified,unknown \
     --no-verification-cache /tmp/trufflehog_test_data/
 
@@ -488,7 +488,7 @@ flowchart LR
         NW["notifierWorker × 4<br/>Dedup + Dispatch"]
     end
 
-    SM -->|"ChunksChan<br/>(unbuffered)"| SW
+    SM -->|"ChunksChan<br/>(buffer: 64)"| SW
     SW -->|"detectableChunksChan<br/>(buffer: NumCPU × 50)"| DW
     SW -->|"verificationOverlapChunksChan<br/>(buffer: NumCPU × 25)"| OW
     OW -->|"detectableChunksChan<br/>(shared channel)"| DW
@@ -506,7 +506,7 @@ flowchart LR
 
 Worker startup counts with `--concurrency=4`:
 
-```
+```bash
 $ /tmp/trufflehog filesystem --no-update --log-level=2 --concurrency=4 \
     /tmp/trufflehog_test_data
 
@@ -612,7 +612,7 @@ flowchart TD
 
 A file containing the same AWS secret in both plaintext and Base64-encoded form was scanned:
 
-```
+```bash
 $ cat /tmp/trufflehog_test_data/combined_secret.txt
 Plaintext credentials:
 AKIAIOSFODNN7REALKEY
@@ -715,7 +715,7 @@ The header message itself documents the behavior: "when results are returned."
 
 ### Runtime Evidence
 
-```
+```bash
 $ /tmp/trufflehog filesystem --no-update --print-avg-detector-time \
     --results=verified,unverified,unknown /tmp/trufflehog_test_data/
 
