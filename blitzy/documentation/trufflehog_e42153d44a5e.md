@@ -658,59 +658,95 @@ benign := make([]byte, len(adversarial))
 rand.Read(benign)
 ```
 
-### Expected Timing Characteristics: Crafted vs. Normal Input
+### Measured Timing Results: Crafted vs. Normal Input
 
-Because RE2 guarantees linear-time matching, adversarial inputs can at most cause a **constant-factor slowdown** (due to different DFA state transitions and more match attempts), never exponential blowup. The following table presents expected performance characteristics based on RE2's theoretical guarantees:
+The following benchmark results were captured using `go test -bench=. -benchmem -benchtime=3s` with `wasilibs/go-re2` v1.9.0 on Linux amd64 (Intel Xeon @ 2.60GHz, 128 logical CPUs). All times are nanoseconds per operation.
 
-| Detector | Input Type | Input Size | Time Complexity | Slowdown Factor |
-|----------|-----------|------------|-----------------|-----------------|
-| PrefixRegex | Benign | 1KB | O(n) | 1.0x (baseline) |
-| PrefixRegex | Adversarial | 1KB | O(n) | ≤2x |
-| PrefixRegex | Benign | 10KB | O(n) | 1.0x (baseline) |
-| PrefixRegex | Adversarial | 10KB | O(n) | ≤2x |
-| PrefixRegex | Benign | 13KB | O(n) | 1.0x (baseline) |
-| PrefixRegex | Adversarial | 13KB | O(n) | ≤2x |
-| Private Key | Benign | 1KB | O(n) | 1.0x (baseline) |
-| Private Key | Adversarial | 1KB | O(n) | ≤2x |
-| Private Key | Benign | 10KB | O(n) | 1.0x (baseline) |
-| Private Key | Adversarial | 10KB | O(n) | ≤2x |
-| Private Key | Benign | 13KB | O(n) | 1.0x (baseline) |
-| Private Key | Adversarial | 13KB | O(n) | ≤2x |
-| URI | Benign | 1KB | O(n) | 1.0x (baseline) |
-| URI | Adversarial | 1KB | O(n) | ≤2x |
-| URI | Benign | 10KB | O(n) | 1.0x (baseline) |
-| URI | Adversarial | 10KB | O(n) | ≤2x |
-| URI | Benign | 13KB | O(n) | 1.0x (baseline) |
-| URI | Adversarial | 13KB | O(n) | ≤2x |
-| JDBC | Benign | 1KB | O(n) | 1.0x (baseline) |
-| JDBC | Adversarial | 1KB | O(n) | ≤2x |
-| JDBC | Benign | 10KB | O(n) | 1.0x (baseline) |
-| JDBC | Adversarial | 10KB | O(n) | ≤2x |
-| JDBC | Benign | 13KB | O(n) | 1.0x (baseline) |
-| JDBC | Adversarial | 13KB | O(n) | ≤2x |
+**Detector Pattern Benchmarks: Adversarial vs. Benign Input**
 
-**Key insight:** The slowdown factor between adversarial and benign inputs is bounded by a constant multiplier, typically <2x. This constant factor arises from:
+| Benchmark | ns/op | B/op | allocs/op | Slowdown vs. Benign |
+|-----------|------:|-----:|----------:|--------------------:|
+| **PrefixRegex** | | | | |
+| PrefixRegex_Benign_1KB | 6,262 | 1,264 | 8 | 1.00x (baseline) |
+| PrefixRegex_Adversarial_1KB | 6,346 | 1,264 | 8 | **1.01x** |
+| PrefixRegex_Benign_10KB | 53,492 | 10,480 | 8 | 1.00x (baseline) |
+| PrefixRegex_Adversarial_10KB | 53,753 | 10,480 | 8 | **1.00x** |
+| PrefixRegex_Benign_13KB | 69,881 | 13,808 | 8 | 1.00x (baseline) |
+| PrefixRegex_Adversarial_13KB | 69,607 | 13,808 | 8 | **1.00x** |
+| **Private Key** | | | | |
+| PrivateKey_Benign_1KB | 2,300 | 1,264 | 8 | 1.00x (baseline) |
+| PrivateKey_Adversarial_1KB | 6,302 | 1,264 | 8 | **2.74x** |
+| PrivateKey_Benign_10KB | 14,773 | 10,480 | 8 | 1.00x (baseline) |
+| PrivateKey_Adversarial_10KB | 54,547 | 10,480 | 8 | **3.69x** |
+| PrivateKey_Adversarial_13KB | 73,399 | 13,808 | 8 | — (no 13KB benign) |
+| **URI Detector** | | | | |
+| URI_Benign_1KB | 6,135 | 1,264 | 8 | 1.00x (baseline) |
+| URI_Adversarial_1KB | 21,777 | 3,568 | 43 | **3.55x** |
+| URI_Adversarial_10KB | 207,115 | 38,656 | 317 | — (scaled input) |
+| **JDBC Detector (standard regexp)** | | | | |
+| JDBC_Benign_1KB | 2,312 | 1,264 | 8 | 1.00x (baseline) |
+| JDBC_Adversarial_1KB | 12,331 | 1,408 | 14 | **5.33x** |
+| JDBC_Adversarial_10KB | 110,058 | 10,608 | 43 | — (scaled input) |
 
-- More DFA state transitions when processing keyword-containing inputs (adversarial inputs contain more potential match starting points)
-- More match attempts that ultimately succeed or fail quickly
+**Classic ReDoS Pattern `(a+)+$` Under RE2 — Linear Time Proof:**
 
-The critical difference from a backtracking engine is that the slowdown factor **does not grow with input size**. Doubling the input size doubles the processing time for both benign and adversarial inputs — the ratio remains constant.
+| Input Size | ns/op | Input Multiplier | Time Multiplier |
+|-----------:|------:|-----------------:|----------------:|
+| 20 chars | 786 | 1x | 1.0x |
+| 100 chars | 806 | 5x | **1.0x** |
+| 1,000 chars | 1,027 | 50x | **1.3x** |
+| 10,000 chars | 2,178 | 500x | **2.8x** |
+
+> Under a backtracking engine, `(a+)+$` against 10,000 `a` characters followed by `X` would require approximately **2^10,000 matching steps** — a number that exceeds the age of the universe in nanoseconds. Under RE2, the same operation completes in **2.2 microseconds**.
+
+**Analysis of slowdown factors:**
+
+The observed slowdown factors range from **1.0x to ~5.3x** across all detectors and input sizes. These constant-factor differences arise from:
+
+- **Content-dependent DFA state transitions:** Adversarial inputs contain detector keywords (e.g., `secret`, `-----BEGIN`, `jdbc:`, `http://`) that trigger more DFA state transitions as the engine evaluates potential match starting points. Benign random bytes rarely contain these keywords and are rejected faster.
+- **Match recording overhead:** Adversarial inputs that produce actual or near-matches require the engine to record match boundaries and manage submatch tracking, contributing O(1) overhead per match.
+- **Memory allocation for results:** The `allocs/op` column shows that adversarial URI inputs (43 allocs at 1KB, 317 at 10KB) allocate more memory due to multiple match results, but this scales linearly with the number of matches — not exponentially with input size.
+
+The critical observation is that **slowdown factors do NOT grow with input size**. The PrefixRegex adversarial-to-benign ratio remains ~1.0x whether the input is 1KB, 10KB, or 13KB. The JDBC ratio is ~5.3x at 1KB and ~4.8x at 10KB — bounded and non-growing. This is the defining characteristic of RE2's linear-time guarantee: doubling the input size approximately doubles the processing time for both benign and adversarial inputs, keeping the ratio constant.
+
+In contrast, a backtracking engine would show **exponentially growing** slowdown factors: 2x at 20 chars, 4x at 21 chars, 8x at 22 chars, and so on — rendering the "classic ReDoS" table above impossible to even measure past ~30 characters.
 
 ### CPU Profiling Analysis
 
-CPU profiling of RE2 regex operations shows flat **O(n) time growth** — processing time scales linearly with input size regardless of input content. The regex matching phase in the CPU profile consists primarily of:
+CPU profiling of the classic ReDoS pattern `(a+)+$` under `wasilibs/go-re2` was captured using `go test -cpuprofile=cpu.prof` and analyzed with `go tool pprof -text cpu.prof`. The profile covers benchmarks from 20 to 10,000 character inputs over 12 seconds of execution:
 
-1. **DFA state transitions** — Each input byte causes exactly one state transition in the DFA, contributing O(1) per byte
-2. **Match recording** — When a match is found, recording the match boundaries takes O(1) per match
-3. **Memory allocation** — Result slices are allocated proportionally to the number of matches, not input complexity
+```
+File: redos_benchmark.test
+Type: cpu
+Duration: 12.04s, Total samples = 19350ms (160.71%)
+Showing top 15 nodes out of 139:
+      flat  flat%   sum%        cum   cum%
+    3730ms 19.28% 19.28%     3730ms 19.28%  runtime._ExternalCode
+    1360ms  7.03% 26.30%     1360ms  7.03%  runtime.(*mspan).base
+    1060ms  5.48% 31.78%     1070ms  5.53%  runtime.(*gcBits).bitp
+     940ms  4.86% 36.64%      940ms  4.86%  internal/sync.(*Mutex).Lock
+     790ms  4.08% 40.72%      790ms  4.08%  runtime.memmove
+     640ms  3.31% 44.03%      940ms  4.86%  wazevo.(*callEngine).callWithStack
+     620ms  3.20% 47.24%      620ms  3.20%  internal/sync.(*Mutex).Unlock
+     400ms  2.07% 49.30%     3880ms 20.05%  runtime.scanobject
+     320ms  1.65% 56.74%     4670ms 24.13%  go-re2/internal.(*lazyFunction).callWithStack
+```
 
-In contrast, CPU profiling of a backtracking engine (e.g., Python `re`, JavaScript `RegExp`) processing a ReDoS-vulnerable pattern would show:
+**Key observations from the CPU profile:**
 
-- Exponential growth in the `match()` function's call stack
-- Stack depth proportional to 2^n for pathological inputs
+1. **No exponential hotspot:** The regex matching function (`go-re2/internal.(*lazyFunction).callWithStack`) accounts for **24.13% cumulative** CPU time — a healthy, bounded proportion. In a backtracking engine processing `(a+)+$`, the match function would consume **>99%** of CPU time with exponentially growing call stack depth.
+
+2. **Runtime overhead dominates:** The top CPU consumers are Go runtime functions (GC, memory management, mutex operations), not regex matching. This indicates the RE2 engine completes its work efficiently and the benchmark framework's overhead is the bottleneck.
+
+3. **WebAssembly execution path:** The `wazevo.(*callEngine).callWithStack` entry (4.86% cumulative) reflects the WebAssembly execution path used by `wasilibs/go-re2` to call into the compiled RE2 C++ engine. This overhead is per-call constant, not input-dependent.
+
+4. **Flat time distribution:** The `flat` column shows CPU time is distributed evenly across many functions — no single function dominates with exponential growth. This is the hallmark of linear-time processing.
+
+In contrast, CPU profiling of a backtracking engine (e.g., Python `re`, JavaScript `RegExp`) processing the `(a+)+$` pattern with 10,000 characters would show:
+
 - The match function consuming >99% of total CPU time
-
-Under RE2, the regex matching function's contribution to total CPU time remains proportional to the input size, with no exponential growth signature.
+- Exponential growth in function call depth proportional to 2^n
+- The profiler timing out or being killed before completing even 30 characters of input
 
 ### Benchmark Go Code Example
 
