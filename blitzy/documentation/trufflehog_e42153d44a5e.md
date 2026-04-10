@@ -470,8 +470,8 @@ Found unverified result 🐷🔑❓
 Detector Type: AWS
 Decoder Type: PLAIN
 Raw result: AKIAZ3MRHLLKZZ4GZN5Q
-Account: 3XXXXX4XXXXX
-Resource Type: Access key
+Resource_type: Access key
+Account: 677298789077
 File: config.env
 Line: 1
 ```
@@ -480,6 +480,7 @@ The key fields in the output:
 - **Detector Type: AWS** — the AWS access key detector identified this credential
 - **Raw result** — shows the access key ID (the secret key is not printed for security)
 - **Found unverified result 🐷🔑❓** — the `❓` indicates the credential was not verified against AWS STS (either `--no-verification` was set, or verification failed because the key is fabricated)
+- **Resource_type** — the type of AWS resource detected (e.g., `Access key`)
 - **Account** — the AWS account number decoded from the access key ID via `GetAccountNumFromID()`
 
 *Source: Result formatting in `pkg/engine/engine.go`, result output via `pkg/output/`*
