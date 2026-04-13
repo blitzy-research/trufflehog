@@ -354,7 +354,7 @@ An isolated pipeline test was constructed that:
 | `jdbc.Scanner` | 490 | 2.2% | 48,760 | 1 |
 | `access_keys.scanner` | 210 | 0.9% | 0 | 1 |
 | `github.Scanner` | 191 | 0.9% | 0 | 2 |
-| All others (6 detectors) | 447 | 2.0% | 0 | 6 |
+| All others (7 detectors) | 447 | 2.0% | 0 | 7 |
 | **TOTAL** | **22,334** | **100%** | **97,520** | — |
 
 ### 6.3 Key Insights
