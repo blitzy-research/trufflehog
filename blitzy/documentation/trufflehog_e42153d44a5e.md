@@ -433,7 +433,7 @@ The detectors that actually participate in a scan are determined by a four-layer
 
 **Layer 1 — Detector Registry (`defaults.DefaultDetectors`)**
 
-`DefaultDetectors()` at `pkg/engine/defaults/defaults.go:1704-1723` calls `buildDetectorList()` (lines 11-1702), which returns approximately 860 detector instances. It then iterates over the list and configures every detector implementing the `EndpointCustomizer` interface (lines 1709-1720):
+`DefaultDetectors()` at `pkg/engine/defaults/defaults.go:1704-1723` calls `buildDetectorList()` (lines 839-1702), which returns approximately 860 detector instances. It then iterates over the list and configures every detector implementing the `EndpointCustomizer` interface (lines 1709-1720):
 - `UseFoundEndpoints(true)` — enables discovery-based endpoints
 - `UseCloudEndpoint(true)` — enables cloud-provider endpoints
 - `SetCloudEndpoint(cloudProvider.CloudEndpoint())` — sets the actual cloud URL for detectors that are also `CloudProvider`s
