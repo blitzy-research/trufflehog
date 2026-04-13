@@ -36,13 +36,15 @@ TruffleHog employs `github.com/wasilibs/go-re2 v1.9.0` across 867 of its 870 det
 
 However, linear-time guarantees do not prevent **constant-factor attacks** — patterns with high per-position computational cost that, while still scaling linearly with input size, do so with a dramatically higher constant than benign input. The most significant example is the SQL Server detector (`pkg/detectors/sqlserver/sqlserver.go`, line 25), whose regex pattern `(?:[A-Za-z0-9_ ]+=[^;$'"$]+;?){3,}` exhibits a **148× slowdown** on crafted input: 19,214 ms on 10 MB of attack data versus 130 ms on 10 MB of benign data of the same size. This single detector accounts for **89% of total detection time** on attack workloads.
 
+> **Note on simplified pattern rendering**: The negated character class shown above omits a backtick character that is present in the actual source code pattern. The complete pattern including the backtick is shown in the fenced code block in [Section 4.1](#41-pattern-analysis), which is the authoritative rendering. The omission here is due to markdown formatting constraints with backtick characters inside inline code spans.
+
 ### Impact on CI Pipelines
 
 On a 50 MB crafted file, the overall scanning time increases from ~3.2 seconds (benign) to ~31.9 seconds (attack), a **9.9× gross slowdown** (54.4× net slowdown after subtracting the ~2,700 ms constant initialization overhead). In a CI pipeline with a 60-second timeout for secret scanning, this could cause legitimate scans to fail, enabling an attacker to deny service to the scanning infrastructure by committing crafted files.
 
 ### Key Quantitative Metrics
 
-- **857** registered detectors with **1,142** compiled regex patterns across **845** detector subdirectories
+- **857** registered detectors with **1,144** compiled regex patterns across **845** detector subdirectories
 - **4** default decoders (UTF-8, Base64, UTF-16, Escaped Unicode) provide decoder multiplication
 - **±512 byte** span calculation radius in the Aho-Corasick prefilter
 - **12** detector match groups triggered per chunk on 10 MB attack data
@@ -194,7 +196,7 @@ TruffleHog's regex execution relies on two RE2-family engines:
 
 | Engine | Package | Version | Detectors Using | Import Pattern |
 |---|---|---|---|---|
-| Google RE2 (C++ via CGo) | `github.com/wasilibs/go-re2` | v1.9.0 (`go.mod` line 100) | 867 files | `regexp "github.com/wasilibs/go-re2"` |
+| Google RE2 (via WebAssembly/wazero) | `github.com/wasilibs/go-re2` | v1.9.0 (`go.mod` line 100) | 867 files | `regexp "github.com/wasilibs/go-re2"` |
 | Go standard regexp | `regexp` (stdlib) | Go 1.24.2 (`go.mod` line 5) | 3 files | `"regexp"` |
 
 Both engines implement the Thompson NFA / RE2 algorithm, which guarantees **O(mn) worst-case time** for a single match operation, where `m` is the pattern size and `n` is the input size. This is achieved by:
@@ -209,7 +211,7 @@ This architectural choice makes **classical exponential-backtracking ReDoS categ
 
 Three lines of evidence confirm that classical ReDoS cannot occur in TruffleHog:
 
-1. **All detector regex calls use RE2 engines**: All 1,142+ `regexp.MustCompile` calls across `pkg/detectors/` use either the `wasilibs/go-re2` aliased import or Go's standard `regexp`. No detector file imports a backtracking regex engine.
+1. **All detector regex calls use RE2 engines**: All 1,144 `regexp.MustCompile` calls across `pkg/detectors/` (excluding test files) use either the `wasilibs/go-re2` aliased import or Go's standard `regexp`. No detector file imports a backtracking regex engine.
 
 2. **The backtracking engine is not used**: `dlclark/regexp2 v1.4.0` — a PCRE-compatible regex library that **does** support backtracking — is present as an **indirect dependency** in `go.mod` (line 187: `github.com/dlclark/regexp2 v1.4.0 // indirect`). However, it is **not imported or used anywhere** in `pkg/`. If it were used, classical exponential-backtracking ReDoS would be possible.
 
@@ -298,7 +300,7 @@ The slowdown is caused by the interaction of three factors:
 
 3. **Full-input scan via `FindAllStringSubmatch(data, -1)`**: The `-1` argument means "find all matches" — the engine must test every position in the input as a potential match start, at ~1.97 ms per KB.
 
-The CPU profile confirms this: `runtime._ExternalCode` (the CGo boundary where the C++ RE2 library executes) consumes **47.9% (22.80s)** of total CPU time during attack-data processing.
+The CPU profile confirms this: `runtime._ExternalCode` (representing wazero's WebAssembly runtime executing the compiled RE2 engine) consumes **47.9% (22.80s)** of total CPU time during attack-data processing.
 
 ---
 
@@ -375,7 +377,7 @@ A CPU profile was captured using Go's `runtime/pprof` package during processing 
 
 | Function | Flat Time | % Total | Cumulative | Category |
 |---|---|---|---|---|
-| `runtime._ExternalCode` | 22.80s | 47.9% | 22.80s | RE2 C library execution (CGo) |
+| `runtime._ExternalCode` | 22.80s | 47.9% | 22.80s | RE2 execution via WebAssembly (wazero) |
 | `runtime.unlock2` | 8.16s | 17.1% | 8.16s | GC lock contention |
 | `runtime.lock2` | 6.74s | 14.2% | 6.74s | GC lock contention |
 | `runtime.freeSomeWbufs` | 0.91s | 1.9% | 0.91s | GC sweep (97K+ result objects) |
@@ -387,7 +389,7 @@ A CPU profile was captured using Go's `runtime/pprof` package during processing 
 
 The CPU profile reveals two compounding attack vectors:
 
-1. **47.9% — RE2 C library execution** (`runtime._ExternalCode`): This represents the SQL Server detector's `FindAllStringSubmatch` call executing within the C++ RE2 library via CGo. The 22.80 seconds of CPU time is almost entirely attributable to the SQL Server regex pattern processing 10 MB of attack data. The `_ExternalCode` label appears because `go-re2` is a CGo wrapper around Google's C++ RE2 library — Go's profiler cannot attribute time to individual C functions, so all CGo execution is aggregated under this symbol.
+1. **47.9% — RE2 WebAssembly execution** (`runtime._ExternalCode`): This represents the SQL Server detector's `FindAllStringSubmatch` call executing within the RE2 engine via `go-re2`'s WebAssembly/wazero backend. The 22.80 seconds of CPU time is almost entirely attributable to the SQL Server regex pattern processing 10 MB of attack data. The `_ExternalCode` label appears because `go-re2` (built with `CGO_ENABLED=0`) packages RE2 as a WebAssembly module executed by the wazero runtime. Wazero's compiler mode JIT-compiles WebAssembly to native machine code, which Go's profiler cannot attribute to individual Go functions — all wazero-executed native code is aggregated under the `_ExternalCode` symbol.
 
 2. **31.3% — GC lock contention** (`runtime.unlock2` + `runtime.lock2`): The URI and JDBC detectors produce 97,520 result objects on the 10 MB attack data. Each `detectors.Result` struct includes multiple string and byte-slice fields that generate significant garbage. The Go garbage collector spends 31.3% of CPU time in lock contention during concurrent GC sweeps, competing with the application goroutines for access to heap metadata.
 
@@ -497,7 +499,7 @@ The CPU profile reveals two compounding attack vectors:
 | **Protection** | `context.WithTimeout(ctx, detectionTimeout)` cancels individual detector invocation after 10 seconds |
 | **Effectiveness** | **PER-DETECTOR effective** — prevents any single detector from running indefinitely |
 | **Gap** | No cumulative cap across all detectors processing a single chunk. With 12 triggered detectors, the theoretical max is 12 × 10s = 120 seconds per chunk |
-| **Additional gap** | The SQL Server detector's `FindAllStringSubmatch` runs in the C++ RE2 library via CGo, and CGo calls may not check Go's context cancellation promptly. The 1-second grace timer (line 1067) logs violations but does not forcibly terminate the CGo call |
+| **Additional gap** | The SQL Server detector's `FindAllStringSubmatch` runs in the RE2 engine via `go-re2`'s WebAssembly/wazero backend. Wazero executes WebAssembly functions as atomic operations that cannot be interrupted by Go's context cancellation mid-execution. The 1-second grace timer (line 1067) logs violations but does not forcibly terminate the in-progress WebAssembly call |
 
 ### 9.4 Archive Limits
 
@@ -726,7 +728,7 @@ Key packages relevant to this security assessment, sourced from `go.mod`:
 
 | Package | Version | go.mod Line | Purpose |
 |---|---|---|---|
-| `github.com/wasilibs/go-re2` | v1.9.0 | 100 | Primary regex engine (CGo binding to Google RE2 C++ library) |
+| `github.com/wasilibs/go-re2` | v1.9.0 | 100 | Primary regex engine (RE2 via WebAssembly/wazero runtime; CGo mode available via `re2_cgo` build tag but not used — build uses `CGO_ENABLED=0`) |
 | `regexp` (Go stdlib) | Go 1.24.2 | 5 (toolchain) | Standard regex engine (Thompson NFA, RE2 semantics) |
 | `github.com/BobuSumisu/aho-corasick` | v1.0.3 | 17 | Aho-Corasick trie for keyword prefiltering |
 | `github.com/microsoft/go-mssqldb` | v1.8.0 | 77 | SQL Server driver; `msdsn.Parse()` called per regex match |
@@ -742,7 +744,7 @@ Key packages relevant to this security assessment, sourced from `go.mod`:
 
 ### Primary Finding
 
-**Classical exponential-backtracking ReDoS is architecturally impossible in TruffleHog v3.** The deliberate choice to use `wasilibs/go-re2` (RE2 semantics via C++ library) for 867 detectors and Go's standard `regexp` (Thompson NFA) for 3 detectors ensures that all regex evaluation completes in time linear in the input size. The backtracking-capable `dlclark/regexp2` library is present as an indirect dependency but is not used in the detection pipeline. This is a strong security design decision that eliminates an entire class of denial-of-service attacks.
+**Classical exponential-backtracking ReDoS is architecturally impossible in TruffleHog v3.** The deliberate choice to use `wasilibs/go-re2` (RE2 semantics via WebAssembly/wazero runtime) for 867 detectors and Go's standard `regexp` (Thompson NFA) for 3 detectors ensures that all regex evaluation completes in time linear in the input size. The backtracking-capable `dlclark/regexp2` library is present as an indirect dependency but is not used in the detection pipeline. This is a strong security design decision that eliminates an entire class of denial-of-service attacks.
 
 ### Secondary Finding
 
