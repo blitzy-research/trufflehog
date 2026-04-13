@@ -168,7 +168,7 @@ Each non-nil decoded chunk carries the `DecoderType` assigned by its originating
 #### Base64 Decoder (`pkg/decoders/base64.go:34-72`)
 
 - **Line 30-31:** `Type()` returns `DecoderType_BASE64`.
-- **Line 36:** Calls `getSubstringsOfCharacterSet(chunk.Data, 20, b64CharsetMapping, b64EndChars)` — the threshold is **20 characters** (runs of Base64-valid characters shorter than 20 are ignored).
+- **Line 36:** Calls `getSubstringsOfCharacterSet(chunk.Data, 20, b64CharsetMapping, b64EndChars)` — the threshold is **20** and the comparison is strictly greater-than (`count > threshold` at `base64.go:97,103,118,125`), so runs of 20 or fewer Base64-valid characters are ignored.
 - **Lines 39-48:** For each candidate substring, attempts `base64.StdEncoding.DecodeString` (line 40) and `base64.RawURLEncoding.DecodeString` (line 45). Both must pass the `isASCII(dec)` check (`base64.go:74-81`) — decoded bytes containing any value > 127 are rejected.
 - **Lines 51-68:** If any successful decodings exist, builds a result buffer that substitutes encoded substrings with their decoded equivalents in-place.
 - **Line 67:** `chunk.Data = result.Bytes()` — **mutates the shared chunk pointer's Data field**.
@@ -212,7 +212,7 @@ This shared-pointer mutation is precisely why the comment at `decoders.go:10` sa
 
 - **`DecoderType_PLAIN` (value 1):** The UTF8 decoder always returns non-nil for any non-empty input. The original file data (containing both the raw key and the Base64-encoded key) is passed through Aho-Corasick matching. The keyword "AKIA" is present in the raw key portion, so the AWS access key detector matches and produces a result tagged `DecoderType_PLAIN`.
 
-- **`DecoderType_BASE64` (value 2):** The Base64 decoder finds the Base64-encoded segment (≥20 characters of Base64 charset), decodes it successfully (the decoded output is ASCII since it's an AWS key), and substitutes the decoded bytes in-place. The resulting `chunk.Data` now contains both the original raw key AND the newly decoded key. Aho-Corasick finds "AKIA" in this data, the AWS detector fires, and a result is tagged `DecoderType_BASE64`.
+- **`DecoderType_BASE64` (value 2):** The Base64 decoder finds the Base64-encoded segment (>20 characters of Base64 charset, per the strict `count > threshold` comparison), decodes it successfully (the decoded output is ASCII since it's an AWS key), and substitutes the decoded bytes in-place. The resulting `chunk.Data` now contains both the original raw key AND the newly decoded key. Aho-Corasick finds "AKIA" in this data, the AWS detector fires, and a result is tagged `DecoderType_BASE64`.
 
 - **`DecoderType_UTF16` (value 3):** Returns `nil` for standard ASCII text. **No result produced.**
 
@@ -240,7 +240,7 @@ The `FindDetectorMatches` function (`pkg/engine/ahocorasick/ahocorasickcore.go:2
 2. **Lines 249-273:** Maps keyword matches to unique `DetectorKey` entries, accumulating match spans for each detector.
 3. **Lines 275-284:** Merges overlapping or adjacent spans and returns `[]*DetectorMatch`, each containing a detector reference and the matched byte spans.
 
-For the AWS access key detector, the keywords are `["AKIA", "ABIA", "ACCA"]` (defined at `pkg/detectors/aws/access_keys/accesskey.go:70-75`). A chunk containing "AKIA" will trigger a match for the AWS access key detector.
+For the AWS access key detector, the keywords are `["AKIA", "ABIA", "ACCA"]` (defined at `pkg/detectors/aws/access_keys/accesskey.go:70-76`). A chunk containing "AKIA" will trigger a match for the AWS access key detector.
 
 ### 4.2 Routing Decision
 
@@ -310,7 +310,7 @@ The `likelyDuplicate` function (`engine.go:887-922`) compares a candidate secret
 
 **For the AWS key scenario with default detectors:**
 
-The AWS access key detector has keywords `["AKIA", "ABIA", "ACCA"]` (`accesskey.go:70-75`). In a typical scan with default detectors, only the AWS access key detector matches a chunk containing an AWS key. Therefore:
+The AWS access key detector has keywords `["AKIA", "ABIA", "ACCA"]` (`accesskey.go:70-76`). In a typical scan with default detectors, only the AWS access key detector matches a chunk containing an AWS key. Therefore:
 
 - `len(matchingDetectors) == 1` — the condition `len(matchingDetectors) > 1` is **false**.
 - The overlap path at `engine.go:796-805` is **NOT taken**.
@@ -483,7 +483,7 @@ The pipeline executes in a strict sequential stage order:
 **Input:** A file containing only the plain-text AWS access key (e.g., `AKIA2OGYBAH6STMMNXNN`).
 
 - **UTF8 decoder** (`utf8.go:16-29`): Returns `DecoderType_PLAIN` chunk with the original data. Aho-Corasick finds "AKIA" → AWS detector matches → produces 1 PLAIN result.
-- **Base64 decoder** (`base64.go:34-72`): `getSubstringsOfCharacterSet` finds "AKIA2OGYBAH6STMMNXNN" (20 characters, meets threshold of 20 at line 36). Attempts Base64 decoding — the result is non-ASCII binary data, which fails the `isASCII` check at line 41. Returns `nil`.
+- **Base64 decoder** (`base64.go:34-72`): `getSubstringsOfCharacterSet` uses a strict `count > threshold` comparison (`base64.go:97,103,118,125`). The isolated key "AKIA2OGYBAH6STMMNXNN" is exactly 20 characters, so `20 > 20` is false — it does **not** qualify as a candidate substring. No qualifying substrings are found, so the decoder returns `nil` at line 71. (Note: in practice, if surrounding Base64-valid characters such as `=` or `_` extend the run beyond 20, the substring may pass the threshold, but the decoded output of an AWS key ID would then fail the `isASCII` check at line 41.)
 - **UTF16 decoder** (`utf16.go:18-33`): Returns `nil` (standard ASCII text).
 - **EscapedUnicode decoder** (`escaped_unicode.go:32-68`): Returns `nil` (no escape patterns).
 
@@ -576,7 +576,7 @@ The variable result count is caused by the interaction of three factors:
 | 7 | processResult | `engine.go:1177-1178` | `CopyMetadata`, `DecoderType = PLAIN` | `ResultWithMetadata` created |
 | 8 | notifierWorker | `engine.go:1216` | Key = `"AWS" + Raw + RawV2 + Metadata` | Key is new → passes through |
 | 9 | scannerWorker | `engine.go:784` | Next decoder: Base64 (index 1) | — |
-| 10 | Base64 decoder | `base64.go:34-71` | Finds "AKIA2OGYBAH6STMMNXNN" (20 chars), decodes as Base64 | Decoded bytes are non-ASCII → `isASCII` fails → returns `nil` |
+| 10 | Base64 decoder | `base64.go:34-71` | `getSubstringsOfCharacterSet` applies strict `count > 20` check (`base64.go:97,103,118,125`) | "AKIA2OGYBAH6STMMNXNN" is exactly 20 chars → `20 > 20` is false → no candidates found → returns `nil` |
 | 11 | scannerWorker | `engine.go:790-792` | `decoded == nil` | Skips to next decoder |
 | 12 | UTF16 decoder | `utf16.go:18-33` | ASCII text, no UTF-16 patterns | Returns `nil` |
 | 13 | EscapedUnicode decoder | `escaped_unicode.go:32-68` | No escape patterns found | Returns `nil` |
@@ -639,7 +639,7 @@ The variable result count is caused by the interaction of three factors:
 | `UTF8.FromChunk` | `pkg/decoders/utf8.go` | 16-29 | PLAIN decoder; always returns non-nil for non-empty input |
 | `Base64.Type` | `pkg/decoders/base64.go` | 30-31 | Returns `DecoderType_BASE64` |
 | `Base64.FromChunk` | `pkg/decoders/base64.go` | 34-72 | BASE64 decoder; chunk mutation at line 67 |
-| `getSubstringsOfCharacterSet` | `pkg/decoders/base64.go` | 83-130 | Extracts runs of ≥threshold Base64 chars |
+| `getSubstringsOfCharacterSet` | `pkg/decoders/base64.go` | 83-130 | Extracts runs of >threshold (strictly greater-than) Base64 chars |
 | `isASCII` | `pkg/decoders/base64.go` | 74-81 | Rejects non-ASCII decoded output |
 | `UTF16.FromChunk` | `pkg/decoders/utf16.go` | 18-33 | UTF16 decoder; returns nil for ASCII text |
 | `EscapedUnicode.FromChunk` | `pkg/decoders/escaped_unicode.go` | 32-68 | Escaped unicode decoder; clones data before processing |
@@ -666,7 +666,7 @@ The variable result count is caused by the interaction of three factors:
 | `CleanResults` | `pkg/detectors/detectors.go` | 200-225 | Filters unverified duplicates; returns `results[:1]` at line 216 |
 | `FindDetectorMatches` | `pkg/engine/ahocorasick/ahocorasickcore.go` | 241-285 | Keyword matching via Aho-Corasick trie |
 | AWS `idPat` | `pkg/detectors/aws/access_keys/accesskey.go` | 65 | Regex: `\b((?:AKIA\|ABIA\|ACCA)[A-Z0-9]{16})\b` |
-| AWS `Keywords` | `pkg/detectors/aws/access_keys/accesskey.go` | 70-75 | `["AKIA", "ABIA", "ACCA"]` |
+| AWS `Keywords` | `pkg/detectors/aws/access_keys/accesskey.go` | 70-76 | `["AKIA", "ABIA", "ACCA"]` |
 | AWS `SecretPat` | `pkg/detectors/aws/common.go` | 10 | 40-character secret regex |
 | `--allow-verification-overlap` | `main.go` | 65 | CLI flag definition |
 | `--filter-unverified` | `main.go` | 66 | CLI flag for unverified result filtering |
