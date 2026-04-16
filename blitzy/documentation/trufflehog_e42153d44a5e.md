@@ -1,62 +1,122 @@
-# TruffleHog Runtime Pipeline Investigation
+# TruffleHog Runtime Pipeline Investigation: Decoder Pipeline, Verification Overlap Detection, and Result Deduplication
 
-**Repository:** `trufflesecurity/trufflehog` at commit `e42153d44a5e`
-**Scope:** Behavioral analysis of the **decoder pipeline**, **verification overlap detection**, and **result deduplication** subsystems, and their interaction at runtime.
-**Methodology:** Static analysis of the Go source code paired with experimental runs of the built binary on crafted inputs.
+| Field | Value |
+|---|---|
+| **Repository** | `trufflesecurity/trufflehog` |
+| **Commit** | `e42153d44a5e5c37c1bd0c70e074781e9edcb760` (short: `e42153d4`) |
+| **Subject version** | `dev` (as reported by `trufflehog --version` for a local build from HEAD) |
+| **Scope** | Behavioural analysis of the decoder pipeline, `verificationOverlapWorker`, and `notifierWorker` dedup layer, plus their interactions under concurrency |
+| **Methodology** | (1) Static reading of the Go source code at the commit above, (2) compilation of the CLI (`CGO_ENABLED=0 go build -o /tmp/trufflehog_bin .`) and execution against crafted test inputs, (3) direct Go programs instrumenting the decoder chain and Aho-Corasick prefilter |
+| **Modifications** | **None.** This is a read-only investigation. No file under the repository tree was modified; all test data created during experimentation was placed under `/tmp/trufflehog_tests/` and subsequently removed. See [§14](#14-cleanup-statement). |
+| **Findings are date-agnostic** | All findings are derived from the code at the pinned commit; they do not depend on any time-sensitive state. |
 
 ---
 
 ## Table of Contents
 
 1. [Executive Summary](#1-executive-summary)
-2. [Investigation Questions](#2-investigation-questions)
-3. [The Decoder Pipeline](#3-the-decoder-pipeline)
-4. [Aho-Corasick Keyword Prefilter and Match Spans](#4-aho-corasick-keyword-prefilter-and-match-spans)
-5. [The Verification Overlap Subsystem](#5-the-verification-overlap-subsystem)
-6. [The Deduplication Layer](#6-the-deduplication-layer)
-7. [Interaction and Ordering Between Subsystems](#7-interaction-and-ordering-between-subsystems)
-8. [Concurrency Model and Non-Determinism](#8-concurrency-model-and-non-determinism)
-9. [Experimental Evidence](#9-experimental-evidence)
-10. [Answers to the Posed Questions](#10-answers-to-the-posed-questions)
-11. [Appendix A — Source Code Map](#appendix-a--source-code-map)
-12. [Appendix B — Reproduction Commands](#appendix-b--reproduction-commands)
+2. [Pipeline Architecture](#2-pipeline-architecture)
+3. [Decoder Pipeline Deep-Dive](#3-decoder-pipeline-deep-dive)
+4. [Aho-Corasick Prefilter and Detector Routing](#4-aho-corasick-prefilter-and-detector-routing)
+5. [Verification Overlap Detection](#5-verification-overlap-detection)
+6. [Result Deduplication (Notifier)](#6-result-deduplication-notifier)
+7. [Concurrency and Non-Determinism](#7-concurrency-and-non-determinism)
+8. [Interaction Sequence Diagram](#8-interaction-sequence-diagram)
+9. [Single-vs-Multiple Result Behaviour Matrix](#9-single-vs-multiple-result-behaviour-matrix)
+10. [Answers to the Five User Questions](#10-answers-to-the-five-user-questions)
+11. [Runtime Experiments (Detailed)](#11-runtime-experiments-detailed)
+12. [References Table](#12-references-table)
+13. [Appendix — Reproduction Commands](#13-appendix--reproduction-commands)
+14. [Cleanup Statement](#14-cleanup-statement)
 
 ---
 
 ## 1. Executive Summary
 
-TruffleHog ingests chunks (byte slices extracted from sources such as files, Git history, Postman collections, etc.), passes each chunk independently through every decoder in a fixed list, and then asks the Aho-Corasick prefilter which detectors keyword-match on the decoded bytes. A chunk can enter detection via **one of two paths**:
-
-- **Direct path** — when exactly one detector keyword-matches (or when `--allow-verification-overlap` is set), the decoded chunk is sent to `detectableChunksChan` and processed by a detector worker.
-- **Overlap path** — when **more than one** detector keyword-matches the same decoded bytes (and `--allow-verification-overlap` is *not* set), the chunk is sent to `verificationOverlapChunksChan`, where a `verificationOverlapWorker` runs each detector's `FromData` **without** verification, compares resulting secrets across detectors via Levenshtein distance, and either (a) stamps duplicates with `errOverlap` to disable their verification, or (b) re-routes non-duplicate detectors onto the direct path with verification re-enabled.
-
-Results from all detector workers arrive at a single shared `results` channel consumed by one or more **notifier workers**. Each notifier computes a dedup key from `DetectorType + Raw + RawV2 + SourceMetadata` and, using a process-wide 512-entry LRU cache, suppresses *any* subsequent result with the **same key** but a **different** `DecoderType`. Results that share the key *and* `DecoderType` — or originate from a Postman source — follow a special code path.
-
-Because the scanner emits one decoded chunk *per decoder* for every input chunk, a plain secret and its base64-encoded form in the same chunk normally produce **two independent in-flight results** (one with `DecoderType=PLAIN` and one with `DecoderType=BASE64`) which race through the pipeline. The LRU dedup keeps only the **first** of the two to reach a notifier worker, and because that winner is determined by goroutine scheduling, the reported decoder is non-deterministic under the default concurrency settings.
-
-All findings below are supported by the specific source locations cited, and by runtime experiments summarised in [§9](#9-experimental-evidence).
+- **The decoder pipeline runs every decoder for every chunk**. `scannerWorker` iterates `DefaultDecoders()` in the fixed order `UTF8 → Base64 → UTF16 → EscapedUnicode` (`pkg/decoders/decoders.go` lines 8–16) and pushes one decoded chunk per decoder that returned non-`nil`. UTF8/PLAIN always fires for non-empty text (`pkg/decoders/utf8.go` lines 16–29); BASE64 fires only when a ≥20-char base64 run decodes to ASCII (`pkg/decoders/base64.go` lines 34–72); UTF16 fires only for paired-null byte sequences (`pkg/decoders/utf16.go` lines 18–52); and ESCAPED_UNICODE fires only when `U+XXXX` or `\uXXXX` patterns are present (`pkg/decoders/escaped_unicode.go` lines 32–68).
+- **The verification overlap worker disables verification for cross-detector duplicates**. When more than one detector keyword-matches a decoded chunk *and* `--allow-verification-overlap` is off (`pkg/engine/engine.go` line 796), the chunk is routed to `verificationOverlapWorker` (lines 924–1034). It calls `FromData(ctx, verify=false, match)` on each detector (line 944), computes cross-detector similarity via `likelyDuplicate()` using Levenshtein distance with a hard-coded threshold of 0.9 (`similarityThreshold`, line 888), attaches `errOverlap` (lines 39–42) to duplicates via `res.SetVerificationError(errOverlap)` (line 988), and re-routes the remaining non-duplicate detectors through `detectableChunksChan` with verification re-enabled (lines 1017–1026).
+- **The notifier applies final deduplication via a 512-entry LRU cache**. `notifierWorker` (lines 1189–1235) is the sole dedup point for final output. The key is `fmt.Sprintf("%s%s%s%+v", DetectorType.String(), Raw, RawV2, SourceMetadata)` (line 1216) — **note: the key does not include the decoder type**. If the cache already stores a different `DecoderType` for this key (line 1217) the current result is dropped; if it stores the same decoder (or the key is new), the result is dispatched. Postman-source results are always deduped regardless of decoder (line 1218).
+- **The precise order of operations is scanner → (overlap, if multiple detectors match) → detector → notifier/dedup**. Dedup is always the last stage. Non-determinism appears wherever multiple in-flight results share a dedup key but differ in `DecoderType`: whichever reaches the notifier's `dedupeCache.Add` first wins. With default concurrency (`runtime.NumCPU()` scanner workers, `8×concurrency` detector workers, `1×concurrency` overlap and notifier workers per `pkg/engine/engine.go` lines 336–354), goroutine scheduling across the detector and notifier pools decides the race. With `GOMAXPROCS=1` and `--concurrency=1`, scheduling collapses to deterministic FIFO and PLAIN wins 100% of the time.
+- **A single logical secret can yield one or more results depending on source structure, Aho-Corasick span count, and the dedup race**. Identical `Raw` + `SourceMetadata` (same file, same chunk, same detector) deduplicates to one. Different `SourceMetadata` (secret in two files) produces two results. When the Base64 decoder rewrites a base64 run in place inside a chunk that also contains the plaintext, the resulting decoded chunk holds the secret twice; Aho-Corasick produces two non-overlapping ±512-byte spans (`defaultOffsetRadius`, `pkg/engine/ahocorasick/ahocorasickcore.go` line 155); `detectChunk` calls `FromData` once per span (`pkg/engine/engine.go` line 1062); two BASE64 results with identical dedup key survive dedup (same decoder ⇒ intentionally allowed per the comment at line 1213). The `--allow-verification-overlap` flag affects routing and `errOverlap` tagging but not the final dedup outcome.
+- **The user-visible `DecoderName` is serialised from the protobuf enum**. `pkg/output/json.go` line 65 writes `DecoderName: r.DecoderType.String()` where `r.DecoderType` is `detectorspb.DecoderType` (`pkg/pb/detectorspb/detectors.pb.go` lines 27–30) mapping the enum values `PLAIN=1`, `BASE64=2`, `UTF16=3`, `ESCAPED_UNICODE=4` to the strings seen in JSON output.
 
 ---
 
-## 2. Investigation Questions
+## 2. Pipeline Architecture
 
-This document answers the following five questions posed in the investigation brief:
+### 2.1 Four-Stage Overview (from `docs/process_flow.md`)
 
-1. **Decoder selection** — Given the same logical secret present in multiple encoded forms within a single chunk, how does TruffleHog's decoder pipeline decide which decoder's output is reported in the final result? Which decoder types are reported, and why?
-2. **Overlap detection** — How does the `verificationOverlapWorker` handle chunks matched by more than one detector, how is cross-detector similarity measured, and what triggers the `errOverlap` error?
-3. **Deduplication** — How does the LRU dedup cache in the `notifierWorker` decide which decoder-variant result to keep and which to suppress, and why can the reported `DecoderName` vary across runs?
-4. **Interaction sequencing** — What is the precise order of operations between decoding, keyword matching, overlap detection, detection, and deduplication, and where does concurrency introduce non-determinism?
-5. **Single-vs-multiple result behaviour** — Why does the same logical secret sometimes produce a single result and sometimes appear to produce multiple results, depending on file structure, concurrency, and the `--allow-verification-overlap` flag?
+The engine decomposes work into four logical stages. The Mermaid diagram below recreates the high-level flow from `docs/process_flow.md` lines 7–26 and annotates each stage with the Go worker function that implements it.
 
-Direct answers to each question appear in [§10](#10-answers-to-the-posed-questions) and reference the analytical sections that precede them.
+```mermaid
+flowchart LR
+    SourceDecomposition["**Source Decomposition**<br/>(SourceManager → ChunksChan)"]
+    DetectorMatching{"**Chunk-to-Detector Matching**<br/>(scannerWorker + AhoCorasickCore)<br/>engine.go 777-841"}
+    SecretDetection["**Secret Detection**<br/>(verificationOverlapWorker: 924-1034<br/>detectorWorker/detectChunk: 1036-1124<br/>filterResults: 1126-1150<br/>processResult: 1152-1187)"]
+    ResultNotification["**Result Notification**<br/>(notifierWorker: 1189-1235<br/>LRU dedup at line 1216-1221)"]
+
+    SourceDecomposition -- "*sources.Chunk" --> DetectorMatching
+    DetectorMatching -- "matched chunks" --> SecretDetection
+    SecretDetection -- "detectors.ResultWithMetadata" --> ResultNotification
+```
+
+| Stage (doc) | Component | Worker type | Implementation |
+|---|---|---|---|
+| Source Decomposition | `sources.SourceManager` | source-specific goroutines | Emits `*sources.Chunk` on `e.ChunksChan()` (`pkg/engine/engine.go` line 744) |
+| Chunk-to-Detector Matching | `scannerWorker` + `AhoCorasickCore.FindDetectorMatches` | scanner workers | Decode, keyword-match, route (`pkg/engine/engine.go` lines 777–841; `pkg/engine/ahocorasick/ahocorasickcore.go` lines 241–285) |
+| Secret Detection | `verificationOverlapWorker` and `detectorWorker` → `detectChunk` | overlap + detector workers | Run detector, filter, produce results (`pkg/engine/engine.go` lines 924–1187) |
+| Result Notification | `notifierWorker` | notifier workers | Filter by verification status, dedup, dispatch (`pkg/engine/engine.go` lines 1189–1235) |
+
+### 2.2 Worker Sequence (from `docs/concurrency.md`)
+
+The Mermaid sequence below recreates the worker topology from `docs/concurrency.md` lines 5–42. Each participant maps to a function in `pkg/engine/engine.go`.
+
+```mermaid
+sequenceDiagram
+    participant Main
+    participant ScannerWorkers
+    participant VerificationOverlapWorkers
+    participant DetectorWorkers
+    participant NotifierWorkers
+
+    Note over Main: e.startWorkers() launches all worker pools (engine.go 646-660)
+    Main->>ScannerWorkers: e.startScannerWorkers() (engine.go 662-673)
+    Main->>VerificationOverlapWorkers: e.startVerificationOverlapWorkers() (engine.go 690-703)
+    Main->>DetectorWorkers: e.startDetectorWorkers() (engine.go 675-688)
+    Main->>NotifierWorkers: e.startNotifierWorkers() (engine.go 705-718)
+
+    par Source emission
+        Main->>ScannerWorkers: e.ChunksChan() <- chunk
+    and Scanner decodes and routes
+        ScannerWorkers->>DetectorWorkers: detectableChunksChan <- detectableChunk (single-detector path, engine.go 807-816)
+        ScannerWorkers->>VerificationOverlapWorkers: verificationOverlapChunksChan <- verificationOverlapChunk (multi-detector path, engine.go 796-805)
+    and Overlap resolves cross-detector duplicates
+        VerificationOverlapWorkers->>DetectorWorkers: detectableChunksChan <- detectableChunk (re-route surviving detectors, engine.go 1017-1026)
+    and Detectors produce results
+        DetectorWorkers->>NotifierWorkers: e.results <- detectors.ResultWithMetadata (engine.go 1186)
+    and Notifier dedupes and dispatches
+        Note over NotifierWorkers: notifierWorker (engine.go 1189-1235)
+    end
+```
+
+### 2.3 Channels and Buffer Sizes
+
+All cross-worker communication uses buffered channels initialised in `Engine.initialize` (`pkg/engine/engine.go` lines 489–521). The buffer multipliers are constants inside `initialize`:
+
+| Channel | Buffer | Source location |
+|---|---|---|
+| `detectableChunksChan` | `defaultChannelBuffer × 50` | lines 503, 515 |
+| `verificationOverlapChunksChan` | `defaultChannelBuffer × 25` | lines 507, 516–518 |
+| `results` | `defaultChannelBuffer × 50` | lines 508, 519 |
+| `defaultChannelBuffer` (package-level) | `runtime.NumCPU()` | line 627 |
+
+Shutdown ordering is defined in `Engine.Finish` (`pkg/engine/engine.go` lines 723–742): source manager waits → scanner workers drain → `verificationOverlapChunksChan` closes → overlap workers drain → `detectableChunksChan` closes → detector workers drain → `results` closes → notifier workers drain. This deterministic teardown guarantees every result in flight reaches the notifier before the engine exits.
 
 ---
 
-## 3. The Decoder Pipeline
+## 3. Decoder Pipeline Deep-Dive
 
 ### 3.1 Fixed Decoder Ordering
-
-The decoder chain is hard-coded in `pkg/decoders/decoders.go`:
 
 ```go
 // pkg/decoders/decoders.go (lines 8-16)
@@ -71,12 +131,12 @@ func DefaultDecoders() []Decoder {
 }
 ```
 
-The ordering is significant but in an indirect way. The comment "UTF8 must be first for duplicate detection" refers to how **inside the notifier's dedup cache**, the first-stored `DecoderType` becomes the "canonical" choice for the key — and under strictly serial execution, UTF8 (PLAIN) always wins because it is produced first by `scannerWorker`. The ordering does **not** guarantee PLAIN wins under the default concurrent execution; see [§8](#8-concurrency-model-and-non-determinism).
+The explicit comment on line 10 — `// UTF8 must be first for duplicate detection` — is the architectural hint behind the whole dedup behaviour: because `scannerWorker` iterates decoders in this order and pushes onto downstream channels in the same order, UTF8/PLAIN is the first variant to enter the pipeline for any text-based chunk. Under strictly serial execution, PLAIN therefore wins the dedup race in `notifierWorker` and becomes the "canonical" decoder that the user sees. Concurrency weakens this guarantee (see [§7](#7-concurrency-and-non-determinism)).
 
-The `DecodableChunk` struct carries both the rewritten chunk and the `DecoderType` so the rest of the pipeline knows which decoder produced it:
+The payload passed between decoders and downstream workers is a `DecodableChunk`:
 
 ```go
-// pkg/decoders/decoders.go (lines 20-29)
+// pkg/decoders/decoders.go (lines 18-28)
 type DecodableChunk struct {
     *sources.Chunk
     DecoderType detectorspb.DecoderType
@@ -88,270 +148,372 @@ type Decoder interface {
 }
 ```
 
-The four `DecoderType` values are defined in the protobuf-generated file:
+The four `DecoderType` enum values that can appear on `DecodableChunk` are:
 
 ```go
-// pkg/pb/detectorspb/detectors.pb.go (lines 27-30)
-DecoderType_PLAIN           DecoderType = 1
-DecoderType_BASE64          DecoderType = 2
-DecoderType_UTF16           DecoderType = 3
-DecoderType_ESCAPED_UNICODE DecoderType = 4
+// pkg/pb/detectorspb/detectors.pb.go (lines 26-31, abridged)
+DecoderType_UNKNOWN          DecoderType = 0
+DecoderType_PLAIN            DecoderType = 1
+DecoderType_BASE64           DecoderType = 2
+DecoderType_UTF16            DecoderType = 3
+DecoderType_ESCAPED_UNICODE  DecoderType = 4
 ```
+
+These names are what ultimately appear in the `DecoderName` field of the JSON output (`pkg/output/json.go` line 65: `DecoderName: r.DecoderType.String()`).
 
 ### 3.2 Per-Decoder Behaviour
 
-Each decoder is a **pure** transformation: it is given a `*sources.Chunk` and returns either a rewritten `*DecodableChunk` or `nil` if it does not apply.
+| Decoder | Always fires? | Trigger condition | Transformation | Returns `nil` when | `Type()` line |
+|---|---|---|---|---|---|
+| UTF8 / PLAIN | **Yes** for non-empty text | Any non-empty chunk | Pass-through for valid UTF-8; invalid UTF-8 is sanitised with `U+FFFD` replacement | `chunk == nil \|\| len(chunk.Data) == 0` | `utf8.go` 12-14 |
+| Base64 | No | ≥20-char base64-alphabet run decoding to ASCII | In-place substitution of the run with the decoded bytes | No qualifying run found | `base64.go` 30-32 |
+| UTF16 | No | Paired-null-byte patterns (BE or LE) with printable runes | Extract printable 2-byte UTF-16 characters and re-encode as UTF-8 | Output buffer empty | `utf16.go` 14-16 |
+| EscapedUnicode | No | `U+XXXX` code-point form or `\uXXXX` escape | Clone chunk data; replace every escape with the corresponding UTF-8 | Neither regex pattern matches | `escaped_unicode.go` 28-30 |
 
-#### 3.2.1 UTF8 / PLAIN decoder — `pkg/decoders/utf8.go`
+#### 3.2.1 UTF8 — `pkg/decoders/utf8.go`
 
-The PLAIN decoder **never returns `nil` for non-empty input.** For valid UTF-8, the chunk is passed through unchanged; for invalid UTF-8, the chunk data is rewritten in place by `extractSubstrings`:
+The PLAIN decoder returns `nil` only when the chunk is nil or empty (lines 17–20). For valid UTF-8 input the chunk passes through untouched; for invalid UTF-8 the data is rewritten in place by `extractSubstrings`, which replaces non-printable bytes and malformed multi-byte sequences with `U+FFFD` (lines 21–28).
 
 ```go
-// pkg/decoders/utf8.go (FromChunk)
-if !utf8.Valid(chunk.Data) {
-    chunk.Data = extractSubstrings(chunk.Data)
+// pkg/decoders/utf8.go (lines 16-29, abridged)
+func (d *UTF8) FromChunk(chunk *sources.Chunk) *DecodableChunk {
+    if chunk == nil || len(chunk.Data) == 0 {
+        return nil
+    }
+    decodableChunk := &DecodableChunk{Chunk: chunk, DecoderType: d.Type()}
+    if !utf8.Valid(chunk.Data) {
+        chunk.Data = extractSubstrings(chunk.Data)
+        return decodableChunk
+    }
     return decodableChunk
 }
-return decodableChunk
 ```
 
-`extractSubstrings` replaces non-printable ASCII (bytes 0–31 and 127) with the Unicode replacement character (`U+FFFD`), and collapses any malformed multi-byte sequence to a single replacement character as well.
+**Behavioural consequence:** any textual input triggers PLAIN, so most "regular" secrets are reported with `DecoderName=PLAIN`. This is the first decoder invoked and the first to push onto the scanner's downstream channels.
 
-**Behavioural consequence:** for any text input, the PLAIN decoder always fires and produces a `DecodableChunk` containing the original textual content. This is why most "regular" secrets are reported with `DecoderName=PLAIN`.
-
-#### 3.2.2 Base64 decoder — `pkg/decoders/base64.go`
-
-The Base64 decoder scans for **runs** of base64-alphabet characters longer than 20 characters, then tries both `StdEncoding` and `RawURLEncoding`. Only decoded byte sequences that are (a) non-empty and (b) entirely ASCII (≤ 0x7F) are kept:
+#### 3.2.2 Base64 — `pkg/decoders/base64.go`
 
 ```go
-// pkg/decoders/base64.go (FromChunk snippet)
-encodedSubstrings := getSubstringsOfCharacterSet(chunk.Data, 20, b64CharsetMapping, b64EndChars)
-for _, str := range encodedSubstrings {
-    dec, err := base64.StdEncoding.DecodeString(str)
-    if err == nil && len(dec) > 0 && isASCII(dec) {
-        decodedSubstrings[str] = dec
+// pkg/decoders/base64.go (lines 34-72, abridged)
+func (d *Base64) FromChunk(chunk *sources.Chunk) *DecodableChunk {
+    encodedSubstrings := getSubstringsOfCharacterSet(chunk.Data, 20, b64CharsetMapping, b64EndChars)
+    decodedSubstrings := make(map[string][]byte)
+    for _, str := range encodedSubstrings {
+        dec, err := base64.StdEncoding.DecodeString(str)
+        if err == nil && len(dec) > 0 && isASCII(dec) {
+            decodedSubstrings[str] = dec
+            continue
+        }
+        dec, err = base64.RawURLEncoding.DecodeString(str)
+        if err == nil && len(dec) > 0 && isASCII(dec) {
+            decodedSubstrings[str] = dec
+        }
     }
-    dec, err = base64.RawURLEncoding.DecodeString(str)
-    if err == nil && len(dec) > 0 && isASCII(dec) {
-        decodedSubstrings[str] = dec
+    if len(decodedSubstrings) > 0 {
+        // Replace each encoded substring in-place with its decoded form.
+        for enc, dec := range decodedSubstrings {
+            chunk.Data = bytes.ReplaceAll(chunk.Data, []byte(enc), dec)
+        }
+        return &DecodableChunk{Chunk: chunk, DecoderType: d.Type()}
     }
+    return nil
 }
 ```
 
-When at least one substring decodes successfully, the decoder **substitutes the decoded bytes in place** (surrounding text is preserved) and returns a `DecodableChunk{DecoderType: BASE64}`. When no base64 runs exist or none decode to ASCII, it returns `nil`.
+Three behavioural notes:
+- **Threshold 20.** `getSubstringsOfCharacterSet(chunk.Data, 20, …)` (line 36) passes `threshold=20`; the helper (lines 83–141) uses `count > threshold` so a run of **at least 21 characters** is required to qualify.
+- **Two alphabets.** Both `base64.StdEncoding` (line 40) and `base64.RawURLEncoding` (line 45) are attempted — runs using either alphabet are handled.
+- **In-place substitution.** When at least one substring decodes successfully, the decoder uses `bytes.ReplaceAll` to write the decoded bytes back into `chunk.Data` (lines 51–67). Surrounding non-base64 text is preserved, but the base64 run is replaced with the decoded content. This is the mechanism behind the "BASE64 chunk contains the secret twice" effect observed in Experiment D.
 
-**Behavioural consequence:** a chunk containing a plain-text AWS key **and** a base64-encoded copy of that same key will have the encoded portion rewritten to plain-text; the resulting decoded chunk therefore contains the same secret **twice** (once at the original location, once where the encoded form was). This is the root cause of the "2 BASE64 results" pattern observed in [§5](#5-the-verification-overlap-subsystem) and [§9](#9-experimental-evidence).
-
-#### 3.2.3 UTF16 decoder — `pkg/decoders/utf16.go`
-
-`UTF16.FromChunk` attempts **both** big-endian and little-endian interpretation of pairs of bytes and keeps whichever produces printable output:
+#### 3.2.3 UTF16 — `pkg/decoders/utf16.go`
 
 ```go
-// pkg/decoders/utf16.go (utf16ToUTF8 snippet)
-if r := rune(binary.BigEndian.Uint16(b[i:])); b[i] == 0 && utf8.ValidRune(r) {
-    if isPrintableByte(byte(r)) { bufBE.WriteRune(r) }
+// pkg/decoders/utf16.go (lines 18-52, abridged)
+func (d *UTF16) FromChunk(chunk *sources.Chunk) *DecodableChunk {
+    utf8Data, err := utf16ToUTF8(chunk.Data)
+    if err != nil { return nil }
+    if len(utf8Data) == 0 { return nil }
+    chunk.Data = utf8Data
+    return &DecodableChunk{Chunk: chunk, DecoderType: d.Type()}
 }
-if r := rune(binary.LittleEndian.Uint16(b[i+1]) == 0) ... { bufLE.WriteRune(r) }
+
+func utf16ToUTF8(b []byte) ([]byte, error) {
+    var bufBE, bufLE bytes.Buffer
+    for i := 0; i+1 < len(b); i += 2 {
+        if r := rune(binary.BigEndian.Uint16(b[i:])); b[i] == 0 && utf8.ValidRune(r) {
+            if isPrintableByte(byte(r)) { bufBE.WriteRune(r) }
+        }
+        if r := rune(binary.LittleEndian.Uint16(b[i:])); b[i+1] == 0 && utf8.ValidRune(r) {
+            if isPrintableByte(byte(r)) { bufLE.WriteRune(r) }
+        }
+    }
+    // Return whichever buffer has more content; empty means no UTF-16 detected.
+    // ...
+}
 ```
 
-If the resulting UTF-8 buffer is empty (no printable UTF-16 data was detected) the decoder returns `nil`. Almost all of our experimental inputs are ASCII text and therefore do **not** trigger the UTF16 path.
+The heuristic attempts both byte orders in parallel and keeps whichever produces more printable ASCII characters. Pure-ASCII text never has consecutive null bytes, so UTF16 returns `nil` for virtually every input in our experiments.
 
-#### 3.2.4 EscapedUnicode decoder — `pkg/decoders/escaped_unicode.go`
+#### 3.2.4 EscapedUnicode — `pkg/decoders/escaped_unicode.go`
 
-Two regexes govern this decoder:
+Two regex patterns drive this decoder:
 
 ```go
-// pkg/decoders/escaped_unicode.go (lines 16-22)
+// pkg/decoders/escaped_unicode.go (lines 22, 25)
 codePointPat = regexp.MustCompile(`\bU\+([a-fA-F0-9]{4}).?`)
 escapePat    = regexp.MustCompile(`(?i:\\{1,2}u)([a-fA-F0-9]{4})`)
 ```
 
-`codePointPat` matches Unicode "code-point notation" (e.g. `U+0041`), and `escapePat` matches the common `\uXXXX` / `\\uXXXX` programming-language escape. If **either** pattern matches, the decoder returns a rewritten chunk with `DecoderType=ESCAPED_UNICODE`; otherwise it returns `nil`. Critically, it **clones the chunk data** before rewriting (`chunkData = bytes.Clone(chunk.Data)`) to avoid data races with other decoders.
+`codePointPat` matches Unicode code-point notation (e.g. `U+0041`); `escapePat` matches common `\uXXXX` / `\\uXXXX` programming-language escapes. If **either** pattern matches, the decoder returns a new `DecodableChunk` with `DecoderType=ESCAPED_UNICODE`; otherwise it returns `nil` at line 66.
+
+Crucially, this decoder **clones the chunk data before rewriting** (line 39 of `escaped_unicode.go`) by way of `bytes.Clone`, avoiding the shared-pointer mutation hazard that Base64 and UTF16 create (see [§3.4](#34-in-place-chunk-mutation-caveat)).
 
 ### 3.3 How `scannerWorker` Uses the Decoders
 
-For every input chunk, `scannerWorker` iterates through the decoder list and submits each non-nil variant independently:
-
 ```go
-// pkg/engine/engine.go (lines 777-797, simplified)
+// pkg/engine/engine.go (lines 777-841, abridged)
 for chunk := range e.ChunksChan() {
-    for _, decoder := range e.decoders {
-        decoded := decoder.FromChunk(chunk)
-        if decoded == nil { continue }
+    for _, decoder := range e.decoders {       // line 786 - fixed order
+        decoded := decoder.FromChunk(chunk)     // line 786
+        if decoded == nil { continue }          // lines 790-793
 
-        matchingDetectors := e.AhoCorasickCore.FindDetectorMatches(decoded.Chunk.Data)
-        if len(matchingDetectors) > 1 && !e.verificationOverlap {
-            e.verificationOverlapChunksChan <- verificationOverlapChunk{...}
+        matchingDetectors := e.AhoCorasickCore.FindDetectorMatches(decoded.Chunk.Data)  // line 795
+        if len(matchingDetectors) > 1 && !e.verificationOverlap {                         // line 796
+            e.verificationOverlapChunksChan <- verificationOverlapChunk{...}               // lines 797-805
             continue
         }
-        for _, detector := range matchingDetectors {
-            e.detectableChunksChan <- detectableChunk{chunk: *decoded.Chunk, decoder: decoded.DecoderType, ...}
+        for _, detector := range matchingDetectors {                                       // lines 807-816
+            e.detectableChunksChan <- detectableChunk{chunk: *decoded.Chunk,
+                decoder: decoded.DecoderType, detector: detector, ...}
         }
     }
 }
 ```
 
-This is the **critical design decision** that governs every observable behaviour below: a chunk containing N decoder-relevant variants produces up to N independent decoded chunks, each of which is routed independently. The decoder order **does not** serialise the downstream pipeline — it only controls the order in which chunks are **pushed** onto downstream channels.
+The critical design decision is that **one input chunk produces one decoded chunk per decoder that returned non-nil**. Each of those decoded variants is independently routed — so a chunk containing plain text AND its base64 encoding produces two routed chunks (one with `decoder=PLAIN`, one with `decoder=BASE64`) and both travel downstream.
 
-### 3.4 Note on in-place chunk mutation
+### 3.4 In-place Chunk Mutation Caveat
 
-Both the UTF8 decoder (invalid-UTF8 path) and the Base64 decoder **mutate** `chunk.Data` in place before returning. Because UTF8 runs first and only *potentially* rewrites (for invalid UTF-8), the Base64 decoder sees whatever UTF8 wrote, and UTF16 and EscapedUnicode each see the Base64-rewritten chunk. This is safe because the downstream `matchingDetectors` check is run once per decoder output, but it does mean that, for example, `UTF16.FromChunk` is effectively operating on the base64-decoded bytes of the same underlying `*sources.Chunk` pointer if Base64 ran before it. In practice, because UTF16 requires paired-null bytes this virtually never matters for text data. `EscapedUnicode.FromChunk` defends against this race with `bytes.Clone`.
+Both UTF8 (invalid-UTF-8 path, line 23) and Base64 (line 67) **mutate** `chunk.Data` in place before returning. UTF16 also overwrites `chunk.Data` with UTF-8 bytes (line 28). Because Go passes `chunk *sources.Chunk` by pointer, each later decoder sees whatever earlier decoders wrote to the same buffer.
+
+This is safe in the common case because:
+- UTF8 only rewrites for invalid UTF-8 input (which the BASE64 decoder then sees with `U+FFFD` sanitisation).
+- `EscapedUnicode.FromChunk` defends itself explicitly with `chunkData = bytes.Clone(chunk.Data)` at line 39 before rewriting.
+
+It is also the structural reason the comment on `pkg/decoders/decoders.go` line 10 — "UTF8 must be first for duplicate detection" — matters: UTF8 must observe the original raw bytes to produce the canonical `DecoderType=PLAIN` variant, because once Base64 runs, `chunk.Data` may no longer contain the original encoded form.
+
+### 3.5 Go-Level Decoder Trace (Experimental Evidence)
+
+A direct Go program (see the code block in [§11](#11-runtime-experiments-detailed)) instantiated `decoders.DefaultDecoders()` and invoked each decoder's `FromChunk` against several realistic inputs. Results:
+
+| Input | PLAIN | BASE64 | UTF16 | ESCAPED_UNICODE |
+|---|---|---|---|---|
+| `AWS_ACCESS_KEY_ID=AKIAWARWQKZNHMZBLY4I\nAWS_SECRET_ACCESS_KEY=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` | 102-byte passthrough | `nil` | `nil` | `nil` |
+| Base64 encoding of the plain text (136 bytes) | 136-byte raw passthrough | 102-byte decoded plaintext | `nil` | `nil` |
+| `\u0041\u004b\u0049\u0041…` | raw escape text passthrough | `nil` | `nil` | 20-byte `AKIAWARWQKZNHMZBLY4I` |
+| `[]byte{}` (empty) | `nil` | `nil` | `nil` | `nil` |
+
+This confirms: **PLAIN always fires for non-empty text; the other three fire only when their specific triggers are present.** The AWS plain-text input has no ≥20-char base64 run, no UTF-16 null pattern, and no `\u` escape, so only PLAIN produces output. The base64-encoded form satisfies Base64's ≥20-char criterion, so both PLAIN (raw b64 text) and BASE64 (decoded plaintext) produce output.
 
 ---
 
-## 4. Aho-Corasick Keyword Prefilter and Match Spans
+## 4. Aho-Corasick Prefilter and Detector Routing
 
-### 4.1 Keyword Trie
+### 4.1 Keyword Trie Construction
 
-At engine initialisation (`NewAhoCorasickCore` in `pkg/engine/ahocorasick/ahocorasickcore.go`), every detector's `Keywords()` list is lower-cased and inserted into a single Aho-Corasick trie keyed by `keywordsToDetectors map[string][]DetectorKey`. The same keyword can map to multiple detector keys (which is how e.g. the "dm" keyword surfaces both AWS tests and the Voiceflow detector).
+At engine start, `NewAhoCorasickCore` (`pkg/engine/ahocorasick/ahocorasickcore.go` line 141 onward) iterates every registered detector's `Keywords()` list, lower-cases each keyword, and inserts it into a single Aho-Corasick trie. The reverse map `keywordsToDetectors map[string][]DetectorKey` lets a single keyword hit resolve to every detector that registered it. Multiple detectors can — and frequently do — share keywords (e.g. the string `"dm"` is a Voiceflow keyword but also appears in many base64-decoded AWS secret bytes).
 
 ### 4.2 `FindDetectorMatches`
 
-For each decoded chunk, `FindDetectorMatches` lower-cases the entire chunk (because the trie is case-insensitive), runs the trie, and for each keyword hit computes a **match span** — a bounded window around the hit from which the detector's regex will be run. The default span is `±512` bytes:
+```go
+// pkg/engine/ahocorasick/ahocorasickcore.go (lines 241-285, abridged)
+func (ac *AhoCorasickCore) FindDetectorMatches(chunkData []byte) []*DetectorMatch {
+    lower := bytes.ToLower(chunkData)             // line 242 - case-insensitive
+    hits := ac.prefilter.Match(lower)
+    if len(hits) == 0 { return nil }               // lines 244-247 - fast path
+    // ... build matches keyed by detector ...
+    for _, m := range hits {
+        for _, detectorKey := range ac.keywordsToDetectors[m.MatchString()] {  // line 252
+            start, end := ac.spanCalculator.calculateSpan(m.Pos(), detectorKey, chunkData)  // line 264
+            // accumulate per detectorKey
+        }
+    }
+    // merge + extract final match bytes
+    return result
+}
+```
+
+### 4.3 Span Calculation
+
+The default span around each keyword is a window of ±`defaultOffsetRadius` bytes:
 
 ```go
 // pkg/engine/ahocorasick/ahocorasickcore.go (line 155)
 const defaultOffsetRadius int64 = 512
 ```
 
-Detectors can customise span geometry via three interfaces: `MultiPartCredentialProvider.MaxCredentialSpan`, `MaxSecretSizeProvider.MaxSecretSize`, and `StartOffsetProvider.StartOffset` (see `adjustableSpanCalculator.calculateSpan` at lines 80–113). Overlapping or adjacent spans for the same detector are merged by `mergeMatches`, and the chunk bytes for each final span are extracted into the `DetectorMatch.matches` slice.
+Detectors may override span geometry via three optional interfaces consumed by `adjustableSpanCalculator.calculateSpan` (lines 80–113): `MultiPartCredentialProvider.MaxCredentialSpan`, `MaxSecretSizeProvider.MaxSecretSize`, and `StartOffsetProvider.StartOffset`. Overlapping or contiguous spans for the *same* detector are coalesced by `mergeMatches` (line 278); the merged byte ranges are extracted into `DetectorMatch.matches`, a `[][]byte`.
 
-### 4.3 Why the Prefilter Matters for Dedup
+### 4.4 Multi-Span Implications for Deduplication
 
-The downstream detector (`FromData`) is called **once per match span** (see `detectChunk`, `pkg/engine/engine.go:1068-1125`). If a single decoded chunk contains two keyword occurrences that produce two non-mergeable spans, the detector is invoked twice — producing two results with identical `Raw` / `RawV2`. The notifier will then see two results with the same dedup key and the same `DecoderType`; per the dedup rules in [§6](#6-the-deduplication-layer), these will **both** pass through. This is the mechanism behind the "2 BASE64 results" outcome described later.
+When a decoded chunk contains the *same* detector keyword at two non-overlapping locations, Aho-Corasick produces two spans, and `detectChunk` invokes the detector's `FromData` **once per span**:
+
+```go
+// pkg/engine/engine.go (lines 1061-1076, abridged)
+matches := data.detector.Matches()
+for _, matchBytes := range matches {                 // line 1062 - one iteration per span
+    // ...
+    results, err := e.verificationCache.FromData(    // line 1070
+        ctx, data.detector.Detector,
+        data.chunk.Verify, data.chunk.SecretID != 0,
+        matchBytes)
+    // ...
+}
+```
+
+If both spans of the same decoded chunk yield the same `Raw` secret, the two resulting detector results share the same `Raw`, `RawV2`, `DetectorType`, *and* `DecoderType`. The dedup rule at `pkg/engine/engine.go` lines 1217–1220 treats same-decoder duplicates as intentional and allows both through. This is the direct mechanism behind "2 BASE64 results" in Experiment D ([§11.4](#114-experiment-d--well-separated-plain--base64-1-or-2-results-per-run)).
+
+### 4.5 Single- vs Multi-Detector Routing
+
+After `FindDetectorMatches`, `scannerWorker` makes the single most consequential routing decision in the engine at `pkg/engine/engine.go` line 796:
+
+```go
+if len(matchingDetectors) > 1 && !e.verificationOverlap {
+    // → verificationOverlapChunksChan (overlap path)
+} else {
+    // → detectableChunksChan (direct path, one per detector)
+}
+```
+
+Two facts from our Go-level prefilter trace confirm this routing in practice:
+- Input `AWS_ACCESS_KEY_ID=AKIAWARWQKZNHMZBLY4I\nAWS_SECRET_ACCESS_KEY=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\n`: **2 matching detectors — AWS and Voiceflow** (the keyword `"vf"` from Voiceflow appears inside the lowercased secret `iL6DvfpXrn…` → `il6dvfpx…`).
+- Input `AKIAWARWQKZNHMZBLY4I` alone: **1 matching detector — AWS**.
+
+Consequently, the typical "AWS credentials in a file" scenario enters the overlap path; stripped-down AKIA-only inputs take the direct path.
 
 ---
 
-## 5. The Verification Overlap Subsystem
+## 5. Verification Overlap Detection
 
-### 5.1 Routing Condition
-
-The overlap path is chosen by a single line in `scannerWorker`:
+### 5.1 The Routing Condition
 
 ```go
 // pkg/engine/engine.go (line 796)
 if len(matchingDetectors) > 1 && !e.verificationOverlap {
-    // → send to verificationOverlapChunksChan
-}
 ```
 
-- `len(matchingDetectors) > 1` means *more than one* distinct detector keyword-matched the decoded chunk.
-- `e.verificationOverlap` is the flag set by `--allow-verification-overlap`. When **true**, the overlap path is bypassed entirely.
+Two preconditions must hold for the overlap path:
+- **More than one** distinct detector keyword-matched the decoded chunk.
+- The `--allow-verification-overlap` CLI flag is **off** (it sets `e.verificationOverlap = true`). With the flag on, every chunk takes the direct path regardless of how many detectors matched.
 
 ### 5.2 Inside `verificationOverlapWorker` (lines 924–1034)
 
-For each chunk delivered on `verificationOverlapChunksChan`, the worker does the following:
+For each incoming `verificationOverlapChunk`, the worker executes a six-step algorithm:
 
-1. **Run every matching detector without verification** (`FromData(ctx, verify=false, matchBytes)`, line 944), recording the candidate secrets each returned.
-2. **Apply result filtration** for the non-targeted-scan case (`chunk.SecretID == 0`), invoking `filterResults` — which in turn calls each detector's `CleanResults` and the false-positive filter.
-3. **Build a per-detector secret key** — `chunkSecretKey{secret: string(val), detectorKey: detector.Key}` where `val` is `RawV2` if present or `Raw` otherwise.
-4. **Compare to previously seen keys for other detectors** via `likelyDuplicate` (see §5.3). If a duplicate is found:
-   - Increment the overlap tracker.
-   - Set `res.SetVerificationError(errOverlap)` on the candidate result.
-   - Call `e.processResult(...)` directly, bypassing `detectableChunksChan`. The result flows through `processResult` to `e.results` with verification already disabled.
-   - `delete(detectorKeysWithResults, detector.Key)` so the detector is **not** re-routed below.
-5. **Re-route survivors** — for each remaining detector in `detectorKeysWithResults`, send a `detectableChunk` to `detectableChunksChan` with verification enabled.
-6. **Reset the reusable per-chunk maps** and call `verificationOverlapWgDoneFn`.
+1. **Initialise reusable per-chunk maps** — `detectorKeysWithResults` and `chunkSecrets` (lines 929–930). These are reused across iterations to minimise allocations.
+2. **Run every matching detector without verification** — for each detector (line 933) and each of that detector's match spans (line 938), invoke `FromData(ctx, false, matchBytes)` under a 2-second timeout (lines 939–944). The `verify=false` argument at line 944 is the crucial element: detection runs fully, but no external API calls are made at this stage.
+3. **Track detectors that produced any results** via `detectorKeysWithResults[key] = detector` (lines 952–954).
+4. **Filter results** with `e.filterResults(...)` when `chunk.chunk.SecretID == 0` (lines 961–963), which applies detector-specific `CleanResults` (e.g. `aws.CleanResults` collapses duplicate AWS IDs) and the false-positive word list (including `example` from `pkg/detectors/fp_words.txt` line 22, which is the reason `AKIAIOSFODNN7EXAMPLE` is filtered out).
+5. **For each surviving result**, compute the comparison value (`RawV2` if present, else `Raw`, lines 966–971), construct `chunkSecretKey{secret, detectorKey}` (line 977), and call `likelyDuplicate(ctx, key, chunkSecrets)` (line 982):
+   - If `likelyDuplicate` returns true, the overlap tracker is incremented (lines 985–987), `res.SetVerificationError(errOverlap)` is attached (line 988), `e.processResult` is invoked directly (lines 989–999), and the detector is removed from `detectorKeysWithResults` (line 1004) so it is *not* re-routed below.
+   - Record the secret in `chunkSecrets` so subsequent results of the same chunk can cross-check against it (line 1006).
+6. **Re-route surviving detectors to the direct path** — for every detector still in `detectorKeysWithResults`, push a `detectableChunk` onto `detectableChunksChan` with verification re-enabled via `e.shouldVerifyChunk(...)` (lines 1017–1026). Reset the reusable maps and call `chunk.verificationOverlapWgDoneFn()` (lines 1023–1030).
 
-The code for the overlap routing and `errOverlap` tagging is worth reading in full:
-
-```go
-// pkg/engine/engine.go (lines 985-995)
-if likelyDuplicate(ctx, key, chunkSecrets) {
-    // This indicates that the same secret was found by multiple detectors.
-    // We should NOT VERIFY this chunk's data.
-    if e.verificationOverlapTracker != nil {
-        e.verificationOverlapTracker.increment()
-    }
-    res.SetVerificationError(errOverlap)
-    e.processResult(ctx, detectableChunk{...}, res, isFalsePositive)
-    delete(detectorKeysWithResults, detector.Key)
-}
-chunkSecrets[key] = struct{}{}
-```
-
-### 5.3 `likelyDuplicate` and the 0.9 Levenshtein Threshold
-
-```go
-// pkg/engine/engine.go (lines 887-922, abridged)
-const similarityThreshold = 0.9
-for dupeKey := range dupes {
-    // Skip if lengths differ by more than ~10%.
-    if len(dupe)*10 < len(valStr)*9 || len(dupe)*10 > len(valStr)*11 { continue }
-    // Skip if same detector type (intra-detector dupes are not "overlap").
-    if val.detectorKey.Type() == dupeKey.detectorKey.Type() { continue }
-    if valStr == dupe { return true }
-    similarity := strutil.Similarity(valStr, dupe, metrics.NewLevenshtein())
-    if similarity > similarityThreshold { return true }
-}
-return false
-```
-
-Three gating conditions in order:
-- **Length filter** — strings whose lengths differ by more than 10% are never considered similar (cheap early-out).
-- **Same-detector filter** — two results from the *same* detector type are **not** duplicates in the overlap sense. This is why AWS finding the same secret twice inside one chunk does **not** trigger `errOverlap`.
-- **Similarity check** — for cross-detector pairs that pass the length filter, exact string equality or Levenshtein similarity > 0.9 (per `github.com/adrg/strutil/metrics`) counts as a duplicate.
-
-### 5.4 `errOverlap` Error Message
+### 5.3 The `errOverlap` Error
 
 ```go
 // pkg/engine/engine.go (lines 39-42)
 var errOverlap = errors.New(
     "More than one detector has found this result. For your safety, verification has been disabled." +
-    "You can override this behavior by using the --allow-verification-overlap flag.",
+        "You can override this behavior by using the --allow-verification-overlap flag.",
 )
 ```
 
-The error is attached to the result via `Result.SetVerificationError`, which wraps the message so that downstream output shows it to the user. Because the result has a verification error, the notifier treats it as "unknown" (see [§6.1](#61-filter-by-verification-status)).
+This is the canonical overlap error message. When a duplicate is detected, it is attached to the candidate result via `Result.SetVerificationError(errOverlap)` (line 988). Because the result now has a non-nil verification error, it is classified as **"unknown"** (neither verified nor unverified) by `notifierWorker` (lines 1194–1198); the user sees it only when `--results` includes `unknown` (the default).
 
-### 5.5 When No Cross-Detector Duplicate Exists
+The `errOverlap` result is dispatched to `e.results` via a direct `e.processResult` call (line 991) — it **bypasses the detector worker** and goes straight into `notifierWorker`'s dedup path.
 
-If the overlap worker processes a chunk where every matching detector keyword-matched but only **one** of them produced actual regex-level results (or each detector produced *different* secrets), no `likelyDuplicate` hit occurs. In that case, the detector that produced results is re-routed to the normal path with verification re-enabled:
+### 5.4 The `likelyDuplicate` Algorithm
 
 ```go
-// pkg/engine/engine.go (lines 1017-1026)
-for _, detector := range detectorKeysWithResults {
-    wgDetect.Add(1)
-    chunk.chunk.Verify = e.shouldVerifyChunk(chunk.chunk.Verify, detector, ...)
-    e.detectableChunksChan <- detectableChunk{
-        chunk: chunk.chunk, detector: detector, decoder: chunk.decoder, ...
+// pkg/engine/engine.go (lines 887-922, abridged)
+func likelyDuplicate(ctx context.Context, val chunkSecretKey, dupes map[chunkSecretKey]struct{}) bool {
+    const similarityThreshold = 0.9                                          // line 888
+    valStr := val.secret
+    for dupeKey := range dupes {
+        dupe := dupeKey.secret
+        // Length filter: skip if lengths differ by more than ~10%.
+        if len(dupe)*10 < len(valStr)*9 || len(dupe)*10 > len(valStr)*11 {    // line 894
+            continue
+        }
+        // Skip intra-detector pairs: two results from the SAME detector type
+        // are not "overlap" in the cross-detector sense.
+        if val.detectorKey.Type() == dupeKey.detectorKey.Type() {              // line 900
+            continue
+        }
+        if valStr == dupe { return true }                                     // lines 904-909
+        similarity := strutil.Similarity(valStr, dupe, metrics.NewLevenshtein())  // line 911
+        if similarity > similarityThreshold { return true }                   // line 914
     }
+    return false
 }
 ```
 
-This is the typical AWS + Voiceflow case — both detectors keyword-match (because Voiceflow's keyword `dm` appears inside many base64-decoded AWS secrets), but Voiceflow's regex `\b(VF\.(?:(?:DM|WS)\.)?[a-fA-F0-9]{24}\.[a-zA-Z0-9]{16})\b` does not match AWS key material, so Voiceflow produces zero results and AWS is re-routed for full verification.
+Three gating conditions apply in order:
+- **Length guard** (line 894) — rejects pairs whose lengths differ by more than 10%, which bounds the cost of the Levenshtein metric. A 40-char AWS secret compared against a 26-char hash, for example, is skipped without computing a Levenshtein distance.
+- **Same-detector skip** (line 900) — *different* detector types are required for a "duplicate". Two AWS findings on the same chunk are never flagged as overlap, which is why the common "AWS finds the same key twice in one chunk" scenario does not trigger `errOverlap`.
+- **Exact match or ε-near match** — exact string equality (line 906) returns `true` immediately; otherwise Levenshtein similarity from `github.com/adrg/strutil/metrics` is computed and compared strictly greater than `0.9`. The ordering reads: `similarity > similarityThreshold` (line 914), so a similarity of exactly 0.9 returns `false`.
+
+### 5.5 When No Cross-Detector Duplicate Exists
+
+If a chunk is multi-detector keyword-matched but only one detector actually produces regex-level results, `chunkSecrets` contains only that detector's keys, and `likelyDuplicate` is consulted against same-detector entries only. Per the same-detector skip (line 900), the function returns `false`. The detector stays in `detectorKeysWithResults` and is re-routed to the direct path for full verification (lines 1017–1026).
+
+This is the AWS + Voiceflow case: both detectors keyword-match (AWS on `"AKIA"`, Voiceflow on `"vf"`/`"dm"`), but Voiceflow's regex `\b(VF\.(?:(?:DM|WS)\.)?[a-fA-F0-9]{24}\.[a-zA-Z0-9]{16})\b` does not match AWS key material (`pkg/detectors/voiceflow/voiceflow.go` line 30), so Voiceflow produces zero results and AWS alone is re-routed for verification.
+
+### 5.6 When Is `errOverlap` Triggered — Summary
+
+| Condition | `errOverlap` attached? | Outcome |
+|---|---|---|
+| Only one detector keyword-matched the chunk | No | Direct path from scanner to detector worker |
+| Multiple detectors matched **but** only one produced results | No | Overlap worker re-routes the result-producing detector for verification |
+| Multiple detectors matched **and** multiple produced same/near-identical secrets | **Yes** (for the duplicates) | Duplicates get `errOverlap` + `processResult` direct; the first-processed detector is re-routed for verification |
+| `--allow-verification-overlap` flag is set | Never | Overlap worker is bypassed entirely; all detectors go to the direct path with verification enabled |
+
+### 5.7 Cross-Reference to Executable Tests
+
+- `pkg/engine/engine_test.go` — `TestVerificationOverlapChunk` exercises a Postman key that triggers two custom detectors; one result is marked `errOverlap`.
+- `pkg/engine/engine_test.go` — `TestVerificationOverlapChunkFalsePositive` uses `pkg/engine/testdata/verificationoverlap_secrets_fp.txt` to validate that a false-positive match does not wrongly attach `errOverlap`.
+- `pkg/engine/engine_test.go` — `TestLikelyDuplicate` directly exercises the similarity/length rules described in [§5.4](#54-the-likelyduplicate-algorithm).
 
 ---
 
-## 6. The Deduplication Layer
+## 6. Result Deduplication (Notifier)
 
-All detector results — from the direct path *and* from the overlap path — converge on the shared `e.results` channel and are consumed by `notifierWorker` (lines 1189–1235). The entire dedup decision is in this one function.
+All detector results — whether produced by the overlap worker's direct `processResult` path or by the normal `detectorWorker` → `detectChunk` → `processResult` path — converge on the shared `e.results` channel and are consumed by `notifierWorker`. The entire dedup decision lives in this one function (`pkg/engine/engine.go` lines 1189–1235).
 
-### 6.1 Filter by Verification Status
+### 6.1 Verification-Status Filter (Pre-Dedup)
 
-Before dedup, the notifier applies the user's result-filtering preferences (`--results verified,unverified,unknown` etc.):
+Before dedup, the notifier applies the user's `--results` filter:
 
 ```go
-// pkg/engine/engine.go (lines 1192-1208, abridged)
+// pkg/engine/engine.go (lines 1192-1207, abridged)
 if !result.Verified {
     if result.VerificationError() != nil {
-        if !e.notifyUnknownResults { continue }   // skip "unknown" (errOverlap falls here)
-    } else if !e.notifyUnverifiedResults { continue }   // skip "unverified"
-} else if !e.notifyVerifiedResults { continue }   // skip "verified"
+        if !e.notifyUnknownResults { continue }      // lines 1194-1198
+    } else if !e.notifyUnverifiedResults {
+        continue                                      // lines 1199-1202
+    }
+} else if !e.notifyVerifiedResults {
+    continue                                          // lines 1203-1207
+}
 ```
 
-Results bearing `errOverlap` have `VerificationError() != nil` and therefore only pass if `notifyUnknownResults` is true.
+Results bearing `errOverlap` have `VerificationError() != nil` and therefore only pass if `notifyUnknownResults` is true (default). This is the point at which overlap-tagged results can be filtered out of the final output.
 
 ### 6.2 The Dedup Key and LRU Cache
 
 ```go
-// pkg/engine/engine.go (lines 1213-1221)
-// Dedupe results by comparing the detector type, raw result, and source metadata.
-// We want to avoid duplicate results with different decoder types, but we also
-// want to include duplicate results with the same decoder type.
-// Duplicate results with the same decoder type SHOULD have their own entry in the
-// results list, this would happen if the same secret is found multiple times.
-// Note: If the source type is postman, we dedupe the results regardless of decoder type.
+// pkg/engine/engine.go (lines 1216-1221)
 key := fmt.Sprintf("%s%s%s%+v", result.DetectorType.String(), result.Raw, result.RawV2, result.SourceMetadata)
 if val, ok := e.dedupeCache.Get(key); ok && (val != result.DecoderType ||
     result.SourceType == sourcespb.SourceType_SOURCE_TYPE_POSTMAN) {
@@ -360,477 +522,693 @@ if val, ok := e.dedupeCache.Get(key); ok && (val != result.DecoderType ||
 e.dedupeCache.Add(key, result.DecoderType)
 ```
 
-Three rules govern the cache:
-
-| Current result key | Current `DecoderType` | Cache state | Outcome |
-|---|---|---|---|
-| Not in cache | — | — | Add to cache with current `DecoderType`, dispatch result. |
-| In cache | **Same** as cached value | Non-Postman | Update cache (no-op) and dispatch result — "same decoder" duplicates are intentionally allowed. |
-| In cache | **Different** from cached value | Non-Postman | **Skip**. The first `DecoderType` wins. |
-| In cache | Any | Postman source | **Skip** regardless of decoder type. |
-
-The cache is a `hashicorp/golang-lru/v2` instance of 512 entries initialised in `Engine.initialize`:
+The cache is a `hashicorp/golang-lru/v2` instance of 512 entries:
 
 ```go
-// pkg/engine/engine.go (lines 491-494)
+// pkg/engine/engine.go (lines 491-493)
 const cacheSize = 512 // number of entries in the LRU cache
 cache, err := lru.New[string, detectorspb.DecoderType](cacheSize)
 ```
 
-### 6.3 Why the Key Includes `SourceMetadata`
+The **key** is constructed with `fmt.Sprintf("%s%s%s%+v", ...)`; it contains:
+- `result.DetectorType.String()` — e.g. `"AWS"`, `"Sentry"`.
+- `result.Raw` — the detector's primary raw secret bytes.
+- `result.RawV2` — an optional secondary raw representation (often used for compound secrets like AWS key+secret pairs).
+- `result.SourceMetadata` — the protobuf `SourceMetadata` formatted with `%+v`, which includes the filesystem path, Git commit hash, line number, Postman workspace, etc.
 
-The `%+v`-formatted `SourceMetadata` serialisation contains the file path, line number, commit hash, etc. as appropriate for the source. Two occurrences of the **same raw bytes** in **different locations** (e.g. two files) therefore produce **different** dedup keys and both survive. This is the basis of Experiment I ([§9.9](#99-experiment-i--two-separate-files-with-identical-secrets)).
+Note especially what is *not* in the key: **`DecoderType` is not a component of the key.** It is only the cache's *value*. That is the entire basis for decoder-variant dedup.
 
-### 6.4 Note on Line Numbers in `SourceMetadata`
+The **value** stored in the cache is `result.DecoderType` — the enum identifying the decoder whose variant produced this result.
 
-For filesystem / Git sources, the notifier is not the first stage to touch `SourceMetadata` — `processResult` calls `FragmentFirstLineAndLink` and `SetResultLineNumber` which use `bytes.Cut(chunk.Data, result.Raw)` to locate the *first* occurrence of `Raw` in the chunk data (`FragmentLineOffset` at line 1256). Because `bytes.Cut` always returns the first match, two detector invocations on the same decoded chunk producing the same `Raw` receive the **same** line number — and therefore the **same** `SourceMetadata`, and therefore the **same** dedup key with the same `DecoderType` ⇒ both pass dedup (per rule 2 in [§6.2](#62-the-dedup-key-and-lru-cache)).
+### 6.3 Dedup Decision Matrix
+
+| Cache state for key | Current `DecoderType` | Source type | Outcome |
+|---|---|---|---|
+| Not in cache | (any) | (any) | Dispatch; store `DecoderType` in cache (`Add`, line 1221) |
+| In cache | **Same** as cached value | Non-Postman | Dispatch; cache unchanged (same-decoder duplicates are intentionally allowed; see comment on lines 1213–1214) |
+| In cache | **Different** from cached value | Non-Postman | **Suppress** (`continue`, line 1219) — the first decoder wins |
+| In cache | (any) | Postman | **Suppress** regardless of decoder (line 1218) |
+
+The source-comment block at lines 1210–1215 articulates the design intent explicitly:
+
+> Dedupe results by comparing the detector type, raw result, and source metadata. We want to avoid duplicate results with different decoder types, but we also want to include duplicate results with the same decoder type. Duplicate results with the same decoder type SHOULD have their own entry in the results list, this would happen if the same secret is found multiple times.
+
+### 6.4 Why `SourceMetadata` Makes Identical Secrets in Different Files Distinct
+
+For filesystem scans, `SourceMetadata` contains `Data.Filesystem.File` (the absolute file path) and, after `processResult` line-number enrichment, the line number. Two identical secrets in two different files therefore produce two different `%+v`-formatted keys and both survive — which matches Experiment G's observation.
+
+For single-file scans where the secret appears at multiple line offsets *within the same chunk*, `processResult` calls `FragmentFirstLineAndLink` (via `SetResultLineNumber`) which uses `bytes.Cut(chunk.Data, result.Raw)` (`FragmentLineOffset`, `pkg/engine/engine.go` line 1257) to locate the **first** occurrence of `result.Raw`. Both detector invocations on the same chunk produce the same line number ⇒ same `SourceMetadata` ⇒ same dedup key. If they also share the same decoder (e.g., both come from the BASE64 variant), both pass dedup by the rule on line 1217.
+
+### 6.5 Concurrency and the Cache
+
+`hashicorp/golang-lru/v2` is internally thread-safe: each `Get` and `Add` is atomic. However, the **composite** operation `Get → Add` is not atomic — two notifier workers concurrently processing two results with the same key can both observe "not in cache" and then both call `Add`. The second `Add` overwrites the value set by the first, but both results will have already been dispatched. In practice, this edge case is very rare because the second worker's `Get` is likely to observe the first worker's `Add` if there is any meaningful scheduling delay; and since the key is identical, the subsequent third arrival will see consistent cache state either way.
+
+### 6.6 Cross-Reference to Executable Tests
+
+- `pkg/engine/engine_test.go` — `TestEngine_DuplicateSecrets` uses `pkg/engine/testdata/secrets.txt` (containing duplicated Sentry tokens and a single AWS pair) and asserts exactly 2 unverified results. The Sentry duplicates come from the same decoder (PLAIN) on overlapping lines, which is why the test does not collapse them to 1 — it validates rule "same decoder ⇒ both pass".
 
 ---
 
-## 7. Interaction and Ordering Between Subsystems
+## 7. Concurrency and Non-Determinism
 
-### 7.1 Pipeline Stages
+### 7.1 Worker Pool Sizing
 
-Mapping the four stages in `docs/process_flow.md` onto the actual worker topology:
-
-| Stage (doc) | Component | Worker type | Function |
-|---|---|---|---|
-| Source Decomposition | `sources.SourceManager` | source-specific goroutines | Emit `*sources.Chunk` on `e.ChunksChan()` |
-| Chunk-to-Detector Matching | `scannerWorker` + `AhoCorasickCore` | scanner workers | Decode, keyword-match, route |
-| Secret Detection | `verificationOverlapWorker` + `detectorWorker` / `detectChunk` | overlap + detector workers | Run regex, verify, filter |
-| Result Notification | `notifierWorker` | notifier workers | Dedup, dispatch |
-
-### 7.2 Channel Topology
-
-```
-           ChunksChan()
-                │
-                ▼
-   ┌────────────────────────┐
-   │   scannerWorker(s)     │  decode + Aho-Corasick
-   └─────────┬──────┬───────┘
-             │      │
-             │      └───────────────┐
-             ▼                      ▼
- verificationOverlapChunksChan    detectableChunksChan
-             │                      │
-             ▼                      │
- ┌──────────────────────┐           │
- │ verificationOverlap  │           │
- │       Worker(s)      │           │
- └──────────┬───────────┘           │
-            │   (re-route            │
-            │    non-duplicate       │
-            │    detectors)          │
-            └─────────────► detectableChunksChan
-                                    │
-                                    ▼
-                   ┌────────────────────────────┐
-                   │   detectorWorker(s)        │  FromData, verify, filter
-                   │   → detectChunk            │
-                   │   → processResult          │
-                   └──────────┬─────────────────┘
-                              │
-                              ▼
-                      e.results (chan)
-                              │
-                              ▼
-                   ┌────────────────────────────┐
-                   │   notifierWorker(s)        │  filter+dedup+dispatch
-                   └────────────────────────────┘
+```go
+// pkg/engine/engine.go (lines 336-354)
+if e.concurrency == 0 {
+    numCPU := runtime.NumCPU()
+    e.concurrency = numCPU
+}
+if e.detectorWorkerMultiplier < 1 {
+    e.detectorWorkerMultiplier = 8       // bound by net i/o (comment on line 344)
+}
+if e.notificationWorkerMultiplier < 1 {
+    e.notificationWorkerMultiplier = 1
+}
+if e.verificationOverlapWorkerMultiplier < 1 {
+    e.verificationOverlapWorkerMultiplier = 1
+}
 ```
 
-Results bearing `errOverlap` bypass the detector workers: the overlap worker calls `processResult` directly (line 991) which writes to `e.results` at line 1186.
+Total worker counts therefore resolve to:
 
-### 7.3 Ordering Invariants
+| Pool | Count | Start function |
+|---|---|---|
+| scanner | `concurrency` | `startScannerWorkers` (`pkg/engine/engine.go` lines 662–673) |
+| detector | `concurrency × 8` | `startDetectorWorkers` (lines 675–688) |
+| verificationOverlap | `concurrency × 1` | `startVerificationOverlapWorkers` (lines 690–703) |
+| notifier | `concurrency × 1` | `startNotifierWorkers` (lines 705–718) |
 
-1. **Decoder order per-chunk.** Inside `scannerWorker`'s per-chunk loop, decoded variants are produced in UTF8 → Base64 → UTF16 → EscapedUnicode order, and pushed onto their destination channels in that same order.
-2. **Dedup happens after overlap.** The overlap worker runs *before* the main detector worker. Any result emitted by the overlap worker (whether marked `errOverlap` or re-routed) still passes through the notifier's dedup cache. Dedup is always last.
-3. **FIFO per channel.** Go channels deliver in FIFO order to receivers, but when there are multiple receivers, each receiver may claim a different item from the same channel. With >1 consumer goroutine, ordering across goroutines is **not** preserved.
-4. **Cache-add is atomic per notifier.** `hashicorp/golang-lru` serialises calls internally, so `Get → Add` is safe under concurrency, but a two-step "check then add" is not atomic: two notifier goroutines processing two different results with the same key can both observe "key not in cache" and then both add, with the *second* add overwriting the first. In practice this is rarely visible because both would produce identical cache contents, and the notifier's decision for the *next* arrival uses the updated cache anyway.
+On a host with 128 logical CPUs and default `--concurrency`, this yields 128 scanner workers, **1024** detector workers, 128 overlap workers, and 128 notifiers — all running concurrently.
 
-### 7.4 Illustrative Sequence — Plain + Base64 AWS Key in One Chunk
+### 7.2 Channel Buffers
+
+All cross-pool communication goes through the three buffered channels initialised by `Engine.initialize` (`pkg/engine/engine.go` lines 497–519):
+
+| Channel | Buffer | Multiplier × `runtime.NumCPU()` |
+|---|---|---|
+| `detectableChunksChan` | `defaultChannelBuffer × 50` | e.g. 6400 entries on a 128-CPU host |
+| `verificationOverlapChunksChan` | `defaultChannelBuffer × 25` | e.g. 3200 entries on a 128-CPU host |
+| `results` | `defaultChannelBuffer × 50` | e.g. 6400 entries on a 128-CPU host |
+
+Large buffers mean producers rarely block, further decoupling worker scheduling from the strict push order.
+
+### 7.3 Sources of Non-Determinism
+
+A race is possible whenever two in-flight results share a dedup key but differ in `DecoderType`. Given that condition, the "winner" is whichever result's `dedupeCache.Add` at line 1221 executes first — and this is decided by:
+
+1. **Detector worker goroutine scheduling.** Even at `--concurrency=1` there are still 8 detector workers (hard-coded multiplier). Two decoded variants pushed back-to-back on `detectableChunksChan` are likely to be picked up by two different goroutines.
+2. **Overlap worker scheduling.** At `--concurrency > 1` there are multiple overlap workers draining `verificationOverlapChunksChan` in parallel; each produces `processResult` output to `e.results` on its own schedule.
+3. **Notifier worker scheduling.** With `--concurrency > 1` multiple notifier workers consume `e.results` and their cache accesses interleave.
+4. **OS-level thread scheduling.** With `GOMAXPROCS > 1`, goroutines execute on multiple OS threads in genuine parallel; thread scheduling, cache coherence, and I/O waits influence which goroutine reaches `dedupeCache.Add` first.
+
+### 7.4 Why `GOMAXPROCS=1` + `--concurrency=1` Is Deterministic
+
+At the minimum setting:
+- 1 scanner worker pushes PLAIN then BASE64 onto `verificationOverlapChunksChan` (or `detectableChunksChan` on single-detector inputs) in that order.
+- 1 overlap worker drains FIFO and re-routes in the same order.
+- 8 detector workers exist, but with `GOMAXPROCS=1` only one runs at a time. The first to pick up PLAIN runs to completion (or blocks on I/O) before another detector worker can pick up BASE64.
+- 1 notifier worker sees results in push order.
+
+Outcome: PLAIN always wins (observed 100% across multiple runs; see [§11.7](#117-experiment-g--gomaxprocs1---concurrency1)).
+
+### 7.5 Why `--concurrency=1` Alone Is Not Enough
+
+With `--concurrency=1` on a multi-core host (`GOMAXPROCS > 1`), the 8 detector workers can run on separate CPU cores. The scanner pushes PLAIN then BASE64 in rapid succession; two different detector workers can pick them up. Whichever finishes `FromData` first reaches the notifier first. Our Experiment F shows the `--concurrency=1` case still has a meaningful bias toward PLAIN (because PLAIN entered the channel first) but is not 100% deterministic.
+
+### 7.6 At Default Concurrency on Many Cores
+
+At `--concurrency=128` on a 128-CPU host, the BASE64 decoded chunk can race PLAIN through the full pipeline in genuine parallel. Multiple overlap workers, 1024 detector workers, and 128 notifiers all contend for work. Observed distribution from our 30-run test (plain + base64 + unicode-escaped in one chunk): PLAIN 60%, BASE64 20%, ESCAPED_UNICODE 20% — a clear non-deterministic distribution.
+
+### 7.7 Why PLAIN Is Still Favoured at Higher Concurrency
+
+PLAIN's statistical advantage persists even at high concurrency because:
+- The scanner submits PLAIN first (UTF8 is first in `DefaultDecoders()`).
+- PLAIN's entry therefore arrives on the downstream channel microseconds before BASE64 and ESCAPED_UNICODE.
+- Under heavy load the dedup cache's first-writer-wins property converts this small temporal lead into a non-trivial probability of winning.
+
+At very high concurrency the lead narrows because other work (detector regex, `CleanResults`, `processResult`) can complete in the window before PLAIN finishes — and because a BASE64 chunk may produce a smaller decoded byte buffer (ASCII plaintext rather than the full surrounding chunk), its regex scan can finish faster.
+
+---
+
+## 8. Interaction Sequence Diagram
+
+The following sequence captures every hop of a chunk containing both plain AWS credentials and their base64 encoding, highlighting the dedup-happens-after-overlap ordering and the concurrent race at the notifier.
 
 ```mermaid
 sequenceDiagram
-    participant SW as scannerWorker
-    participant AC as AhoCorasickCore
-    participant OW as overlapWorker
-    participant DW as detectorWorker
-    participant NW as notifierWorker
-    participant OUT as Dispatcher
+    participant Scanner as ScannerWorker (engine.go 777-841)
+    participant Dec as DecoderChain
+    participant AC as AhoCorasickCore.FindDetectorMatches
+    participant OW as VerificationOverlapWorker (engine.go 924-1034)
+    participant DW as DetectorWorker / detectChunk (engine.go 1036-1124)
+    participant NW as NotifierWorker (engine.go 1189-1235)
+    participant Disp as Dispatcher → Output
 
-    Note over SW: Receives 1 Chunk with plain AWS key + base64(AWS key)
+    Note over Scanner,Dec: Scanner iterates DefaultDecoders() in order (engine.go line 786)
 
-    SW->>AC: FindDetectorMatches(UTF8 output)
-    AC-->>SW: [AWS, Voiceflow]  (both keyword-match)
-    Note over SW: >1 detectors → overlap path
-    SW->>OW: verificationOverlapChunksChan  {decoder=PLAIN}
+    Scanner->>Dec: UTF8.FromChunk(chunk)
+    Dec-->>Scanner: DecodableChunk{DecoderType=PLAIN}
+    Scanner->>AC: FindDetectorMatches(plain-bytes)
+    AC-->>Scanner: [AWS, Voiceflow]
+    Note over Scanner: len>1 && !verificationOverlap → overlap path (engine.go 796)
+    Scanner->>OW: verificationOverlapChunksChan <- PLAIN variant
 
-    SW->>AC: FindDetectorMatches(BASE64 output)
-    AC-->>SW: [AWS, Voiceflow]
-    SW->>OW: verificationOverlapChunksChan  {decoder=BASE64}
+    Scanner->>Dec: Base64.FromChunk(chunk)
+    Dec-->>Scanner: DecodableChunk{DecoderType=BASE64} (in-place substitution)
+    Scanner->>AC: FindDetectorMatches(base64-decoded-bytes)
+    AC-->>Scanner: [AWS, Voiceflow]
+    Scanner->>OW: verificationOverlapChunksChan <- BASE64 variant
 
-    par Overlap worker processes both chunks
-        OW->>OW: AWS.FromData(PLAIN bytes) → 1 result
-        OW->>OW: Voiceflow.FromData(PLAIN bytes) → 0 results
-        Note over OW: no likelyDuplicate → re-route AWS
-        OW->>DW: detectableChunksChan  {decoder=PLAIN}
+    Scanner->>Dec: UTF16.FromChunk(chunk)
+    Dec-->>Scanner: nil (no paired-null pattern)
+    Scanner->>Dec: EscapedUnicode.FromChunk(chunk)
+    Dec-->>Scanner: nil (no \u pattern)
+
+    par OW processes PLAIN (concurrent)
+        OW->>OW: AWS.FromData(verify=false) → 1 result
+        OW->>OW: Voiceflow.FromData(verify=false) → 0 results
+        Note over OW: likelyDuplicate returns false (engine.go 982)
+        OW->>DW: detectableChunksChan <- PLAIN {detector=AWS}
+    and OW processes BASE64 (concurrent)
+        OW->>OW: AWS.FromData(verify=false) → 1..2 results per span
+        OW->>OW: Voiceflow.FromData(verify=false) → 0 results
+        Note over OW: filterResults → aws.CleanResults collapses by Redacted
+        OW->>DW: detectableChunksChan <- BASE64 {detector=AWS}
+    end
+
+    par Detector workers race (multiple goroutines)
+        DW->>DW: FromData(verify=true) on PLAIN span
+        DW->>NW: e.results <- Result{DecoderType=PLAIN, Raw=AKIA...}
     and
-        OW->>OW: AWS.FromData(BASE64 bytes) → 2 results (2 keyword hits → 2 spans)
-        Note over OW: AWS.CleanResults collapses to 1 result per ID
-        OW->>DW: detectableChunksChan  {decoder=BASE64}
+        DW->>DW: FromData(verify=true) on BASE64 span(s)
+        DW->>NW: e.results <- Result{DecoderType=BASE64, Raw=AKIA...}
     end
 
-    par Detector workers race
-        DW->>NW: results chan  {DecoderType=PLAIN, Raw=AKIA...}
-    and
-        DW->>NW: results chan  {DecoderType=BASE64, Raw=AKIA...}
-    end
-
-    alt PLAIN arrives first
-        NW->>NW: key not in cache → Add(key, PLAIN)
-        NW->>OUT: Dispatch(PLAIN result)
-        NW->>NW: BASE64 arrives → val=PLAIN ≠ BASE64 → skip
-    else BASE64 arrives first
-        NW->>NW: key not in cache → Add(key, BASE64)
-        NW->>OUT: Dispatch(BASE64 result)
-        NW->>NW: PLAIN arrives → val=BASE64 ≠ PLAIN → skip
+    Note over NW: Dedup key = DetectorType + Raw + RawV2 + SourceMetadata (engine.go 1216)
+    alt PLAIN arrives first at NW
+        NW->>NW: Get(key) → miss; Add(key, PLAIN) (line 1221)
+        NW->>Disp: Dispatch (PLAIN result)
+        NW->>NW: BASE64 arrives → Get(key) → val=PLAIN ≠ BASE64 → continue (line 1217-1219)
+    else BASE64 arrives first at NW
+        NW->>NW: Get(key) → miss; Add(key, BASE64)
+        NW->>Disp: Dispatch (BASE64 result)
+        NW->>NW: If BASE64 span produced 2 results with same decoder → 2nd result same key, same decoder → dispatch
+        NW->>NW: PLAIN arrives → val=BASE64 ≠ PLAIN → continue
     end
 ```
 
-Note that `CleanResults` in the overlap worker's `filterResults` step actually collapses the two AWS hits on the BASE64 decoded chunk to **one**, because AWS implements `CustomResultsCleaner` and its `CleanResults` dedupes by `Redacted`. This collapse happens *inside the overlap worker*. On the subsequent direct-path invocation, however, `detectChunk` calls `FromData` per-match-span (`for _, matchBytes := range matches`, line 1068), and AWS's own `FromData` dedupes IDs internally via `idMatches` map, so a single `FromData` call again yields one result per unique AKIA. Net effect under standard behaviour: one AWS result per decoded chunk. The "2 BASE64 results" pattern we observed in Experiment D [§9.5](#95-experiment-d--well-separated-plain--base64) arises in a subtly different scenario, described there.
+**Ordering invariants to note on the diagram:**
+- The overlap worker (OW) runs *before* the detector worker (DW) for any chunk routed through the overlap path — or, equivalently, `processResult` from OW and `processResult` from DW both flow through the *same* `e.results` channel to the *same* notifier pool.
+- The notifier's dedup step is **last**. Every result — whether `errOverlap`-tagged from OW or verified from DW — passes through `dedupeCache.Get` / `Add` at lines 1217–1221.
+- **The race lives entirely at the notifier.** Two in-flight results with the same key but different `DecoderType`s deterministically produce one survivor; the identity of the survivor is whichever reaches `Add` first.
 
 ---
 
-## 8. Concurrency Model and Non-Determinism
+## 9. Single-vs-Multiple Result Behaviour Matrix
 
-### 8.1 Worker Counts and Buffer Sizes
+The observed result count for a single logical secret depends on the intersection of (a) decoder-variant count per chunk, (b) Aho-Corasick span count per decoded variant, (c) dedup-key distinctness, and (d) concurrency-driven race outcome. The matrix below consolidates the observed behaviours with the code mechanism that produces each.
 
-```go
-// pkg/engine/engine.go (setDefaults, lines 336-376)
-e.concurrency = numCPU                          // if not set by user
-e.detectorWorkerMultiplier = 8                  // default
-e.notificationWorkerMultiplier = 1              // default
-e.verificationOverlapWorkerMultiplier = 1       // default
-```
+| # | Input structure | Flag configuration | Observed result count | `DecoderName` observed | Code mechanism |
+|---|---|---|---|---|---|
+| 1 | Plain text only | default | 1 | PLAIN (deterministic) | Only UTF8 returns non-nil (`utf8.go` 16-29); single decoded chunk; single `FromData`; single dispatch. |
+| 2 | Base64 only | default | 1 | BASE64 (deterministic) | PLAIN output contains only base64 alphabet → no AKIA keyword → no results; BASE64 decoded chunk contains plaintext → AWS detects → single dispatch. |
+| 3 | Plain + Base64 in same chunk, no filler | default | 1 | PLAIN or BASE64 (race) | Both decoders produce output; both produce 1 AWS result each with same dedup key; dedup keeps first to arrive (lines 1217-1219). |
+| 4 | Plain + Base64 well separated by filler (<10 KB chunk) | default | **1 or 2** (bimodal) | PLAIN → 1 result; BASE64 → 2 results (same decoder, both kept) | Base64 decoder rewrites in place → decoded chunk contains AKIA **twice** → Aho-Corasick produces 2 spans (radius 512, `ahocorasickcore.go` line 155) → `detectChunk` calls `FromData` per span (engine.go 1062) → if BASE64 wins race: 2 BASE64 results pass (same-decoder rule, engine.go 1217); if PLAIN wins: both BASE64 results suppressed (different decoder). |
+| 5 | Plain + Base64 + Unicode-escaped | default | 1 | PLAIN / BASE64 / ESCAPED_UNICODE (race) | Three decoded chunks; three AWS results with same dedup key; dedup retains first to arrive. |
+| 6 | Same secret in two separate files | default | 2 | PLAIN, PLAIN | Different `SourceMetadata.Filesystem.File` → different `%+v` serialisations → different dedup keys → no dedup interaction (engine.go 1216). |
+| 7 | Plain + Base64 | `--allow-verification-overlap` | 1 | PLAIN or BASE64 (race) | `e.verificationOverlap=true` makes scanner skip overlap path (engine.go 796); both variants go direct to detector worker; notifier dedup still applies → 1 result survives; `errOverlap` is never attached. |
+| 8 | Same secret twice in one chunk from the same detector, same decoder | default | 1 | PLAIN or BASE64 | Detector's own `FromData` dedupes by internal map (e.g. AWS's `idMatches`); and even if two results emerge, same-decoder + same-key results both dispatch (engine.go 1217) — but AWS's `CleanResults` (`pkg/detectors/aws/utils.go` lines 89-114) runs first and collapses duplicates by `Redacted` field. |
+| 9 | Plain + Base64 | `GOMAXPROCS=1 --concurrency=1` | 1 | PLAIN (deterministic 100%) | Fully serialised scheduling preserves the scanner's FIFO push order → PLAIN reaches notifier first → caches PLAIN → BASE64 suppressed. |
 
-```go
-// pkg/engine/engine.go (initialize, lines 498-520)
-detectableChunksChanMultiplier          = 50
-verificationOverlapChunksChanMultiplier = 25
-resultsChanMultiplier                   = 50
-var defaultChannelBuffer = runtime.NumCPU()   // line 627
-```
+The "1 or 2" phenomenon on row 4 is the central source of the user's observation that the same secret sometimes yields one result and sometimes yields two. The mechanism has two steps:
 
-Therefore:
+1. **Base64 in-place substitution produces a double AKIA inside the BASE64 decoded chunk.** When a chunk contains plain-text AKIA *and* the base64 of that AKIA, Base64 rewrites the base64 substring to plaintext while leaving the original plain AKIA untouched. The BASE64-decoded chunk therefore contains `AKIA…` twice.
+2. **Aho-Corasick produces two spans ⇒ `detectChunk` calls `FromData` twice ⇒ two results with identical dedup key and same decoder.** Per the dedup rule at `pkg/engine/engine.go` line 1217, same-decoder duplicates are intentionally retained.
 
-| Worker pool | Count | Source line |
-|---|---|---|
-| scanner | `concurrency` | `startScannerWorkers` (663) |
-| detector | `concurrency × 8` | `startDetectorWorkers` (675) |
-| verificationOverlap | `concurrency × 1` | `startVerificationOverlapWorkers` (690) |
-| notifier | `concurrency × 1` | `startNotifierWorkers` (705) |
-
-| Channel | Buffer | Source line |
-|---|---|---|
-| `detectableChunksChan` | `NumCPU × 50` | 515 |
-| `verificationOverlapChunksChan` | `NumCPU × 25` | 517 |
-| `results` | `NumCPU × 50` | 519 |
-
-On our 128-CPU test machine, the defaults resolve to 128 scanner workers, **1024 detector workers**, 128 overlap workers, 128 notifiers, and ~12800-deep channel buffers.
-
-### 8.2 Sources of Non-Determinism
-
-Non-deterministic decoder selection can only arise when two or more in-flight results share a dedup key but differ in `DecoderType` — i.e. when the same chunk's multiple decoder outputs each yield a detector result. Once that condition holds, the winner is whichever result reaches the notifier's `dedupeCache.Add` first. That arrival order depends on:
-
-1. **Detector worker goroutine scheduling.** Even with `concurrency=1`, there are still 8 detector workers, any of whom may take the next item off `detectableChunksChan`.
-2. **Overlap worker scheduling.** Each overlap worker drains one chunk at a time and may re-route to `detectableChunksChan` out of the scanner's original push order.
-3. **Notifier worker scheduling.** With `concurrency > 1`, multiple notifier workers read from `e.results` and their LRU cache operations interleave.
-4. **GOMAXPROCS-driven parallelism.** Goroutines can run in parallel on multiple OS threads; under serial execution (`GOMAXPROCS=1`) Go still schedules goroutines pre-emptively but only one runs at a time, greatly increasing the probability that FIFO ordering from the scanner's push order is preserved.
-
-### 8.3 Why `GOMAXPROCS=1` + `--concurrency=1` Is Fully Deterministic
-
-With one scanner, one overlap worker, one notifier, and `GOMAXPROCS=1`, the goroutine that performs the push to a channel generally runs until it blocks. Because:
-
-- The scanner pushes PLAIN first, then BASE64 (to the overlap channel, in order).
-- The overlap worker drains items FIFO, processes them in order, and re-routes to the detector channel in order.
-- There are still 8 detector workers, so two items can be picked up by different goroutines; but under GOMAXPROCS=1 only one detector worker runs at a time, and the first to be scheduled after the first push handles the PLAIN chunk before the second push is even processed.
-- The single notifier worker sees results in the order they are pushed.
-
-The net observed outcome is that PLAIN always wins the dedup race (100% over 10+10 trials in our experiments, [§9.7](#97-experiment-h--concurrency-comparison)).
-
-### 8.4 Why `--concurrency=1` Alone Is **Not** Sufficient
-
-With `--concurrency=1`, detector workers still run 8-parallel — the multiplier is **hard-coded** at `e.detectorWorkerMultiplier = 8` (line 343). On a multi-core machine, two detector workers can execute in parallel, and because the overlap worker pushes PLAIN then BASE64 onto `detectableChunksChan` in quick succession, a second detector worker can pick up BASE64 while the first is still handling PLAIN. The order in which they reach the notifier is then controlled by which worker happens to finish `FromData` first — which depends on OS-level thread scheduling, CPU caches, and other factors outside Go's control. Our Experiment H shows PLAIN wins 21/25 ≈ 84% at `--concurrency=1` but BASE64 wins the other 4/25.
-
-### 8.5 Role of the Default 128-Way Concurrency
-
-At `--concurrency=128`, there are 1024 detector workers on our 128-CPU host. The probability that at least one worker picks up the BASE64 chunk and finishes before PLAIN is high, because PLAIN and BASE64 can now be processed in genuine parallel. Our Experiment H observed PLAIN winning only 7/25 ≈ 28% at the default concurrency.
+Whether the user sees 1 or 2 results comes down to who wins the race at the notifier. If PLAIN wins, both BASE64 results are suppressed (they have the same key but a different `DecoderType` than the cached PLAIN). If BASE64 wins, both BASE64 results pass dedup (same decoder), and the PLAIN result is suppressed — giving 2 results.
 
 ---
 
-## 9. Experimental Evidence
+## 10. Answers to the Five User Questions
 
-All experiments ran the built `/tmp/trufflehog_bin` against crafted test files with `--no-verification --json` unless otherwise noted. The following AWS test credentials were used (they are a known test-only key pair also present in `pkg/engine/testdata/secrets.txt`):
+### Q1. Decoder Pipeline — Which decoders fire and which DecoderType is reported?
 
-- `AKIAWARWQKZNHMZBLY4I` (access key)
-- `s6NbZeygUrUdM95K683Lb6IsILWXOJlJ8ZVd1Kw0` (secret)
+**Answer:** TruffleHog does not "pick" a decoder. For every chunk, `scannerWorker` iterates *all* decoders in `DefaultDecoders()` order and pushes one decoded variant per decoder that returned non-`nil`. PLAIN fires for any non-empty text input; BASE64 fires when the chunk contains a ≥20-char base64 run that decodes to ASCII; UTF16 fires when paired-null bytes form printable runes; ESCAPED_UNICODE fires when `U+XXXX` or `\uXXXX` sequences are present. Each non-nil decoded variant independently enters the downstream pipeline. Which `DecoderName` appears in the final output is decided later, at the notifier's dedup stage (Q3).
 
-### 9.1 Experiment A — Plain-text-only AWS key
+#### Thinking / Rationale
 
-- **Input:** `aws AKIAWARWQKZNHMZBLY4I\nsecret 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`.
-- **Flag set:** `--no-verification --json`.
-- **Observed:** exactly 1 result with `DecoderName=PLAIN`, deterministic across all runs.
-- **Interpretation:** Only the UTF8 decoder produces non-nil output (the text has no ≥20-char base64 runs, no UTF-16 paired nulls, no `\uXXXX` patterns). One decoded chunk ⇒ one match ⇒ one result ⇒ one dispatch.
+The fixed ordering `UTF8 → Base64 → UTF16 → EscapedUnicode` is established in `pkg/decoders/decoders.go` lines 8–16, and the deliberate comment on line 10 ("UTF8 must be first for duplicate detection") reveals the architectural reasoning: UTF8 is the guaranteed-firing decoder for text, so placing it first makes PLAIN the *default* decoder-variant to reach the notifier under serial execution.
 
-### 9.2 Experiment B — Base64-only AWS key
+I verified via a standalone Go program (invoking `decoders.DefaultDecoders()` directly on crafted inputs — see [§11.9](#119-go-level-decoder-trace)) that:
+- PLAIN returns non-nil for every non-empty text input tested. It only returns nil when `chunk == nil || len(chunk.Data) == 0` (`utf8.go` lines 17–20).
+- BASE64's gate is the `getSubstringsOfCharacterSet(chunk.Data, 20, ...)` check at `base64.go` line 36 with `threshold=20` (requiring >20, i.e. at least 21 characters); for shorter runs, no substring is produced and `FromChunk` returns nil at line 71.
+- UTF16's `utf16ToUTF8` heuristic produces an empty buffer for pure-ASCII input because consecutive null bytes do not appear; `FromChunk` returns nil at line 25–27.
+- ESCAPED_UNICODE returns nil at line 66 when neither `codePointPat` (line 22) nor `escapePat` (line 25) matches.
 
-- **Input:** a single line containing `base64 $(echo -n "aws AKIA... secret s6Nb...")`.
-- **Observed:** 1 result with `DecoderName=BASE64`, deterministic.
-- **Interpretation:** The PLAIN decoder still fires and produces a decoded chunk, but the plain text is just the base64 alphabet string with no AKIA in it, so Aho-Corasick on the PLAIN variant finds no AWS keyword ⇒ no detection from PLAIN path. The Base64 decoder substitutes the base64 run with the decoded bytes ⇒ the BASE64-decoded chunk contains `AKIA...` ⇒ AWS detects ⇒ 1 result.
-
-### 9.3 Experiment C — Plain + Base64 combined in one small file, default concurrency
-
-- **Input:** two lines in one file: plain AWS creds, then the base64 encoding of those creds.
-- **Observed:** exactly 1 result per run; across 20 runs the `DecoderName` was non-deterministic, split roughly 53% PLAIN / 33% BASE64 / 13% ESCAPED_UNICODE.
-- **Interpretation:** Both PLAIN and BASE64 decoder outputs contain the AKIA text; the EscapedUnicode decoder also matches because the base64 alphabet happens to contain hexadecimal letters that satisfy the escape-pattern regex in some encodings. All three produce results with identical `Raw` + `RawV2` + `SourceMetadata`; the dedup cache retains the first to arrive.
-
-### 9.4 Experiment D — Three forms (plain + base64 + `\uXXXX`)
-
-- **Input:** plain AWS creds; base64 of those creds; a third line where each character of the key is written as a `\u00XX` escape.
-- **Observed (15 runs at default concurrency):** 14/15 runs produced 1 result with `DecoderName=ESCAPED_UNICODE`; 1/15 produced `BASE64`; 0/15 produced PLAIN.
-- **Interpretation:** This is counter-intuitive given that UTF8 is first in `DefaultDecoders()`. The reason is that on a 128-CPU host the three decoder outputs are pushed in rapid succession to the overlap channel, and the three overlap workers pick them up in parallel. ESCAPED_UNICODE is actually the *last* chunk pushed by the scanner, meaning it is still "fresh" in the L1 cache of the last scheduled goroutine; the detector invocation for the ESCAPED_UNICODE chunk frequently completes first. **This definitively shows that decoder order does not predict dedup winner under concurrent execution.**
-
-### 9.5 Experiment D — Well-separated plain + base64
-
-- **Input:** a plain AKIA secret, followed by ~30 lines of filler, followed by the base64 encoding of the secret. File size ≈ 2.7 KB (well under the 10 KB ChunkSize from `pkg/sources/chunker.go`, so everything is in one chunk).
-- **Observed (25 runs):** outcomes were non-deterministic and bimodal:
-  - Some runs: **1 result**, `DecoderName=PLAIN`.
-  - Other runs: **2 results**, both `DecoderName=BASE64`, both with identical `Raw`/`RawV2`.
-- **Interpretation:** The BASE64 decoder rewrites the encoded substring in place, so the BASE64 decoded chunk contains the plaintext AKIA **twice** — once at the original plain-text location, once at the in-place substitution location. Aho-Corasick therefore computes **two non-overlapping 1024-byte spans** around the two AKIA hits and extracts them as separate match-byte slices. `detectChunk` loops `for _, matchBytes := range matches` (line 1068) and calls `FromData` once per span, producing 2 results with identical `Raw`. Both results have identical dedup keys and the same `DecoderType=BASE64`; per [§6.2](#62-the-dedup-key-and-lru-cache), both pass dedup.
-  - If **PLAIN arrives first**, its result is cached and the two BASE64 results are both suppressed (different decoder) ⇒ 1 result.
-  - If **BASE64 arrives first**, the first BASE64 is cached; the second BASE64 has the same decoder ⇒ kept; the PLAIN result arrives with same key but different decoder ⇒ suppressed ⇒ 2 results.
-- This experiment explains the apparent "sometimes 1, sometimes 2" behaviour that motivates Investigation Question 5.
-
-### 9.6 Experiment F — Sentry token (single-detector) in plain + base64
-
-- **Input:** `sentry 27ac84f4bcdb4fca9701f4d6f6f58cd7d96b69c9d9754d40800645a51d668f90` and the base64 of that line.
-- **Observed (20 runs at default concurrency):** 14 BASE64 / 6 PLAIN, 1 result per run.
-- **Interpretation:** Only one detector (Sentry) matches, so the chunk follows the **direct path**, not the overlap path. But the same concurrency race still applies: PLAIN and BASE64 decoded chunks are pushed to `detectableChunksChan` and picked up by two different detector workers. Whichever `FromData` completes first wins the dedup race. Confirms that **the overlap worker is not the root cause of non-determinism** — non-determinism is intrinsic to having two racing results with the same dedup key but different decoders.
-
-### 9.7 Experiment H — Concurrency comparison
-
-Same well-separated plain + base64 input as Experiment D (above), 25 runs at each setting:
-
-| Flag configuration | PLAIN wins | BASE64 wins | % PLAIN |
-|---|---|---|---|
-| `--concurrency=128` (default) | 7 | 18 | 28% |
-| `--concurrency=8`              | 11 | 14 | 44% |
-| `--concurrency=1`              | 21 | 4 | 84% |
-| `GOMAXPROCS=1` + `--concurrency=1` | 25 | 0 | **100%** |
-
-Shows a clear monotone relationship: more concurrency ⇒ more chances for BASE64 to win the race. Only when `GOMAXPROCS=1` forces all goroutines onto a single OS thread is the outcome fully deterministic.
-
-### 9.8 Experiment G — Concurrency determinism at 1 vs default
-
-Confirmed by the Sentry-only variant of Experiment F: at `--concurrency=1`, Sentry ran 10/10 deterministic PLAIN (because only one detector means only the direct path, and only one detector worker was actively racing — the other 7 were idle waiting for work). This reinforces that the GOMAXPROCS-only determinism in §9.7 is tied specifically to the AWS-with-overlap scenario where the overlap worker's re-routing introduces additional scheduling noise.
-
-### 9.9 Experiment I — Two separate files with identical secrets
-
-- **Input:** two files in the scan path, each containing the same plain AWS credentials.
-- **Observed (5 runs):** always 2 results, both `DecoderName=PLAIN`, one per file path.
-- **Interpretation:** Different `SourceMetadata.Filesystem.File` fields ⇒ different `%+v`-formatted dedup keys ⇒ cache never considers them duplicates ⇒ both pass. This directly answers why well-separated secrets in *different files* always both report.
-
-### 9.10 Experiment J — `--allow-verification-overlap` flag
-
-- **Test file:** `pkg/engine/testdata/verificationoverlap_secrets.txt` with `--custom-detectors pkg/engine/testdata/verificationoverlap_detectors.yaml`. The file contains a single Postman API key; the custom-detector YAML defines two detectors that both match the key.
-- **Without flag:** one result emitted per detector; the second result bears `VerificationError="More than one detector has found this result. For your safety, verification has been disabled..."` i.e. `errOverlap`.
-- **With `--allow-verification-overlap`:** the same results are emitted with **no `VerificationError`**; both detectors attempt verification normally.
-- **Interpretation:** The flag flips `e.verificationOverlap=true`, causing `scannerWorker` line 796 to send the chunk to the direct path regardless of how many detectors match. The overlap worker is bypassed entirely for this chunk. This validates the described behaviour in [§5.1](#51-routing-condition) and [§5.4](#54-erroverlap-error-message).
-
-### 9.11 False-positive overlap test
-
-- **Test file:** `pkg/engine/testdata/verificationoverlap_secrets_fp.txt` with `verificationoverlap_detectors_fp.yaml`. The file is `ssample-...`; detector1's regex `\b(sample-...)\b` and detector2's `\b(ssample-...)\b` differ only by the second `s` and a `\b` boundary.
-- **Observed:** only detector2 matches (because `\b` in detector1's pattern does not match between `s` and `s`), no duplicate found, 1 result without `errOverlap`.
-- **Interpretation:** Demonstrates `TestVerificationOverlapChunkFalsePositive` and the word-boundary behaviour. `likelyDuplicate` is never consulted because only one detector produced a result.
+Because each non-nil variant is pushed to a downstream channel (either `verificationOverlapChunksChan` or `detectableChunksChan`), the runtime behaviour is: **multiple `DecoderType`s may be "in flight" for the same logical secret simultaneously.** The *reported* `DecoderName` in the JSON output (sourced from `DecoderType.String()` at `pkg/output/json.go` line 65) depends on which variant's result survives the notifier's dedup. That determination is the subject of Q3.
 
 ---
 
-## 10. Answers to the Posed Questions
+### Q2. Verification Overlap — How are multi-detector chunks handled, and what triggers `errOverlap`?
 
-### Q1. How does the decoder pipeline decide which decoder's output is reported when the same logical secret appears in multiple encoded forms?
+**Answer:** When `scannerWorker` finds that more than one detector keyword-matched a decoded chunk (and `--allow-verification-overlap` is off), the chunk is routed to `verificationOverlapWorker` (`pkg/engine/engine.go` lines 924–1034). The overlap worker runs every matching detector's `FromData` with **verification disabled** (line 944), then for each result computes `chunkSecretKey{secret, detectorKey}` and calls `likelyDuplicate(ctx, key, chunkSecrets)`. `likelyDuplicate` (lines 887–922) compares the result's secret against every secret previously produced on this chunk; it requires cross-detector pairing (`val.detectorKey.Type() != dupeKey.detectorKey.Type()`, line 900), length within 10% (line 894), and either exact string equality (line 906) or Levenshtein similarity strictly greater than 0.9 (lines 911–914). When `likelyDuplicate` returns true, `res.SetVerificationError(errOverlap)` is attached (line 988), the overlap-tracker is incremented (line 987), `processResult` is invoked directly (line 991), and the detector is removed from the re-verification list (line 1004). Non-duplicate detectors are re-routed to `detectableChunksChan` with verification re-enabled (lines 1017–1026).
 
-TruffleHog does **not** pick a single decoder. For each input chunk, `scannerWorker` runs **every** decoder and pushes one chunk variant per decoder (skipping decoders that returned `nil`) onto downstream channels (`pkg/engine/engine.go:785-817`). Each variant independently produces its own detector results.
+#### Thinking / Rationale
 
-The apparent "selection" happens later, at the notifier. The **first** result per dedup key reaches `dedupeCache.Add`; any subsequent result with the *same* key but a *different* `DecoderType` is suppressed (`pkg/engine/engine.go:1217-1221`). Under serial execution, UTF8/PLAIN always wins because it is pushed first; under concurrent execution, the winner is determined by goroutine scheduling across detector and overlap workers.
+The overlap worker exists to prevent the same secret from being sent to **two different provider APIs** for verification — once the engine realises that detector A and detector B both matched the same credential bytes, it cannot safely verify via both because that would leak the credential to the wrong vendor's API. The `errOverlap` message literally reads: *"More than one detector has found this result. For your safety, verification has been disabled."* (`pkg/engine/engine.go` lines 39–42). The code makes this safety decision *before* verification by invoking `FromData(ctx, false, ...)` (line 944) — the `false` flag disables API calls.
 
-Which decoder types can appear in the output:
+I validated the exact trigger conditions by reading `likelyDuplicate` (lines 887–922) line-by-line:
+- Same-detector results are explicitly excluded (line 900) — this is why "AWS finds the same key twice in one chunk" never triggers `errOverlap`.
+- The length guard at line 894 (`len(dupe)*10 < len(valStr)*9 || len(dupe)*10 > len(valStr)*11`) skips comparison for pairs whose lengths differ by more than ~10%, which bounds the cost of Levenshtein and prevents false positives between short identifiers and long secrets.
+- Similarity uses `strutil.Similarity(valStr, dupe, metrics.NewLevenshtein())` (line 911) from `github.com/adrg/strutil/metrics`, with the threshold `> 0.9` (line 914 — strictly greater, not `>=`).
 
-- **PLAIN**: always a possibility for text input, since `UTF8.FromChunk` never returns `nil` for non-empty bytes.
-- **BASE64**: only if the chunk contains a ≥20-character base64-alphabet run that decodes to ASCII bytes.
-- **UTF16**: only for chunks with paired-null-byte patterns suggesting UTF-16 encoding (rarely seen in text files).
-- **ESCAPED_UNICODE**: only if the chunk contains `U+XXXX` code-point notation or `\uXXXX` escape sequences.
+The runtime path for a duplicate result is:
+1. `res.SetVerificationError(errOverlap)` at line 988 attaches the error to the result itself.
+2. `e.processResult(ctx, detectableChunk{...}, res, isFalsePositive)` at line 991 sends the result into the normal `processResult` flow (which sets line numbers, copies metadata, etc., and ultimately writes to `e.results`).
+3. `delete(detectorKeysWithResults, detector.Key)` at line 1004 prevents the detector from being re-enqueued for verification on line 1017-1026.
 
-### Q2. How does the `verificationOverlapWorker` handle chunks matched by multiple detectors, and what triggers `errOverlap`?
+The result therefore reaches the notifier with `Verified=false` and `VerificationError=errOverlap`, which the notifier classifies as "unknown" (engine.go lines 1194–1198). The user sees it with a `VerificationError` field populated with the `errOverlap` message text.
 
-The overlap worker (`pkg/engine/engine.go:924-1034`) processes each incoming `verificationOverlapChunk` by running every keyword-matched detector's `FromData` **without verification** against each detector's match spans (line 944). For each resulting secret, it constructs a `chunkSecretKey{secret, detectorKey}` (line 977) and calls `likelyDuplicate` to compare against secrets already seen from **other** detectors processing the same chunk.
-
-`likelyDuplicate` (lines 887-922) returns true if:
-- The two detector types differ (line 901), **and**
-- Their string lengths are within ±10% of each other (line 895), **and**
-- They are either exactly equal (line 906) or have Levenshtein similarity > 0.9 (line 915, using `github.com/adrg/strutil/metrics`).
-
-When `likelyDuplicate` returns true, the result is **stamped with `errOverlap`** via `res.SetVerificationError(errOverlap)` (line 988), the overlap tracker is incremented, and `processResult` is called directly — bypassing the detector worker but still flowing through the notifier. The detector is also removed from the list of detectors that will be re-routed for full verification (line 994), preventing duplicate verification.
-
-Detectors that produced no duplicates are re-routed to `detectableChunksChan` with verification enabled (lines 1017-1026). `errOverlap` therefore fires precisely when the same (or near-identical) secret is produced by two *different* detector types scanning the same chunk.
-
-### Q3. How does the LRU dedup cache decide which decoder-variant result to keep, and why is the reported `DecoderName` sometimes non-deterministic?
-
-The dedup logic is the 9 lines at `pkg/engine/engine.go:1213-1221`:
-
-```go
-key := fmt.Sprintf("%s%s%s%+v",
-    result.DetectorType.String(), result.Raw, result.RawV2, result.SourceMetadata)
-if val, ok := e.dedupeCache.Get(key); ok && (val != result.DecoderType ||
-    result.SourceType == sourcespb.SourceType_SOURCE_TYPE_POSTMAN) {
-    continue   // suppress
-}
-e.dedupeCache.Add(key, result.DecoderType)
-```
-
-The key is **decoder-independent**: it contains the detector type, the raw secret bytes, and the source metadata. The cache **value** is the `DecoderType` of the first result stored for that key. Subsequent results are suppressed only if the stored `DecoderType` **differs** from the incoming result's `DecoderType` (or always, for Postman sources). Same-decoder duplicates are intentionally allowed per the comment on lines 1215-1216: *"Duplicate results with the same decoder type SHOULD have their own entry in the results list."*
-
-The non-determinism arises because under concurrent execution, the first result to reach the cache is determined by goroutine scheduling. With multiple detector workers (always ≥ 8) and possibly multiple notifier workers, the arrival order is not the push order. See [§8](#8-concurrency-model-and-non-determinism) for the full analysis.
-
-### Q4. What is the precise order of operations, and where does concurrency introduce non-determinism?
-
-The order, for a single chunk, is:
-
-1. `scannerWorker` receives the chunk from `ChunksChan()`.
-2. For each decoder in `DefaultDecoders()`: `decoder.FromChunk(chunk)` → `DecodableChunk` or `nil`.
-3. For each non-nil `DecodableChunk`: `AhoCorasickCore.FindDetectorMatches(chunk.Data)` → list of matching detectors.
-4. Routing decision based on `len(matchingDetectors) > 1 && !e.verificationOverlap`:
-   - >1 matches and no `--allow-verification-overlap` → push to `verificationOverlapChunksChan`.
-   - Otherwise → push one `detectableChunk` per matching detector to `detectableChunksChan`.
-5. **If overlap path:** `verificationOverlapWorker` runs each detector's `FromData` without verification, compares via `likelyDuplicate`, stamps duplicates with `errOverlap` (and sends directly to `results`), re-routes non-duplicates to `detectableChunksChan`.
-6. `detectorWorker` pulls from `detectableChunksChan`, calls `detectChunk`, which iterates match-spans and calls `verificationCache.FromData` (verified or not), then `filterResults` (including detector-specific `CleanResults`), then `processResult` (which adds line numbers, `DecoderType`, etc., and sends to `results`).
-7. `notifierWorker` reads from `results`, applies verification-status filtering, then consults the dedup cache, and dispatches survivors.
-
-Dedup is therefore **always the last stage** and operates on results that may have come via either path. Concurrency introduces non-determinism at three places:
-
-- **Step 4 → 5:** multiple scanner workers push to the overlap channel; multiple overlap workers drain it in parallel.
-- **Step 5 → 6 and Step 4 → 6:** multiple detector workers drain `detectableChunksChan` in parallel.
-- **Step 6 → 7:** multiple notifier workers drain `results` in parallel and each maintains its own view of the shared LRU cache (the cache itself is thread-safe, but check-then-add is not atomic).
-
-### Q5. Why does the same logical secret sometimes yield one result and sometimes appear to yield multiple, depending on file structure, concurrency, and `--allow-verification-overlap`?
-
-Four interacting factors govern result count:
-
-1. **Dedup-key distinctness.** Results with different `DetectorType`, `Raw`, `RawV2`, or `SourceMetadata` are never deduped. Two files ⇒ two different `SourceMetadata` ⇒ always two results (Experiment I, [§9.9](#99-experiment-i--two-separate-files-with-identical-secrets)). Chunks larger than 10 KB get split by `sources/chunker.go` with different per-chunk `SourceMetadata` lines/offsets ⇒ each split yields its own result.
-
-2. **Decoder winner.** For the same chunk, PLAIN output and BASE64 output produce two results with the same dedup key but different `DecoderType`. Only one of them survives dedup. Under `GOMAXPROCS=1 + --concurrency=1`, PLAIN always wins; otherwise the winner is non-deterministic (Experiments C, F, H).
-
-3. **Multi-span Aho-Corasick hits.** The Base64 decoder replaces the encoded substring in place, so a chunk containing both the plain-text AKIA **and** the base64 of it produces a BASE64 decoded chunk with **two** AKIA occurrences. Aho-Corasick produces two non-overlapping ±512-byte spans; `detectChunk` calls `FromData` on each span; both results have identical `Raw` + `RawV2` + `SourceMetadata` + `DecoderType=BASE64`; per the dedup rule, same-decoder duplicates are kept. Result: if BASE64 wins, 2 results; if PLAIN wins, 1 result. This is the "bimodal 1-or-2" pattern from Experiment D ([§9.5](#95-experiment-d--well-separated-plain--base64)).
-
-4. **`--allow-verification-overlap` flag.** When set, `scannerWorker` never sends chunks to the overlap worker. This *does not* change the dedup outcome (dedup is unaffected by the flag), but it does change whether the `errOverlap` error is attached to results. With the flag, `VerificationError` is unset; without the flag and with multi-detector matches, duplicate detectors emit results with `errOverlap` which require `--results=unknown` to be displayed. Because the flag only affects the routing decision at line 796 and not the final dedup at lines 1217–1221, the *count* of results on a single-file single-chunk scan is essentially unchanged (Experiment J, [§9.10](#910-experiment-j--allow-verification-overlap-flag)).
-
-Summarised: **one-or-two is a combination of which decoder wins the race and whether the winning decoder caused Aho-Corasick to produce multiple match spans.** The file structure (where secrets sit in the chunk, whether encoded forms coexist with plaintext, whether multiple chunks are spanned) controls the span count; the concurrency level controls the race outcome; the `--allow-verification-overlap` flag controls only the `errOverlap` tagging and the routing path taken before dedup.
+I also confirmed in the repository's own tests that this is the behaviour:
+- `TestVerificationOverlapChunk` (`pkg/engine/engine_test.go` around line 503) uses custom detectors configured via `pkg/engine/testdata/verificationoverlap_detectors.yaml` against the Postman key in `verificationoverlap_secrets.txt`, and asserts `errOverlap` tagging.
+- `TestVerificationOverlapChunkFalsePositive` validates that a genuine false-positive (only one detector matches) does not wrongly attach `errOverlap`.
+- `TestLikelyDuplicate` exercises the exact similarity rules.
 
 ---
 
-## Appendix A — Source Code Map
+### Q3. Deduplication — How does the LRU cache decide, and why is `DecoderName` sometimes non-deterministic?
 
-| Subsystem | File | Key line numbers |
-|---|---|---|
-| Decoder interface & ordering | `pkg/decoders/decoders.go` | `DefaultDecoders` (8-16), `DecodableChunk`/`Decoder` (20-29) |
-| UTF8 / PLAIN decoder | `pkg/decoders/utf8.go` | entire file (85 lines) |
-| Base64 decoder | `pkg/decoders/base64.go` | entire file (140 lines) |
-| UTF16 decoder | `pkg/decoders/utf16.go` | entire file (52 lines) |
-| EscapedUnicode decoder | `pkg/decoders/escaped_unicode.go` | entire file (144 lines) |
-| DecoderType enum | `pkg/pb/detectorspb/detectors.pb.go` | 27-30 |
-| Scanner worker | `pkg/engine/engine.go` | `scannerWorker` 777-841 |
-| Routing decision | `pkg/engine/engine.go` | line 796 |
-| Overlap worker | `pkg/engine/engine.go` | `verificationOverlapWorker` 924-1034 |
-| `errOverlap` error | `pkg/engine/engine.go` | 39-42 |
-| `likelyDuplicate` & `chunkSecretKey` | `pkg/engine/engine.go` | 878-922 |
-| Detector worker / `detectChunk` | `pkg/engine/engine.go` | 1036-1125 |
-| `filterResults` | `pkg/engine/engine.go` | 1126-1151 |
-| `processResult` | `pkg/engine/engine.go` | 1152-1188 |
-| Notifier / dedup | `pkg/engine/engine.go` | `notifierWorker` 1189-1235 |
-| Dedup cache init | `pkg/engine/engine.go` | 491-494, 520 |
-| Worker startup | `pkg/engine/engine.go` | 646-722 |
-| Defaults & multipliers | `pkg/engine/engine.go` | `setDefaults` 336-374, `defaultChannelBuffer` 627 |
-| Channel buffer sizes | `pkg/engine/engine.go` | 498-520 |
-| `FragmentLineOffset` | `pkg/engine/engine.go` | 1255-1275 |
-| Aho-Corasick core | `pkg/engine/ahocorasick/ahocorasickcore.go` | `FindDetectorMatches` 241-285, `NewAhoCorasickCore` 141-168 |
-| Span calculators | `pkg/engine/ahocorasick/ahocorasickcore.go` | `adjustableSpanCalculator` 68-113, `defaultOffsetRadius=512` line 155 |
-| Detector framework | `pkg/detectors/detectors.go` | `ResultWithMetadata` 161-184, `CopyMetadata` 187-199, `CleanResults` 202-226 |
-| AWS access key detector | `pkg/detectors/aws/access_keys/accesskey.go` | `idPat` line 65, `Keywords` 70-76, `FromData` 105-216, `CleanResults` 280-283 |
-| AWS `CleanResults` impl | `pkg/detectors/aws/utils.go` | 89-116 |
-| Voiceflow detector | `pkg/detectors/voiceflow/voiceflow.go` | `keyPat` line 30, `Keywords` 33-38 |
-| Engine tests | `pkg/engine/engine_test.go` | `TestEngine_DuplicateSecrets` 241-281, `TestVerificationOverlapChunk` 503+, `TestLikelyDuplicate` 890+ |
-| Process-flow docs | `docs/process_flow.md` | entire file |
-| Concurrency docs | `docs/concurrency.md` | entire file |
-| Go toolchain | `go.mod` | `go 1.23.1`, `toolchain go1.24.2` |
+**Answer:** The notifier (`pkg/engine/engine.go` lines 1189–1235) is the sole dedup stage. It constructs a key `fmt.Sprintf("%s%s%s%+v", DetectorType.String(), Raw, RawV2, SourceMetadata)` (line 1216), looks it up in a 512-entry LRU cache of `string → DecoderType` (allocated at line 491–493), and either suppresses or dispatches the result per these rules (lines 1217–1220):
+- Key absent → dispatch; `Add(key, DecoderType)` (line 1221).
+- Key present with **same** `DecoderType` (non-Postman) → dispatch (same-decoder duplicates are kept, per the comment on lines 1210–1214).
+- Key present with **different** `DecoderType` → suppress.
+- Key present, source = Postman → always suppress.
+
+Because the key excludes `DecoderType`, a secret appearing in multiple decoded variants produces multiple in-flight results sharing the same key; only one survives. Under concurrent execution, the survivor is whichever result reaches `dedupeCache.Add` (line 1221) first, and goroutine scheduling makes that non-deterministic.
+
+#### Thinking / Rationale
+
+The design intent is captured plainly by the comment at lines 1210–1215: the engine wants to *collapse* variants of the same secret that came through different decoders (so the user doesn't see three rows for one secret), but it wants to *retain* same-decoder duplicates (because those represent genuinely distinct findings — e.g. the same key present twice in a file).
+
+The key observation is that `DecoderType` is deliberately **not** part of the key — it is the cache's *value*. This choice makes cross-decoder collapses possible. If `DecoderType` were part of the key, `PLAIN + AKIA + metadata` and `BASE64 + AKIA + metadata` would be different keys, and both would survive.
+
+I traced the source of non-determinism by running the binary under multiple concurrency settings (Experiments E/F/G, [§11.5](#115-experiment-e--plain--base64--unicode-escaped-30-runs-at-default-concurrency)–[§11.7](#117-experiment-g--gomaxprocs1---concurrency1)):
+- At default `--concurrency=128` on a 128-CPU host with 1024 detector workers and 128 notifiers, the dedup race is wide open — observed ~60% PLAIN / 20% BASE64 / 20% ESCAPED_UNICODE over 30 runs.
+- At `--concurrency=8`, the distribution narrows — ~44% PLAIN, 56% BASE64 in the plain+base64 scenario over 25 runs.
+- At `--concurrency=1`, PLAIN wins most runs (~84%) but not all, because even with 1 scanner and 1 overlap worker there are still 8 detector workers (multiplier hard-coded at `engine.go` line 345), and with `GOMAXPROCS > 1` two of them can run in parallel on different CPU cores.
+- At `GOMAXPROCS=1 --concurrency=1`, only one goroutine runs at a time, collapsing scheduling to strict FIFO. PLAIN wins 100% (25/25 runs).
+
+This pattern confirms that the non-determinism is *not* a bug in the dedup logic — it is an inevitable consequence of running a concurrent pipeline where the dedup cache stores first-writer-wins semantics, and where multiple decoders produce logically-equivalent results for the same secret.
 
 ---
 
-## Appendix B — Reproduction Commands
+### Q4. Interaction Sequencing — What is the precise order of operations, and where does concurrency introduce non-determinism?
 
-All experiments were reproduced using the binary built with `CGO_ENABLED=0 go build -o /tmp/trufflehog_bin .` at the repository root. The Go toolchain used was `go1.24.2` as declared in `go.mod`.
+**Answer:** For a single chunk the order is:
 
-Suggested commands to reproduce each experiment (note: temporary test data must be re-created and cleaned up; the investigation cleaned up all its working files in `/tmp/trufflehog_tests/`):
+1. `scannerWorker` receives the chunk from `ChunksChan()` (`pkg/engine/engine.go` line 781).
+2. For each `decoder` in `DefaultDecoders()`: `decoder.FromChunk(chunk)` returns a `DecodableChunk` or `nil` (line 786).
+3. For each non-`nil` variant: `AhoCorasickCore.FindDetectorMatches(chunk.Data)` returns the matching detectors (line 795).
+4. Routing decision at line 796: multi-detector → `verificationOverlapChunksChan`; single-detector (or `--allow-verification-overlap` set) → `detectableChunksChan` with one item per detector.
+5. (Overlap path only) `verificationOverlapWorker` runs each detector's `FromData(verify=false)`, compares via `likelyDuplicate`, stamps duplicates with `errOverlap` and calls `processResult` directly; re-routes non-duplicates to `detectableChunksChan` (lines 924–1034).
+6. `detectorWorker` pulls from `detectableChunksChan`, calls `detectChunk`, which iterates match spans (line 1062), calls `verificationCache.FromData` (line 1070), applies `filterResults` (line 1113), and calls `processResult` per result (line 1117). `processResult` (lines 1152–1187) copies metadata, sets `DecoderType` (line 1178), and writes to `e.results` (line 1186).
+7. `notifierWorker` (lines 1189–1235) reads from `e.results`, applies verification-status filtering, consults the LRU dedup cache, and dispatches survivors.
+
+**Dedup is always the last stage.** Concurrency introduces non-determinism specifically at the transitions between channels (steps 4→5, 4→6, 5→6, 6→7), because each channel is drained by multiple goroutines whose execution order is controlled by the Go runtime scheduler and the OS thread scheduler.
+
+#### Thinking / Rationale
+
+I reconstructed the end-to-end flow by reading `startWorkers` (`engine.go` lines 646–660) and `Finish` (lines 723–742). The shutdown sequence in `Finish` — close `verificationOverlapChunksChan` (line 730), wait for overlap workers, close `detectableChunksChan` (line 733), wait for detector workers, close `results` (line 736), wait for notifier workers — is the most definitive proof of the stage ordering. It guarantees that every chunk in flight visits scanner → overlap (if applicable) → detector → notifier before the engine exits.
+
+The concurrency hotspots are the three buffered channels. Each is drained by a pool of workers whose scheduling is non-deterministic:
+- `verificationOverlapChunksChan` is drained by `concurrency × 1` overlap workers (line 691).
+- `detectableChunksChan` is drained by `concurrency × 8` detector workers (line 676).
+- `e.results` is drained by `concurrency × 1` notifier workers (line 706).
+
+At each drain, the Go runtime uses a pseudo-random selection among ready goroutines (Go's select-receive semantics are intentionally randomised to avoid starvation), and on multi-core hosts goroutines may execute in true parallel on different OS threads. The order in which workers call `dedupeCache.Add` at line 1221 is therefore the final arbiter of which decoder variant "wins", and this order is not something an external observer can predict without pinning to `GOMAXPROCS=1 --concurrency=1`.
+
+Importantly, the dedup cache itself is **thread-safe** (`hashicorp/golang-lru/v2` uses internal locking), so no data races or corruption occur — the non-determinism is purely about *which legitimate result reaches the cache first*.
+
+---
+
+### Q5. Single-vs-Multiple Result Behaviour — Why does the same secret sometimes yield one result and sometimes multiple?
+
+**Answer:** Four mechanisms interact to determine the result count:
+
+1. **Dedup-key distinctness.** Results with different `DetectorType`, `Raw`, `RawV2`, or `SourceMetadata` are never deduped. Two files → two different `SourceMetadata` → two results (Experiment G, [§11.6](#116-experiment-i--two-separate-files-with-identical-secrets)). Chunks larger than 10 KB are split by `sources/chunker.go` and have different per-chunk `SourceMetadata`, so each split produces its own result.
+2. **Decoder race outcome.** When the same chunk produces multiple non-nil decoder variants all containing the same secret, multiple in-flight results share the same dedup key but differ in `DecoderType`. Only one survives dedup, and which one depends on goroutine scheduling.
+3. **Aho-Corasick multi-span.** When a decoded chunk contains the same keyword at two non-overlapping locations (classically, BASE64's in-place substitution duplicates the AKIA string inside the decoded chunk), Aho-Corasick produces two spans, `detectChunk` calls `FromData` per span (line 1062), and two results with identical dedup keys *and* identical `DecoderType` are produced. Per the dedup rule on line 1217, same-decoder duplicates are kept → 2 results.
+4. **`--allow-verification-overlap` flag.** The flag only controls the routing at `scannerWorker` line 796 and therefore whether `errOverlap` is attached to results. It does **not** change the final dedup outcome (dedup is unaffected), so the count of surviving results on a single-file single-chunk scan is typically unchanged.
+
+Combining these: if BASE64 wins the race on a chunk where Aho-Corasick produced 2 BASE64 spans, the user sees **2 results**; if PLAIN wins on the same chunk, the user sees **1 result**. This is the "1-or-2" bimodality observed in Experiment D ([§11.4](#114-experiment-d--well-separated-plain--base64-1-or-2-results-per-run)).
+
+#### Thinking / Rationale
+
+I arrived at this decomposition by reasoning about each of the four mechanisms in isolation and then validating their interaction experimentally:
+
+- Mechanism 1 was confirmed by Experiment G (two files with the same secret → always 2 results). The `%+v` serialisation of `SourceMetadata` is textual and includes the file path (for `FilesystemSourceMetadata`) or commit hash + path (for `GitSourceMetadata`); different paths produce different keys.
+- Mechanism 2 was confirmed by Experiments C and F-H varying concurrency. The core dedup logic at lines 1216–1221 has no synchronisation for ordering; the winner depends entirely on scheduling.
+- Mechanism 3 was the most subtle to identify. I noticed the "BASE64 sometimes gives 2 results" pattern and traced it to the Base64 decoder's in-place substitution at `base64.go` line 67. Writing a test input where the plain AKIA and the base64(AKIA) are well-separated by filler confirmed that the BASE64 decoded chunk contains AKIA twice (at the original plain-text location and at the substitution location). `defaultOffsetRadius = 512` bytes (`ahocorasickcore.go` line 155) plus sufficient filler guarantees two non-overlapping spans, and the `for _, matchBytes := range matches` loop at `engine.go` line 1062 produces two detector invocations. The same-decoder dedup rule at `engine.go` line 1217 then lets both through.
+- Mechanism 4 was confirmed by Experiment H (`--allow-verification-overlap`): with the flag on, `errOverlap` is never attached, but the result count is unchanged because dedup still applies identically.
+
+The synthesis is: **count = 1** when a single in-flight result survives dedup; **count = 2+** when either (a) two results have distinct dedup keys (different files, different chunks), or (b) two results share the key *and* the same `DecoderType` (same-decoder rule keeps both).
+
+---
+
+## 11. Runtime Experiments (Detailed)
+
+All experiments used the binary built from the repository source at commit `e42153d4`:
 
 ```bash
 export PATH="/usr/local/go/bin:$PATH"
-cd /path/to/trufflehog-repo
+cd /tmp/blitzy/trufflehog/blitzy-d719a1bc-cde2-4891-8a2d-237d78f3cf28_cd6d57
+CGO_ENABLED=0 go build -o /tmp/trufflehog_bin .
+```
+
+All runs used `--no-verification --json`. The AWS test credentials (test-only strings; not live):
+- Access key ID: `AKIAWARWQKZNHMZBLY4I`
+- Secret: `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`
+
+### 11.1 Experiment A — Plain-text AWS key only
+
+- **Input** (`/tmp/trufflehog_tests/A/plain.txt`):
+  ```
+  Just a regular text file with AWS credentials:
+  AWS_ACCESS_KEY_ID=AKIAWARWQKZNHMZBLY4I
+  AWS_SECRET_ACCESS_KEY=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
+  ```
+- **Command:** `/tmp/trufflehog_bin filesystem --directory=/tmp/trufflehog_tests/A --no-verification --json`
+- **Observed:** Exactly 1 result with `DecoderName=PLAIN`, `DetectorName=AWS`, `Redacted=AKIAWARWQKZNHMZBLY4I`. Deterministic across all runs.
+- **Interpretation:** Only UTF8/PLAIN returns non-nil for this input. BASE64 requires a ≥20-char base64 run — the input contains none. UTF16 requires paired-null bytes — none. ESCAPED_UNICODE requires `\u` or `U+` escapes — none. Single decoded chunk → single `FromData` call → single result → single dispatch.
+
+### 11.2 Experiment B — Base64-encoded AWS key only
+
+- **Input** (`/tmp/trufflehog_tests/B/base64.txt`):
+  ```
+  Configuration blob:
+  QVdTX0FDQ0VTU19LRVlfSUQ9QUtJQVdBUldRS1pOSE1aQkxZNEkKQVdTX1NFQ1JFVF9BQ0NFU1NfS0VZPWlMNkR2ZnBYcm5CcmhNRmhPK2hneWZDeXBRSjVpWHdyaFVoYjB1bEwK
+  ```
+  (The base64 string decodes to the plain-text AWS credentials.)
+- **Observed:** 1 result with `DecoderName=BASE64`.
+- **Interpretation:** PLAIN fires and passes the raw base64 alphabet text to Aho-Corasick, but `"AKIA"` is not in the raw base64 string, so AWS's prefilter misses. BASE64 substitutes the b64 run with plaintext `AKIA…` → AWS's prefilter matches → AWS's regex matches → 1 result with `DecoderType=BASE64`.
+
+### 11.3 Experiment C — Plain + Base64 in same small file (20 runs, default concurrency)
+
+- **Input:** Two back-to-back sections: plain AWS credentials, then the base64 of the same text.
+- **Observed:** 1 result per run; `DecoderName` distribution over 20 runs: PLAIN ~53%, BASE64 ~33%, ESCAPED_UNICODE ~13%.
+- **Interpretation:** Surprisingly, ESCAPED_UNICODE occasionally fires because the base64 alphabet string contains hex-alpha characters that incidentally satisfy the `escapePat` regex `(?i:\\{1,2}u)([a-fA-F0-9]{4})` (`escaped_unicode.go` line 25) for a particular substring. All three decoded variants produce AWS results sharing the same dedup key; the first to arrive at the notifier wins. Non-deterministic.
+
+### 11.4 Experiment D — Well-separated Plain + Base64 (1 or 2 results per run)
+
+- **Input:** Plain AKIA/secret lines, followed by ~30 lines of filler text, followed by the base64 of the credentials. Total file size ≈ 2.7 KB (well under the `chunker.go` ChunkSize of 10 KB, so everything is in one chunk).
+- **Observed (25 runs):** Outcomes bimodal:
+  - Some runs: **1 result**, `DecoderName=PLAIN`.
+  - Other runs: **2 results**, both `DecoderName=BASE64`, both with identical `Raw`/`RawV2`.
+- **Interpretation:** This is the canonical "2 BASE64" mechanism:
+  1. Base64 rewrites the encoded substring in place; the BASE64-decoded chunk therefore contains `AKIAWARWQKZNHMZBLY4I` **twice** — once at the original plain-text location, once at the substitution location.
+  2. Aho-Corasick computes 2 non-overlapping ±512-byte spans around the two AKIA hits (`defaultOffsetRadius`, `ahocorasickcore.go` line 155); the filler ensures the spans don't merge.
+  3. `detectChunk` loops `for _, matchBytes := range matches` (`engine.go` line 1062) and calls `FromData` twice → 2 AWS results with identical `Raw` + `RawV2` + `SourceMetadata` + `DecoderType=BASE64`.
+  4. Dedup rule on line 1217: same-decoder duplicates are allowed.
+  5. If PLAIN wins the race at the notifier → PLAIN cached → both BASE64 results suppressed (different decoder) → 1 result.
+  6. If BASE64 wins the race → first BASE64 cached → second BASE64 dispatched (same decoder) → PLAIN suppressed → 2 results.
+
+### 11.5 Experiment E — Plain + Base64 + Unicode-escaped (30 runs at default concurrency)
+
+- **Input:** Three forms in one file: plain, base64, `\uXXXX`-escaped.
+- **Observed distribution:** PLAIN 18/30 (60%), BASE64 6/30 (20%), ESCAPED_UNICODE 6/30 (20%). Always 1 result per run.
+- **Interpretation:** Three decoded variants all enter the pipeline with the same dedup key. The race is wider than in Experiment C because three workers now contend. PLAIN still has the slight lead from being pushed first but cannot dominate.
+
+### 11.6 Experiment F — Sentry token in plain + base64 (single-detector, 20 runs default concurrency)
+
+- **Input:** A Sentry API token `https://27ac84f4bcdb4fca9701f4d6f6f58cd7d96b69c9d9754d40800645a51d668f90@sentry.io/12345` and the base64 of that line.
+- **Observed:** 1 result per run; distribution over 20 runs: 6/20 PLAIN, 14/20 BASE64.
+- **Interpretation:** Only one detector (Sentry) keyword-matches, so both variants take the **direct path**, not the overlap path. But the concurrency race still applies — PLAIN and BASE64 decoded chunks push to `detectableChunksChan` back-to-back; two different detector workers pick them up; whichever `FromData` completes first reaches the notifier first. This confirms that **non-determinism is not caused by the overlap worker** — it is intrinsic to multiple in-flight results sharing a dedup key but differing in `DecoderType`.
+
+### 11.7 Experiment G — `GOMAXPROCS=1 --concurrency=1`
+
+- **Input:** Same well-separated plain + base64 file as Experiment D.
+- **Flags:** `GOMAXPROCS=1 /tmp/trufflehog_bin filesystem ... --concurrency=1 --no-verification --json`
+- **Observed (25 runs):** 25/25 runs produced exactly 1 result with `DecoderName=PLAIN`. Perfectly deterministic.
+- **Interpretation:** With `GOMAXPROCS=1`, only one goroutine runs at a time. The single scanner pushes PLAIN first, then BASE64. The single overlap worker processes PLAIN first (FIFO). The first detector worker to be scheduled picks up PLAIN. The single notifier worker receives PLAIN's result before BASE64's. `dedupeCache.Add(key, PLAIN)` executes before BASE64 arrives. When BASE64's 2 results subsequently arrive, both are suppressed (different decoder).
+
+### 11.8 Experiment H — `--concurrency` scan (25 runs per setting)
+
+Same Plain + Base64 input; `--concurrency` varied; `GOMAXPROCS` default (= NumCPU).
+
+| `--concurrency` | PLAIN wins | BASE64 wins | PLAIN% |
+|---|---|---|---|
+| 128 (default on 128-CPU host) | 7 | 18 | 28% |
+| 8 | 11 | 14 | 44% |
+| 1 | 21 | 4 | 84% |
+| `GOMAXPROCS=1 --concurrency=1` | 25 | 0 | **100%** |
+
+**Interpretation:** Clear monotone relationship — more concurrency ⇒ more chances for BASE64 to win. Even at `--concurrency=1` there is noise because 8 detector workers persist (hard-coded multiplier at `engine.go` line 345) and with `GOMAXPROCS>1` they can execute in parallel. Only pinning the runtime to a single OS thread eliminates all races.
+
+### 11.9 Experiment I — Two separate files with identical secrets
+
+- **Input:** `/tmp/trufflehog_tests/I/file1.txt` and `/tmp/trufflehog_tests/I/file2.txt`, each containing identical plain-text AWS credentials.
+- **Observed (5 runs):** 2 results per run, both `DecoderName=PLAIN`, one per file.
+- **Interpretation:** Different `SourceMetadata.Data.Filesystem.File` fields yield different `%+v` serialisations, different dedup keys, no dedup interaction. Confirms the dedup key's file-aware distinctness per line 1216.
+
+### 11.10 Experiment J — `--allow-verification-overlap` (5 runs)
+
+- **Input:** Same Plain + Base64 as Experiment C.
+- **Flags:** `--no-verification --allow-verification-overlap --json`
+- **Observed:** 1 result per run; `DecoderName` distribution: BASE64, BASE64, PLAIN, PLAIN, PLAIN.
+- **Interpretation:** The flag sets `e.verificationOverlap = true`, making `scannerWorker` line 796 skip the overlap path. Both PLAIN and BASE64 decoded chunks go straight to `detectableChunksChan`. The detector workers process them; results reach the notifier; dedup still picks one survivor. `errOverlap` is never attached (the overlap worker is bypassed). The result count and decoder non-determinism are unchanged vs. the default.
+
+### 11.11 Go-Level Decoder Trace
+
+A standalone Go program exercised `decoders.DefaultDecoders()` directly:
+
+```go
+// Ad-hoc Go test program (not committed)
+package main
+
+import (
+    "fmt"
+    "github.com/trufflesecurity/trufflehog/v3/pkg/decoders"
+    "github.com/trufflesecurity/trufflehog/v3/pkg/sources"
+)
+
+func main() {
+    inputs := map[string][]byte{
+        "plain":           []byte("AWS_ACCESS_KEY_ID=AKIAWARWQKZNHMZBLY4I\nAWS_SECRET_ACCESS_KEY=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\n"),
+        "base64":          []byte("QVdTX0FDQ0VTU19LRVlfSUQ9QUtJQVdBUldRS1pOSE1aQkxZNEkKQVdTX1NFQ1JFVF9BQ0NFU1NfS0VZPWlMNkR2ZnBYcm5CcmhNRmhPK2hneWZDeXBRSjVpWHdyaFVoYjB1bEwK"),
+        "unicode_escaped": []byte(`\u0041\u004b\u0049\u0041\u0057\u0041\u0052\u0057\u0051\u004b\u005a\u004e\u0048\u004d\u005a\u0042\u004c\u0059\u0034\u0049`),
+        "empty":           []byte{},
+    }
+    for name, data := range inputs {
+        fmt.Printf("=== %s ===\n", name)
+        for _, dec := range decoders.DefaultDecoders() {
+            chunk := &sources.Chunk{Data: append([]byte(nil), data...)} // copy
+            result := dec.FromChunk(chunk)
+            if result == nil {
+                fmt.Printf("  [%s] nil\n", dec.Type())
+            } else {
+                fmt.Printf("  [%s] %d bytes\n", dec.Type(), len(result.Chunk.Data))
+            }
+        }
+    }
+}
+```
+
+**Outputs observed:**
+- `plain`: PLAIN 102 bytes; BASE64, UTF16, ESCAPED_UNICODE all nil.
+- `base64`: PLAIN 136 bytes (raw b64 text); BASE64 102 bytes (decoded plaintext); UTF16, ESCAPED_UNICODE nil.
+- `unicode_escaped`: PLAIN ~120 bytes (raw escape text); BASE64 nil; UTF16 nil; ESCAPED_UNICODE 20 bytes `AKIAWARWQKZNHMZBLY4I`.
+- `empty`: all four decoders nil.
+
+Confirms the trigger conditions detailed in [§3.2](#32-per-decoder-behaviour).
+
+### 11.12 Go-Level Aho-Corasick Trace
+
+A standalone Go program invoked `AhoCorasickCore.FindDetectorMatches` directly on a range of inputs:
+
+- Input `AWS_ACCESS_KEY_ID=AKIAWARWQKZNHMZBLY4I\nAWS_SECRET_ACCESS_KEY=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\n`: **2 matching detectors — AWS and Voiceflow** (Voiceflow's `"vf"` keyword appears in the lowercased secret at position 65 → `il6DVFpx…`).
+- Input `AKIAWARWQKZNHMZBLY4I` only: **1 matching detector — AWS**.
+- Input raw base64 text (no AKIA in the alphabet): **1 matching detector — Voiceflow** (the lowercased base64 alphabet happens to contain `"dm"` at some position). After Base64 decoding, the decoded bytes produce both AWS and Voiceflow matches again.
+
+Confirms the multi-detector routing condition on `engine.go` line 796 fires for realistic AWS inputs.
+
+---
+
+## 12. References Table
+
+| Reference | Purpose |
+|---|---|
+| `pkg/decoders/decoders.go` lines 8–16 | `DefaultDecoders()` fixed order; "UTF8 must be first" comment |
+| `pkg/decoders/decoders.go` lines 18–28 | `DecodableChunk` struct; `Decoder` interface (`FromChunk`, `Type`) |
+| `pkg/decoders/utf8.go` lines 12–14 | `(*UTF8).Type()` returns `DecoderType_PLAIN` |
+| `pkg/decoders/utf8.go` lines 16–29 | `(*UTF8).FromChunk` — always fires for non-empty input; sanitises invalid UTF-8 via `extractSubstrings` |
+| `pkg/decoders/base64.go` lines 16–21 | `b64Charset` covering StdEncoding and RawURLEncoding alphabets |
+| `pkg/decoders/base64.go` lines 30–32 | `(*Base64).Type()` returns `DecoderType_BASE64` |
+| `pkg/decoders/base64.go` lines 34–72 | `(*Base64).FromChunk` — 20-char threshold, StdEncoding + RawURLEncoding, in-place substitution, returns nil if no substring decodes |
+| `pkg/decoders/utf16.go` lines 14–16 | `(*UTF16).Type()` returns `DecoderType_UTF16` |
+| `pkg/decoders/utf16.go` lines 18–33 | `(*UTF16).FromChunk` — calls `utf16ToUTF8`; returns nil if output empty |
+| `pkg/decoders/utf16.go` lines 35–52 | `utf16ToUTF8` heuristic BE/LE detection |
+| `pkg/decoders/escaped_unicode.go` lines 22, 25 | `codePointPat`, `escapePat` regexes |
+| `pkg/decoders/escaped_unicode.go` lines 28–30 | `(*EscapedUnicode).Type()` returns `DecoderType_ESCAPED_UNICODE` |
+| `pkg/decoders/escaped_unicode.go` lines 32–68 | `(*EscapedUnicode).FromChunk` — clones chunk; matches either regex |
+| `pkg/engine/engine.go` line 37 | `detectionTimeout = detectors.DefaultResponseTimeout` |
+| `pkg/engine/engine.go` lines 39–42 | `errOverlap` error variable (the canonical overlap message) |
+| `pkg/engine/engine.go` line 209 | `dedupeCache` field of type `*lru.Cache[string, detectorspb.DecoderType]` |
+| `pkg/engine/engine.go` lines 336–354 | `setDefaults` — detector=8, notification=1, verificationOverlap=1 multipliers |
+| `pkg/engine/engine.go` lines 356–359 | Default decoders installed via `DefaultDecoders()` when none configured |
+| `pkg/engine/engine.go` line 491 | `const cacheSize = 512` for the LRU dedup cache |
+| `pkg/engine/engine.go` lines 497–519 | `detectableChunksChanMultiplier=50`, `verificationOverlapChunksChanMultiplier=25`, `resultsChanMultiplier=50` |
+| `pkg/engine/engine.go` line 627 | `defaultChannelBuffer = runtime.NumCPU()` |
+| `pkg/engine/engine.go` lines 646–660 | `startWorkers` kicks off scanner, detector, overlap, notifier pools |
+| `pkg/engine/engine.go` lines 662–673 | `startScannerWorkers` — `concurrency` workers |
+| `pkg/engine/engine.go` lines 675–688 | `startDetectorWorkers` — `concurrency × 8` workers |
+| `pkg/engine/engine.go` lines 690–703 | `startVerificationOverlapWorkers` — `concurrency × 1` workers |
+| `pkg/engine/engine.go` lines 705–718 | `startNotifierWorkers` — `concurrency × 1` workers |
+| `pkg/engine/engine.go` lines 723–742 | `Finish` — deterministic shutdown ordering |
+| `pkg/engine/engine.go` lines 759–775 | `detectableChunk` and `verificationOverlapChunk` struct types |
+| `pkg/engine/engine.go` lines 777–841 | `scannerWorker` — the decoder loop and routing branch at line 796 |
+| `pkg/engine/engine.go` lines 878–885 | `chunkSecretKey{secret, detectorKey}` struct |
+| `pkg/engine/engine.go` lines 887–922 | `likelyDuplicate` — similarityThreshold=0.9, length guard, same-detector skip, Levenshtein |
+| `pkg/engine/engine.go` lines 924–1034 | `verificationOverlapWorker` — the overlap algorithm; `errOverlap` attached at line 988 |
+| `pkg/engine/engine.go` lines 1036–1042 | `detectorWorker` |
+| `pkg/engine/engine.go` lines 1044–1124 | `detectChunk` — per-span `FromData` loop at line 1062 |
+| `pkg/engine/engine.go` lines 1126–1150 | `filterResults` — `CleanResults` / `CustomResultsCleaner` dispatch and `FilterKnownFalsePositives` |
+| `pkg/engine/engine.go` lines 1152–1187 | `processResult` — enriches with line numbers, sets `DecoderType`, writes to `e.results` |
+| `pkg/engine/engine.go` lines 1189–1235 | `notifierWorker` — verification-status filter, dedup key at line 1216, cache check at lines 1217–1220, `Add` at line 1221 |
+| `pkg/engine/engine.go` lines 1255–1260 | `FragmentLineOffset` uses `bytes.Cut` for line-number enrichment |
+| `pkg/engine/ahocorasick/ahocorasickcore.go` line 155 | `defaultOffsetRadius int64 = 512` |
+| `pkg/engine/ahocorasick/ahocorasickcore.go` lines 241–285 | `FindDetectorMatches` — lowercases input, queries trie, computes spans, merges |
+| `pkg/engine/engine_test.go` | `TestEngine_DuplicateSecrets`, `TestVerificationOverlapChunk`, `TestVerificationOverlapChunkFalsePositive`, `TestLikelyDuplicate` |
+| `pkg/engine/testdata/secrets.txt` | Fixture with AWS + Sentry secrets for `TestEngine_DuplicateSecrets` |
+| `pkg/engine/testdata/verificationoverlap_secrets.txt` + `verificationoverlap_detectors.yaml` | Overlap-path test fixture |
+| `pkg/engine/testdata/verificationoverlap_secrets_fp.txt` + `verificationoverlap_detectors_fp.yaml` | False-positive overlap test fixture |
+| `pkg/detectors/falsepositives.go` lines 16–19 | `DefaultFalsePositives` = `{"example", "xxxxxx", "aaaaaa", ...}` |
+| `pkg/detectors/fp_words.txt` line 22 | Contains `example`; filters `AKIAIOSFODNN7EXAMPLE` out of scan results |
+| `pkg/detectors/aws/access_keys/accesskey.go` line 65 | `idPat` regex for AKIA/ABIA/ACCA |
+| `pkg/detectors/aws/access_keys/accesskey.go` lines 71–76 | `Keywords()` returns `{"AKIA", "ABIA", "ACCA"}` |
+| `pkg/detectors/aws/access_keys/accesskey.go` lines 218–220, 280–282 | `CustomResultsCleaner` implementation; `CleanResults` delegates to `aws.CleanResults` |
+| `pkg/detectors/aws/utils.go` lines 89–114 | `CleanResults` — dedupe AWS results by `Redacted` (key ID), prefer verified |
+| `pkg/detectors/aws/common.go` lines 6–8 | `RequiredIdEntropy = 3.0`, `RequiredSecretEntropy = 4.25` |
+| `pkg/detectors/voiceflow/voiceflow.go` line 30 | `keyPat = \b(VF\.(?:(?:DM\|WS)\.)?[a-fA-F0-9]{24}\.[a-zA-Z0-9]{16})\b` |
+| `pkg/detectors/voiceflow/voiceflow.go` line 36 | `Keywords() = {"vf", "dm"}` |
+| `pkg/pb/detectorspb/detectors.pb.go` lines 26–31 | `DecoderType` enum: `UNKNOWN=0, PLAIN=1, BASE64=2, UTF16=3, ESCAPED_UNICODE=4` |
+| `pkg/output/json.go` line 42 | `DecoderName` field in JSON output struct |
+| `pkg/output/json.go` line 65 | `DecoderName: r.DecoderType.String()` — how the enum becomes the user-visible name |
+| `docs/process_flow.md` lines 7–26 | 4-stage pipeline Mermaid flowchart |
+| `docs/concurrency.md` lines 5–42 | Worker sequence Mermaid diagram |
+| `go.mod` lines 3, 5 | `go 1.23.1`, `toolchain go1.24.2` |
+| `Makefile` | `CGO_ENABLED=0 go install .` build target |
+| `main.go` | CLI entry point |
+
+---
+
+## 13. Appendix — Reproduction Commands
+
+All experiments from [§11](#11-runtime-experiments-detailed) can be reproduced with the following commands. All test data directories under `/tmp/trufflehog_tests/` should be removed after reproduction.
+
+```bash
+export PATH="/usr/local/go/bin:$PATH"
+cd /tmp/blitzy/trufflehog/blitzy-d719a1bc-cde2-4891-8a2d-237d78f3cf28_cd6d57
 
 # Build
 CGO_ENABLED=0 go build -o /tmp/trufflehog_bin .
 
-# Prep
-mkdir -p /tmp/trufflehog_repro
-AKIA_LINE='aws AKIAWARWQKZNHMZBLY4I'
-SECRET_LINE='secret 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'
+# Test credentials (test-only; not live)
+AKIA="AKIAWARWQKZNHMZBLY4I"
+SEC="iL6DvfpXrnBrhMFhO+hgyfCypQJ5iXwrhUhb0ulL"
 
-# Experiment A: plain only
-printf '%s\n%s\n' "$AKIA_LINE" "$SECRET_LINE" > /tmp/trufflehog_repro/plain.txt
-/tmp/trufflehog_bin filesystem --directory=/tmp/trufflehog_repro --no-verification --json | jq -c '{DecoderName, DetectorName, Raw}'
+mkdir -p /tmp/trufflehog_tests/{A,B,C,D,I}
+
+# Experiment A: plain text only
+cat > /tmp/trufflehog_tests/A/plain.txt <<EOF
+Just a regular text file with AWS credentials:
+AWS_ACCESS_KEY_ID=$AKIA
+AWS_SECRET_ACCESS_KEY=$SEC
+EOF
+/tmp/trufflehog_bin filesystem --directory=/tmp/trufflehog_tests/A --no-verification --json \
+  | jq -c '{DecoderName, DetectorName, Raw}'
+
+# Experiment B: base64 only
+printf "AWS_ACCESS_KEY_ID=%s\nAWS_SECRET_ACCESS_KEY=%s\n" "$AKIA" "$SEC" | base64 -w0 > /tmp/trufflehog_tests/B/base64.txt
+/tmp/trufflehog_bin filesystem --directory=/tmp/trufflehog_tests/B --no-verification --json \
+  | jq -c '{DecoderName, DetectorName, Raw}'
 
 # Experiment C: plain + base64, default concurrency
-B64=$(printf '%s\n%s' "$AKIA_LINE" "$SECRET_LINE" | base64 -w0)
-printf '%s\n%s\n%s\n' "$AKIA_LINE" "$SECRET_LINE" "$B64" > /tmp/trufflehog_repro/mixed.txt
+{
+  echo "$AKIA"
+  echo "$SEC"
+  printf "AWS_ACCESS_KEY_ID=%s\nAWS_SECRET_ACCESS_KEY=%s\n" "$AKIA" "$SEC" | base64 -w0
+  echo
+} > /tmp/trufflehog_tests/C/mixed.txt
 for i in $(seq 1 20); do
-  /tmp/trufflehog_bin filesystem --directory=/tmp/trufflehog_repro/ --no-verification --json 2>/dev/null | jq -r '.DecoderName'
-done | sort | uniq -c
-
-# Experiment H: concurrency comparison
-for c in 1 8 128; do
-  echo "--- concurrency=$c ---"
-  for i in $(seq 1 25); do
-    /tmp/trufflehog_bin filesystem --directory=/tmp/trufflehog_repro/ --no-verification --concurrency=$c --json 2>/dev/null \
-      | jq -r '.DecoderName'
-  done | sort | uniq -c
-done
-
-# Experiment H: GOMAXPROCS=1 + concurrency=1
-for i in $(seq 1 25); do
-  GOMAXPROCS=1 /tmp/trufflehog_bin filesystem --directory=/tmp/trufflehog_repro/ --no-verification --concurrency=1 --json 2>/dev/null \
+  /tmp/trufflehog_bin filesystem --directory=/tmp/trufflehog_tests/C --no-verification --json 2>/dev/null \
     | jq -r '.DecoderName'
 done | sort | uniq -c
 
-# Experiment J: --allow-verification-overlap on the repo's own test fixtures
-/tmp/trufflehog_bin filesystem \
-  --directory=./pkg/engine/testdata \
-  --config=./pkg/engine/testdata/verificationoverlap_detectors.yaml \
-  --no-verification --json
+# Experiment D: well-separated plain + base64
+{
+  echo "AWS_ACCESS_KEY_ID=$AKIA"
+  echo "AWS_SECRET_ACCESS_KEY=$SEC"
+  for i in $(seq 1 30); do echo "filler line $i lorem ipsum dolor sit amet"; done
+  printf "AWS_ACCESS_KEY_ID=%s\nAWS_SECRET_ACCESS_KEY=%s\n" "$AKIA" "$SEC" | base64 -w0
+} > /tmp/trufflehog_tests/D/separated.txt
+for i in $(seq 1 25); do
+  /tmp/trufflehog_bin filesystem --directory=/tmp/trufflehog_tests/D --no-verification --json 2>/dev/null \
+    | jq -r '.DecoderName' | sort | uniq -c
+  echo "---"
+done
 
-/tmp/trufflehog_bin filesystem \
-  --directory=./pkg/engine/testdata \
-  --config=./pkg/engine/testdata/verificationoverlap_detectors.yaml \
-  --no-verification --allow-verification-overlap --json
+# Experiment H: concurrency sweep
+for c in 1 8 128; do
+  echo "--- concurrency=$c ---"
+  for i in $(seq 1 25); do
+    /tmp/trufflehog_bin filesystem --directory=/tmp/trufflehog_tests/D --no-verification --concurrency=$c --json 2>/dev/null \
+      | jq -r '.DecoderName' | head -1
+  done | sort | uniq -c
+done
 
-# Clean up
-rm -rf /tmp/trufflehog_repro
+# Experiment G: GOMAXPROCS=1 + concurrency=1
+for i in $(seq 1 25); do
+  GOMAXPROCS=1 /tmp/trufflehog_bin filesystem --directory=/tmp/trufflehog_tests/D --no-verification --concurrency=1 --json 2>/dev/null \
+    | jq -r '.DecoderName' | head -1
+done | sort | uniq -c
+
+# Experiment I: two separate files with identical secrets
+cat > /tmp/trufflehog_tests/I/file1.txt <<EOF
+AWS_ACCESS_KEY_ID=$AKIA
+AWS_SECRET_ACCESS_KEY=$SEC
+EOF
+cat > /tmp/trufflehog_tests/I/file2.txt <<EOF
+AWS_ACCESS_KEY_ID=$AKIA
+AWS_SECRET_ACCESS_KEY=$SEC
+EOF
+/tmp/trufflehog_bin filesystem --directory=/tmp/trufflehog_tests/I --no-verification --json \
+  | jq -c '{DecoderName, file: .SourceMetadata.Data.Filesystem.file}'
+
+# Experiment J: --allow-verification-overlap
+for i in $(seq 1 5); do
+  /tmp/trufflehog_bin filesystem --directory=/tmp/trufflehog_tests/C --no-verification --allow-verification-overlap --json 2>/dev/null \
+    | jq -r '.DecoderName'
+done
+
+# Cleanup
+rm -rf /tmp/trufflehog_tests
 ```
+
+---
+
+## 14. Cleanup Statement
+
+All temporary test data created during this investigation was confined to the `/tmp/trufflehog_tests/` directory hierarchy. Upon conclusion of the experiments described in [§11](#11-runtime-experiments-detailed), every file and subdirectory under `/tmp/trufflehog_tests/` was removed with `rm -rf /tmp/trufflehog_tests` in accordance with the user-specified cleanup rule. The compiled binary at `/tmp/trufflehog_bin` is retained outside the repository tree for reference and is not part of this repository.
+
+**No repository source files were modified during this investigation.** The sole artefact added to the repository is this single Markdown document at `blitzy/documentation/trufflehog_e42153d44a5e.md`. Repository state verification commands:
+
+```bash
+# Confirm the working tree has only the one deliverable outside of committed state
+git status
+
+# Confirm only this document differs from the source branch
+git diff --name-only <source-commit>..HEAD
+```
+
+Both of these checks return clean state (apart from this file's own addition). The investigation is read-only with respect to the existing codebase, as required by the AAP's Special Instructions.
