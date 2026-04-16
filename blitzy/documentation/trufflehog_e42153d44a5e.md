@@ -548,26 +548,26 @@ This generates patterns like `(?i:keyword1|keyword2)(?:.|[\n\r]){0,40}?` which a
 
 **File**: `pkg/common/patterns.go`
 
-TruffleHog provides shared regex patterns used across multiple detectors:
+TruffleHog defines shared pattern constants in `pkg/common/patterns.go` used across multiple detectors. These are `const` string declarations — some are full regex pattern strings, while others are character class building blocks consumed by helper functions:
 
 ```go
 // patterns.go, lines 10-17
-var (
-    EmailPattern     = regexp.MustCompile(`\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b`)
-    SubDomainPattern = regexp.MustCompile(`\b([A-Za-z0-9](?:[A-Za-z0-9\-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,6}\b`)
-    UUIDPattern      = regexp.MustCompile(`\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b`)
-    RegexPattern     = regexp.MustCompile(`[a-zA-Z0-9!@#$%^&*()_+\-=\[\]{};':"\\|,.<>\/?]+`)
-    AlphaNumPattern  = regexp.MustCompile(`[a-zA-Z0-9]+`)
-    HexPattern       = regexp.MustCompile(`[a-fA-F0-9]+`)
-)
+const EmailPattern = `\b((?i)(?:[a-z0-9!#$%&'*+/=?^_\x60{|}~-]+(?:\.[a-z0-9!#$%&'*+/=?^_\x60{|}~-]+)*|"(?:[\x01-\x08\x0b\x0c\x0e-\x1f\x21\x23-\x5b\x5d-\x7f]|\\[\x01-\x09\x0b\x0c\x0e-\x7f])*")@(?:(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]*[a-z0-9])?|\[(?:(?:(2(5[0-5]|[0-4][0-9])|1[0-9][0-9]|[1-9]?[0-9]))\.){3}(?:(2(5[0-5]|[0-4][0-9])|1[0-9][0-9]|[1-9]?[0-9])|[a-z0-9-]*[a-z0-9]:(?:[\x01-\x08\x0b\x0c\x0e-\x1f\x21-\x5a\x53-\x7f]|\\[\x01-\x09\x0b\x0c\x0e-\x7f])+)\]))\b`
+const SubDomainPattern = `\b([A-Za-z0-9](?:[A-Za-z0-9\-]{0,61}[A-Za-z0-9])?)\b`
+const UUIDPattern = `\b([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b`
+const UUIDPatternUpperCase = `\b([0-9A-Z]{8}-[0-9A-Z]{4}-[0-9A-Z]{4}-[0-9A-Z]{4}-[0-9A-Z]{12})\b`
+
+const RegexPattern = "0-9a-z"
+const AlphaNumPattern = "0-9a-zA-Z"
+const HexPattern = "0-9a-f"
 ```
 
-All shared patterns use bounded character classes or simple alternations, placing them in the **LOW** risk category. The `BuildRegex()` helper at line 24 constructs custom patterns:
+`EmailPattern` is a comprehensive RFC 5322-compliant regex with nested alternations, but it uses only bounded quantifiers and literal character classes. `SubDomainPattern` and `UUIDPattern` are simple bounded regex strings. The three short constants (`RegexPattern`, `AlphaNumPattern`, `HexPattern`) are plain character class component strings — not standalone compiled regex patterns — used as building blocks by the `BuildRegex()` helper at line 24. All shared patterns remain in the **LOW** risk category. The `BuildRegex()` function constructs bounded character class regex strings:
 
 ```go
-func BuildRegex(prefixes, suffixes []string, center string) *regexp.Regexp {
-    // Constructs: (?:prefix1|prefix2)center(?:suffix1|suffix2)
-    // ...
+// patterns.go, lines 24-26
+func BuildRegex(pattern string, specialChar string, length int) string {
+    return fmt.Sprintf(`\b([%s%s]{%s})\b`, pattern, specialChar, strconv.Itoa(length))
 }
 ```
 
