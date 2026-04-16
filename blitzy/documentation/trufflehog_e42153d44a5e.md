@@ -292,7 +292,7 @@ Inside each detector's `FromData()` method, regex matching is performed via `Fin
 
 But the **number of matches returned** becomes the input size `N` for the combinatorial explosion in Layer 5.
 
-**AWS example** — `pkg/detectors/aws/access_keys/accesskey.go` lines 112–118:
+**AWS example** — `pkg/detectors/aws/access_keys/accesskey.go` lines 111–118 (preceded at line 110 by the comment `// Filter & deduplicate matches.`):
 
 ```go
 idMatches := make(map[string]struct{})
@@ -347,7 +347,7 @@ RequiredIdEntropy     = 3.0
 RequiredSecretEntropy = 4.25
 ```
 
-**NetSuite — O(n⁵)**. From `pkg/detectors/netsuite/netsuite.go` lines 71–111 (condensed, structure preserved):
+**NetSuite — O(n⁵)**. From `pkg/detectors/netsuite/netsuite.go` lines 71–111 (condensed — inner result-construction and verification elided for brevity; see [Section 8.1](#81-detector-anatomy) for the full verbatim excerpt). Note that `credentialSet` is a locally-defined struct type (declared at line 46 of `netsuite.go`), not a slice literal:
 
 ```go
 for consumerKey := range consumerKeyMatches {
@@ -355,8 +355,14 @@ for consumerKey := range consumerKeyMatches {
         for tokenKey := range tokenKeyMatches {
             for tokenSecret := range tokenSecretMatches {
                 for accountID := range accountIDMatches {
-                    credentialSet := []string{consumerKey, consumerSecret, tokenKey, tokenSecret, accountID}
-                    if !isUniqueKeys(credentialSet) {
+                    cs := credentialSet{
+                        consumerKey:    consumerKey,
+                        consumerSecret: consumerSecret,
+                        tokenKey:       tokenKey,
+                        tokenSecret:    tokenSecret,
+                        accountID:      accountID,
+                    }
+                    if !isUniqueKeys(cs) {
                         continue
                     }
                     // result construction, verification, append
@@ -497,11 +503,10 @@ The profile was analyzed with `go tool pprof` using the `-cum` (cumulative) orde
 - **~30 % of CPU time** is spent in `detectors.StringShannonEntropy`, confirming the hypothesis that entropy computation amplifies per-iteration cost. The function is defined in `pkg/detectors/falsepositives.go` lines 136–151:
 
   ```go
-  // StringShannonEntropy calculates the entropy of a string using the formula: H(X) = -sum(p(x) * log2(p(x)))
-  // where p(x) is the probability of the character x in the string.
   func StringShannonEntropy(input string) float64 {
       chars := make(map[rune]float64)
       inverseTotal := 1 / float64(len(input)) // precompute the inverse
+
       for _, char := range input {
           chars[char]++
       }
@@ -588,7 +593,7 @@ accountIDPat      = regexp.MustCompile(detectors.PrefixRegex([]string{"netsuite"
 
 Four of the five patterns use the same `[a-zA-Z0-9]{64}` capturing group, meaning all four token-type strings look identical from the regex's perspective — any 64-character alphanumeric string within 40 bytes of the right keyword will match. The account ID pattern is shorter (`{6,15}`) but still trivial to generate.
 
-After match collection at lines 65–69 (see [Section 4.4](#44-layer-4--detector-pattern-matching)), the detector enters the 5-level nested loop at lines 71–111:
+After match collection at lines 65–69 (see [Section 4.4](#44-layer-4--detector-pattern-matching)), the detector enters the 5-level nested loop at lines 71–111 (verbatim excerpt). Note that `credentialSet` is the locally-defined struct type at line 46 of `netsuite.go`; each iteration constructs an instance `cs` of that type:
 
 ```go
 for consumerKey := range consumerKeyMatches {
@@ -596,23 +601,36 @@ for consumerKey := range consumerKeyMatches {
         for tokenKey := range tokenKeyMatches {
             for tokenSecret := range tokenSecretMatches {
                 for accountID := range accountIDMatches {
-                    credentialSet := []string{consumerKey, consumerSecret, tokenKey, tokenSecret, accountID}
-                    if !isUniqueKeys(credentialSet) {
+                    cs := credentialSet{
+                        consumerKey:    consumerKey,
+                        consumerSecret: consumerSecret,
+                        tokenKey:       tokenKey,
+                        tokenSecret:    tokenSecret,
+                        accountID:      accountID,
+                    }
+
+                    if !isUniqueKeys(cs) {
                         continue
                     }
+
                     s1 := detectors.Result{
-                        DetectorType: detectorspb.DetectorType_NetSuite,
-                        Raw:          []byte(tokenKey),
-                        RawV2:        []byte(consumerKey + tokenKey + accountID),
-                        ExtraData: map[string]string{
-                            "consumerKey":    consumerKey,
-                            "consumerSecret": consumerSecret,
-                            "tokenKey":       tokenKey,
-                            "tokenSecret":    tokenSecret,
-                            "accountID":      accountID,
-                        },
+                        DetectorType: detectorspb.DetectorType_Netsuite,
+                        Raw:          []byte(consumerKey),
+                        RawV2:        []byte(consumerKey + consumerSecret),
                     }
-                    // … optional verification …
+
+                    if verify {
+                        client := s.client
+                        if client == nil {
+                            client = defaultClient
+                        }
+
+                        isVerified, err := verifyCredentials(ctx,
+                            client,
+                            cs)
+                        s1.Verified = isVerified
+                        s1.SetVerificationError(err, consumerKey)
+                    }
                     results = append(results, s1)
                 }
             }
@@ -621,7 +639,7 @@ for consumerKey := range consumerKeyMatches {
 }
 ```
 
-The `isUniqueKeys` check prevents the same match from appearing in two credential slots, which removes some combinations where `consumerKey == tokenKey`, but does **not** bound the overall count.
+The `isUniqueKeys` check prevents the same match from appearing in two credential slots, which removes some combinations where (for example) `consumerKey == tokenKey`, but does **not** bound the overall count.
 
 ### 8.2 Attack arithmetic
 
@@ -645,23 +663,24 @@ Several structural properties combine to make NetSuite uniquely vulnerable:
 2. **All 5 patterns share a common `PrefixRegex` structure** — making it trivial to satisfy all five from a single compact crafted chunk.
 3. **64-character alphanumeric credentials** are easy to synthesize at scale. Unlike AWS's `AKIA` prefix or base64 padding constraints, any `[a-zA-Z0-9]{64}` string suffices.
 4. **The pre-filter keyword `netsuite`** is a simple English word that the attacker can include freely in the file (for example, in a comment or docstring) to ensure Aho-Corasick routes the chunk to this detector.
-5. **`trimUniqueMatches` de-duplicates but does not cap total match count.** It is located at `pkg/detectors/netsuite/netsuite.go` lines 241–250:
+5. **`trimUniqueMatches` de-duplicates but does not cap total match count.** It is located at `pkg/detectors/netsuite/netsuite.go` lines 241–250 (verbatim excerpt — note the named return `result` and the `len(match) > 0` guard):
 
    ```go
-   func trimUniqueMatches(matches [][]string) map[string]struct{} {
-       uniqueMatches := make(map[string]struct{})
+   func trimUniqueMatches(matches [][]string) (result map[string]struct{}) {
+       result = make(map[string]struct{})
        for _, match := range matches {
-           if len(match) > 1 {
-               uniqueMatches[match[1]] = struct{}{}
+           if len(match) > 0 {
+               trimmedString := strings.TrimSpace(match[1])
+               result[trimmedString] = struct{}{}
            }
        }
-       return uniqueMatches
+       return result
    }
    ```
 
-   There is no `if len(uniqueMatches) > maxTotalMatches { break }` guard. Any attacker-supplied match volume passes through.
+   There is no `if len(result) > maxTotalMatches { break }` guard. Any attacker-supplied match volume passes through — the only trimming performed is `strings.TrimSpace` on each individual match and deduplication via the map, neither of which bounds the total count.
 
-6. **Every iteration allocates a 5-entry `ExtraData` map** — adding GC pressure in addition to CPU cost. In the scaled attack (N = 10), 100,000 such maps are allocated just to populate the `results` slice, which itself grows to 1M+ entries.
+6. **Every iteration performs multiple heap allocations** — adding GC pressure in addition to CPU cost. Per-iteration allocations (as revealed by the verbatim excerpt in [Section 8.1](#81-detector-anatomy)) include: a `credentialSet` struct value (5 string fields, which may escape to heap when passed to `isUniqueKeys` and `verifyCredentials`); a `detectors.Result{}` struct that escapes to heap because it is appended to the `results` slice; a `[]byte(consumerKey)` conversion (copy of 64 bytes of the original string); a `consumerKey + consumerSecret` string concatenation (a fresh 128-byte string on the heap); and a further `[]byte(...)` conversion over that concatenation (another 128-byte copy). In the scaled attack (N = 10), 100,000 such struct + slice allocations are performed just to populate the `results` slice, which itself grows to 1M+ entries across chunked invocations and triggers repeated slice-reallocation copies. This per-iteration allocation burden is what drives the observed `runtime.mapassign_fast32` and GC-related CPU cost reported in [Section 6.2](#62-cpu-profiling-results-table).
 
 Together these properties make NetSuite the single most cost-effective detector to weaponize. An attacker needs less than 2 KB of crafted input to get a 19-second penalty, and less than 4 KB to force process termination.
 
@@ -699,17 +718,18 @@ The relevant locations in the source tree:
   }
   ```
 
-- **`pkg/engine/engine.go` lines 1066–1077** — the timeout is applied by wrapping each `FromData()` call in `context.WithTimeout`, with an `AfterFunc`-based warning if the detector ignores cancellation:
+- **`pkg/engine/engine.go` lines 1066–1077** — the timeout is applied by wrapping each per-match `FromData()` call in `context.WithTimeout`, with an `AfterFunc`-based warning if the detector ignores cancellation. The enclosing `for _, matchBytes := range matches` loop at line 1062 means the timeout is scoped to each pre-matched byte slice individually, not to the whole chunk — `FromData` receives the already-matched `matchBytes` rather than the raw chunk data:
   ```go
-  // Use the verification cache for detection results.
   ctx, cancel := context.WithTimeout(ctx, detectionTimeout)
   t := time.AfterFunc(detectionTimeout+1*time.Second, func() {
-      ctx.Logger().Error(nil, "a detector ignored the context timeout",
-          "detector_type", data.detector.Type().String())
+      ctx.Logger().Error(nil, "a detector ignored the context timeout")
   })
   results, err := e.verificationCache.FromData(
-      ctx, data.detector.Detector, data.chunk.Verify,
-      data.chunk.Data)
+      ctx,
+      data.detector.Detector,
+      data.chunk.Verify,
+      data.chunk.SecretID != 0,
+      matchBytes)
   t.Stop()
   cancel()
   ```
@@ -821,7 +841,7 @@ Recommendations #2 and #3 together are sufficient to close the demonstrated atta
 - `pkg/detectors/detectors.go` — `PrefixRegex` (lines 227–235)
 - `pkg/detectors/falsepositives.go` — `StringShannonEntropy` (lines 136–151)
 - `pkg/detectors/netsuite/netsuite.go` — O(n⁵) (patterns lines 37–43; match extraction lines 65–69; nested loops lines 71–111; `trimUniqueMatches` lines 241–250)
-- `pkg/detectors/aws/access_keys/accesskey.go` — O(n²) (match extraction lines 112–118; nested loops lines 121–214)
+- `pkg/detectors/aws/access_keys/accesskey.go` — O(n²) (match extraction lines 111–118, preceded at line 110 by the `// Filter & deduplicate matches.` comment; nested loops lines 121–214)
 - `pkg/detectors/aws/common.go` — `RequiredIdEntropy`, `RequiredSecretEntropy` (lines 6–7)
 - `pkg/custom_detectors/custom_detectors.go` — `maxTotalMatches = 100` (line 23), cap enforced in `productIndices` (lines 287–297)
 
