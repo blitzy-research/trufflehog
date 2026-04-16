@@ -42,7 +42,7 @@
 
 TruffleHog v3 is **not vulnerable to classical exponential-backtracking Regular Expression Denial of Service (ReDoS)**. This is an architectural guarantee provided by the regex engines used throughout the codebase:
 
-- **865 detector files** import `regexp "github.com/wasilibs/go-re2"` — a CGo binding to Google's C++ RE2 library that implements Thompson NFA semantics with guaranteed linear-time matching.
+- **865 detector files** import `regexp "github.com/wasilibs/go-re2"` — a WebAssembly-based binding to Google's RE2 library (executed via the `tetratelabs/wazero v1.9.0` runtime) that implements Thompson NFA semantics with guaranteed linear-time matching.
 - **3 detector files** use Go's standard `"regexp"` package (`pkg/detectors/azure_cosmosdb/azure_cosmosdb.go`, `pkg/detectors/azure_entra/serviceprincipal/v2/spv2.go`, `pkg/detectors/jdbc/jdbc.go`) — which also implements RE2/Thompson NFA semantics with the same linear-time guarantees.
 - The PCRE-compatible backtracking engine `dlclark/regexp2 v1.4.0` is present as an **indirect dependency** in `go.mod` (line 187) but is **not imported or used** anywhere in `pkg/`. If it were used, classical exponential-backtracking ReDoS would be possible.
 
@@ -87,7 +87,7 @@ This assessment directly answers the following security research questions:
 | Q2 | Can a malicious file slow down TruffleHog scanning? | **Yes** — up to 9.9× gross slowdown on 50MB file | [Section 6](#6-quantitative-timing-measurements-file-size-scaling) |
 | Q3 | Which detector is most vulnerable? | SQL Server (`sqlserver.Scanner`) — 148× slowdown, 89% of attack time | [Section 4](#4-critical-vulnerability-sql-server-detector) |
 | Q4 | What is the attack mechanism? | High-constant-factor regex + keyword amplification + GC pressure | [Section 8](#8-attack-vector-catalog) |
-| Q5 | What are the CPU hotspots during attack? | 47.9% in RE2 C library, 31.3% in GC lock contention | [Section 7](#7-cpu-profiling-data) |
+| Q5 | What are the CPU hotspots during attack? | 47.9% in RE2 engine (via WebAssembly), 31.3% in GC lock contention | [Section 7](#7-cpu-profiling-data) |
 | Q6 | Can this cause CI pipeline failures? | **Yes** — 250MB of attack data can exhaust a 5-minute timeout | [Section 6.6](#66-ci-pipeline-impact) |
 | Q7 | What mitigations are available? | `--detector-timeout 5s`, `--exclude-detectors SQLServer`, pipeline timeout | [Section 11](#11-mitigation-recommendations-for-ci-pipeline-deployment) |
 | Q8 | What is the overall risk? | **MODERATE** — significant CI impact but bounded by RE2 and timeouts | [Section 14](#14-conclusions) |
@@ -327,7 +327,7 @@ TruffleHog uses a concurrent worker pool architecture with configurable multipli
 
 | Worker Type | Default Count | Source | Purpose |
 |---|---|---|---|
-| Scanner workers | `runtime.NumCPU()` | Line 338: `e.concurrency = numCPU` | Chunk processing: decoders → Aho-Corasick → dispatch |
+| Scanner workers | `runtime.NumCPU()` | Line 340: `e.concurrency = numCPU` | Chunk processing: decoders → Aho-Corasick → dispatch |
 | Detector workers | 8× scanner workers | Lines 343–345: `e.detectorWorkerMultiplier = 8` | Per-detector regex execution and verification |
 | Notification workers | 1× scanner workers | Lines 348–349: `e.notificationWorkerMultiplier = 1` | Result notification and output |
 | Verification overlap workers | 1× scanner workers | Lines 352–353: `e.verificationOverlapWorkerMultiplier = 1` | Cross-source verification deduplication |
@@ -596,7 +596,7 @@ Both regex engines used by TruffleHog implement the Thompson NFA construction, w
 
 **Source**: `go.mod`, line 100: `github.com/wasilibs/go-re2 v1.9.0`
 
-This package is a CGo binding to Google's C++ RE2 library. RE2 was specifically designed to prevent ReDoS by implementing the Thompson NFA algorithm, which:
+This package provides a WebAssembly-based binding to Google's RE2 library, compiled to Wasm and executed via the `tetratelabs/wazero v1.9.0` runtime (confirmed in `go.mod`, line 285). When built with `CGO_ENABLED=0` (as in this assessment), `go-re2` uses its default WebAssembly backend rather than CGo. RE2 was specifically designed to prevent ReDoS by implementing the Thompson NFA algorithm, which:
 
 - Constructs a finite automaton from the regex pattern
 - Processes input in a single left-to-right scan
@@ -657,21 +657,21 @@ Even within linear time, patterns with complex character classes, nested bounded
 
 For a pattern that matches at every position in the input (overlapping matches), `FindAllString(data, -1)` can produce O(n²) total matched bytes, leading to O(n²) total processing time — still polynomial, but quadratically worse than a single match. This is the theoretical upper bound for RE2 with unlimited match counts.
 
-### 3.3 CGo Overhead and RE2 Memory Model
+### 3.3 WebAssembly Execution Overhead and RE2 Memory Model
 
-#### 3.3.1 CGo Call Overhead
+#### 3.3.1 WebAssembly (Wazero) Execution Overhead
 
-The `wasilibs/go-re2 v1.9.0` library uses CGo to call into the C++ RE2 library. Each CGo call has a fixed overhead (typically ~100–200ns) due to the Go runtime needing to:
+The `wasilibs/go-re2 v1.9.0` library, when built with `CGO_ENABLED=0` (as in this assessment), executes Google's RE2 engine as a WebAssembly module via the `tetratelabs/wazero v1.9.0` runtime (a pure-Go WebAssembly runtime, confirmed in `go.mod`, line 285; with `wasilibs/wazero-helpers` at line 292). Each regex operation crosses the Go → Wasm boundary, which has a fixed overhead due to:
 
-1. Save Go goroutine state
-2. Switch to a C-compatible stack
-3. Execute the C function
-4. Return results back to Go
-5. Resume the Go goroutine
+1. Marshaling Go data into the Wasm linear memory
+2. Invoking the Wasm function through the wazero runtime
+3. Executing the RE2 matching logic within the Wasm sandbox
+4. Copying results back from Wasm linear memory to Go heap
+5. Resuming normal Go execution
 
-For the SQL Server detector's `FindAllStringSubmatch(data, -1)` call, this overhead is amortized over the entire match operation (which takes 19.2 seconds on 10MB attack data), making it negligible. However, for detectors that make many small regex calls (e.g., iterating over individual matches and applying secondary patterns), the CGo overhead can accumulate.
+For the SQL Server detector's `FindAllStringSubmatch(data, -1)` call, this boundary overhead is amortized over the entire match operation (which takes 19.2 seconds on 10MB attack data), making it negligible. However, for detectors that make many small regex calls (e.g., iterating over individual matches and applying secondary patterns), the Wasm boundary overhead can accumulate.
 
-The CPU profile confirms this: **47.9% of time** is in `runtime._ExternalCode`, which is Go's profiling label for code executing in CGo-called C functions — i.e., RE2's C++ matching engine.
+The CPU profile confirms this: **47.9% of time** is in `runtime._ExternalCode`, which is Go's profiling label for code executing outside the Go runtime — in this case, RE2's matching engine running as WebAssembly via the wazero runtime.
 
 #### 3.3.2 Memory Behavior
 
@@ -1129,7 +1129,7 @@ A CPU profile was captured during processing of a 10MB attack file using Go's `r
 
 | Rank | Function | Flat Time | Flat % | Cumulative % | Category |
 |---|---|---|---|---|---|
-| 1 | `runtime._ExternalCode` | 22.80s | 47.9% | 47.9% | RE2 C library execution |
+| 1 | `runtime._ExternalCode` | 22.80s | 47.9% | 47.9% | RE2 engine execution (via WebAssembly) |
 | 2 | `runtime.unlock2` | 8.16s | 17.1% | 65.0% | GC lock contention |
 | 3 | `runtime.lock2` | 6.74s | 14.2% | 79.2% | GC lock contention |
 | 4 | `runtime.freeSomeWbufs` | 0.91s | 1.9% | 81.1% | GC sweep |
@@ -1139,9 +1139,9 @@ A CPU profile was captured during processing of a 10MB attack file using Go's `r
 
 ### 7.3 Analysis by Category
 
-#### 7.3.1 RE2 C Library Execution (47.9%)
+#### 7.3.1 RE2 Engine Execution via WebAssembly (47.9%)
 
-The largest single contributor is `runtime._ExternalCode`, which represents time spent executing code outside Go's runtime — in this case, the RE2 C++ library invoked through CGo by `wasilibs/go-re2`.
+The largest single contributor is `runtime._ExternalCode`, which represents time spent executing code outside Go's runtime — in this case, the RE2 matching engine executed as WebAssembly via the `tetratelabs/wazero` runtime by `wasilibs/go-re2`.
 
 This 47.9% directly corresponds to the SQL Server detector's `pattern.FindAllStringSubmatch()` call, which invokes RE2's matching engine on 10MB of data with a high-constant-factor pattern. The time is spent in RE2's Thompson NFA simulation, processing the `(?:[A-Za-z0-9_ ]+=[^;$'"$]+;?){3,}` pattern byte-by-byte across the entire input.
 
@@ -1199,7 +1199,7 @@ This ~58 MB of live heap during peak processing triggers frequent GC cycles. Go'
 ├───────────────────────────────────────────────────────────────┤
 │                                                                │
 │  ████████████████████████████████████████████  47.9%           │
-│  RE2 C library (SQL Server regex)             22.80s          │
+│  RE2 engine/Wasm (SQL Server regex)            22.80s          │
 │                                                                │
 │  ████████████████                              17.1%           │
 │  GC runtime.unlock2                            8.16s           │
@@ -1227,7 +1227,7 @@ This ~58 MB of live heap during peak processing triggers frequent GC cycles. Go'
 
 ### 7.6 Key Takeaways from Profiling
 
-1. **SQL Server detector is the dominant bottleneck**: 47.9% of total CPU time spent in RE2's C library, directly attributable to the SQL Server detector's `FindAllStringSubmatch` call on 10MB of attack data.
+1. **SQL Server detector is the dominant bottleneck**: 47.9% of total CPU time spent in RE2's engine (via WebAssembly), directly attributable to the SQL Server detector's `FindAllStringSubmatch` call on 10MB of attack data.
 
 2. **GC pressure is the secondary bottleneck**: 35% of total CPU time spent in GC-related functions (lock2, unlock2, freeSomeWbufs, sweepone). This is caused by the 97K+ result objects from URI and JDBC detectors, each requiring heap allocation and GC tracking.
 
@@ -1534,7 +1534,7 @@ Based on the analysis of 1,144 `regexp.MustCompile` calls across 845+ detector s
 | Unbounded repetition of groups | `(group){3,}` | **HIGH** | RE2 must explore all possible groupings; no upper bound means potentially many iterations |
 | Broad negated character classes | `[^;$'"]+` | **HIGH** | Matches almost any character, leading to long match spans on arbitrary text |
 | `FindAllStringSubmatch(data, -1)` | `pattern.FindAllStringSubmatch(data, -1)` | **MODERATE** | Scans entire input for all matches; `-1` means no limit on match count |
-| Complex character classes with many alternations | `[\w!#$%&()*+,\-./:;<=>?@[\\\]^_{|}~]` | **MODERATE** | Higher per-byte processing cost in the NFA simulation |
+| Complex character classes with many alternations | `[\w!#$%&()*+,\-./:;<=>?@[\\\]^_{\|}~]` | **MODERATE** | Higher per-byte processing cost in the NFA simulation |
 
 #### 10.3.2 Low-Risk Indicators
 
@@ -1551,7 +1551,7 @@ Beyond the top-5 ranked detectors, this section provides analysis of additional 
 
 #### 10.4.1 MongoDB Detector
 
-**File**: `pkg/detectors/mongodb/mongodb.go`, line 33
+**File**: `pkg/detectors/mongodb/mongodb.go`, line 32
 
 ```
 \b(mongodb(?:\+srv)?://(?P<username>\S{3,50}):(?P<password>\S{3,88})@
@@ -1574,7 +1574,7 @@ The MongoDB pattern is not a significant risk because it requires the `mongodb:/
 
 #### 10.4.2 GitHub Token Detector (v2)
 
-**File**: `pkg/detectors/github/v2/github.go`, line 37
+**File**: `pkg/detectors/github/v2/github.go`, line 36
 
 ```
 \b((?:ghp|gho|ghu|ghs|ghr|github_pat)_[a-zA-Z0-9_]{36,255})\b
@@ -1586,13 +1586,13 @@ The MongoDB pattern is not a significant risk because it requires the `mongodb:/
 |---|---|
 | Bounded quantifier | `{36,255}` — well-bounded |
 | Character class | `[a-zA-Z0-9_]` — simple alphanumeric |
-| Prefix alternation | `(?:ghp|gho|ghu|ghs|ghr|github_pat)` — finite set |
+| Prefix alternation | `(?:ghp\|gho\|ghu\|ghs\|ghr\|github_pat)` — finite set |
 | Word boundaries | `\b...\b` — limits match positions |
 | Overall | Very safe pattern. Simple character class with bounded repetition |
 
 #### 10.4.3 Slack Token Detector
 
-**File**: `pkg/detectors/slack/slack.go`, lines 31–35
+**File**: `pkg/detectors/slack/slack.go`, lines 28–31
 
 ```
 xoxb\-[0-9]{10,13}\-[0-9]{10,13}[a-zA-Z0-9\-]*    (Bot Token)
@@ -1612,7 +1612,7 @@ xoxr\-[0-9]{10,13}\-[0-9]{10,13}[a-zA-Z0-9\-]*    (Workspace Refresh)
 
 #### 10.4.4 Stripe API Key Detector
 
-**File**: `pkg/detectors/stripe/stripe.go`, line 23
+**File**: `pkg/detectors/stripe/stripe.go`, line 22
 
 ```
 [rs]k_live_[a-zA-Z0-9]{20,247}
@@ -1639,7 +1639,7 @@ xoxr\-[0-9]{10,13}\-[0-9]{10,13}[a-zA-Z0-9\-]*    (Workspace Refresh)
 
 | Characteristic | Assessment |
 |---|---|
-| Fixed prefix | `(?:AKIA|ABIA|ACCA)` — 4-char exact prefix |
+| Fixed prefix | `(?:AKIA\|ABIA\|ACCA)` — 4-char exact prefix |
 | Fixed length | `{16}` — exactly 16 characters |
 | Character class | `[A-Z0-9]` — uppercase alphanumeric only |
 | Word boundaries | `\b...\b` — limits match positions |
@@ -1686,7 +1686,7 @@ Only 3 detectors use Go's standard `regexp` instead of `wasilibs/go-re2`:
 | Azure Cosmos DB | `pkg/detectors/azure_cosmosdb/azure_cosmosdb.go` | Line 13: `"regexp"` | LOW — typical API key pattern |
 | Azure Entra SP v2 | `pkg/detectors/azure_entra/serviceprincipal/v2/spv2.go` | Line 7: `"regexp"` | LOW — typical credential pattern |
 
-All three use well-bounded patterns and do not present elevated risk. The use of Go's standard `regexp` instead of `go-re2` does not affect the linear-time guarantee — both implement RE2/Thompson NFA semantics. The primary practical difference is that Go's standard `regexp` is implemented in pure Go (no CGo overhead), which means slightly different constant factors but identical algorithmic complexity.
+All three use well-bounded patterns and do not present elevated risk. The use of Go's standard `regexp` instead of `go-re2` does not affect the linear-time guarantee — both implement RE2/Thompson NFA semantics. The primary practical difference is that Go's standard `regexp` is implemented in pure Go (no WebAssembly boundary overhead), which means slightly different constant factors but identical algorithmic complexity.
 
 ### 10.6 Pattern Complexity Taxonomy
 
@@ -2207,7 +2207,7 @@ Real SQL Server connection strings are short (typically 100–300 characters) an
 
 This is guaranteed by the consistent use of RE2/Thompson NFA regex engines:
 
-- 865 detector files use `wasilibs/go-re2 v1.9.0` (CGo binding to Google RE2)
+- 865 detector files use `wasilibs/go-re2 v1.9.0` (WebAssembly-based binding to Google RE2, via wazero runtime)
 - 3 detector files use Go's standard `regexp` package (same linear-time guarantees)
 - The PCRE-compatible backtracking engine `dlclark/regexp2` is present only as an indirect dependency and is not used in any detector code
 
@@ -2897,7 +2897,7 @@ This is one of the most impactful mitigation recommendations with minimal risk o
 | Term | Definition |
 |---|---|
 | **Aho-Corasick** | A string-searching algorithm that locates all occurrences of a finite set of strings within an input text in a single pass, O(n+m+z) time |
-| **CGo** | Go's mechanism for calling C code from Go programs; used by `wasilibs/go-re2` to call Google's C++ RE2 library |
+| **CGo** | Go's mechanism for calling C code from Go programs; `wasilibs/go-re2` supports a CGo backend (via the `re2_cgo` build tag) but defaults to WebAssembly when built with `CGO_ENABLED=0` as in this assessment |
 | **Constant Factor** | The multiplier in an O(cn) algorithm; higher constant factors mean slower execution even with the same asymptotic complexity |
 | **Detector** | A TruffleHog component that matches a specific secret type (e.g., SQL Server credentials, GitHub tokens) using regex patterns |
 | **FindAllStringSubmatch** | Go regex function that returns all matches (including capture groups) found in the input; `-1` means no limit on match count |
@@ -2915,7 +2915,7 @@ This is one of the most impactful mitigation recommendations with minimal risk o
 | **Chunk** | A unit of data (byte slice with metadata) produced by a TruffleHog source and passed through the detection pipeline; represents a portion of a file or git diff |
 | **Decoder** | A component that transforms chunk data into a decoded form; TruffleHog has 4 default decoders: UTF8 (passthrough), Base64, UTF16, EscapedUnicode |
 | **FromData** | The primary method on the `Detector` interface (`pkg/detectors/detectors.go`, line 19); takes context, verify flag, and data bytes; returns results and error |
-| **Go-RE2** | Short for `github.com/wasilibs/go-re2`; a Go package that provides a drop-in replacement for Go's standard `regexp` using Google's C++ RE2 library via CGo |
+| **Go-RE2** | Short for `github.com/wasilibs/go-re2`; a Go package that provides a drop-in replacement for Go's standard `regexp` using Google's RE2 library via WebAssembly (wazero runtime) by default, with an optional CGo backend available via the `re2_cgo` build tag |
 | **Keyword Amplification** | An attack technique where dense placement of detector keywords in a file causes the Aho-Corasick prefilter to trigger many detectors per chunk |
 | **MaxSecretSizeProvider** | An optional interface (`pkg/detectors/detectors.go`) that detectors can implement to specify a maximum size for matches; limits data passed to verification |
 | **MustCompile** | Go regex function that compiles a pattern at initialization time and panics on invalid patterns; used 1,144 times across TruffleHog's detectors |
@@ -2928,7 +2928,7 @@ This is one of the most impactful mitigation recommendations with minimal risk o
 | **Verification** | The optional process where a detector confirms a potential secret is active by making an HTTP request to the service's API; controlled by the `--no-verification` flag |
 | **Backtracking** | A regex matching strategy used by PCRE engines where the engine tries one path and "backtracks" to alternatives on failure; can lead to exponential time on crafted input |
 | **Bounded Quantifier** | A regex quantifier with both lower and upper limits, e.g., `{3,20}`; prevents unbounded matching and limits the NFA state space |
-| **CGo Overhead** | The performance cost of crossing the Go/C boundary when calling C libraries from Go; includes stack switching, memory copying, and scheduler interactions |
+| **Wasm Boundary Overhead** | The performance cost of crossing the Go/WebAssembly boundary when invoking RE2 via the wazero runtime; includes data marshaling into Wasm linear memory, function invocation, and result copying back to the Go heap |
 | **Defense-in-Depth** | A security strategy employing multiple layers of defense; in this context: RE2 engine + prefiltering + timeouts + result limits + monitoring |
 | **Keyword** | A string registered by a TruffleHog detector (via the `Keywords()` method) that, when found in input data, triggers that detector's regex evaluation |
 | **Linear Time** | An algorithm whose execution time grows proportionally with input size (O(n)); both Go `regexp` and RE2 guarantee linear-time regex matching |
