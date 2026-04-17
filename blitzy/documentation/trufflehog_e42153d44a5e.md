@@ -33,8 +33,8 @@
 
 ## 1. Executive Summary
 
-- **The decoder pipeline runs every decoder for every chunk**. `scannerWorker` iterates `DefaultDecoders()` in the fixed order `UTF8 → Base64 → UTF16 → EscapedUnicode` (`pkg/decoders/decoders.go` lines 8–16) and pushes one decoded chunk per decoder that returned non-`nil`. UTF8/PLAIN always fires for non-empty text (`pkg/decoders/utf8.go` lines 16–29); BASE64 fires only when a ≥20-char base64 run decodes to ASCII (`pkg/decoders/base64.go` lines 34–72); UTF16 fires only for paired-null byte sequences (`pkg/decoders/utf16.go` lines 18–52); and ESCAPED_UNICODE fires only when `U+XXXX` or `\uXXXX` patterns are present (`pkg/decoders/escaped_unicode.go` lines 32–68).
-- **The verification overlap worker disables verification for cross-detector duplicates**. When more than one detector keyword-matches a decoded chunk *and* `--allow-verification-overlap` is off (`pkg/engine/engine.go` line 796), the chunk is routed to `verificationOverlapWorker` (lines 924–1034). It calls `FromData(ctx, verify=false, match)` on each detector (line 944), computes cross-detector similarity via `likelyDuplicate()` using Levenshtein distance with a hard-coded threshold of 0.9 (`similarityThreshold`, line 888), attaches `errOverlap` (lines 39–42) to duplicates via `res.SetVerificationError(errOverlap)` (line 988), and re-routes the remaining non-duplicate detectors through `detectableChunksChan` with verification re-enabled (lines 1017–1026).
+- **The decoder pipeline runs every decoder for every chunk**. `scannerWorker` iterates `DefaultDecoders()` in the fixed order `UTF8 → Base64 → UTF16 → EscapedUnicode` (`pkg/decoders/decoders.go` lines 8–16) and pushes one decoded chunk per decoder that returned non-`nil`. UTF8/PLAIN always fires for non-empty text (`pkg/decoders/utf8.go` lines 16–29); BASE64 fires only when a base64-alphabet run of at least 21 characters (strict `>` comparison against `threshold=20`) decodes to ASCII (`pkg/decoders/base64.go` lines 34–72); UTF16 fires only for paired-null byte sequences (`pkg/decoders/utf16.go` lines 18–52); and ESCAPED_UNICODE fires only when `U+XXXX` or `\uXXXX` patterns are present (`pkg/decoders/escaped_unicode.go` lines 32–68).
+- **The verification overlap worker disables verification for cross-detector duplicates**. When more than one detector keyword-matches a decoded chunk *and* `--allow-verification-overlap` is off (`pkg/engine/engine.go` line 796), the chunk is routed to `verificationOverlapWorker` (lines 924–1034). It calls `FromData(ctx, verify=false, match)` on each detector (line 940), computes cross-detector similarity via `likelyDuplicate()` using Levenshtein distance with a hard-coded threshold of 0.9 (`similarityThreshold`, line 888), attaches `errOverlap` (lines 39–42) to duplicates via `res.SetVerificationError(errOverlap)` (line 988), and re-routes the remaining non-duplicate detectors through `detectableChunksChan` with verification re-enabled (lines 1011–1020).
 - **The notifier applies final deduplication via a 512-entry LRU cache**. `notifierWorker` (lines 1189–1235) is the sole dedup point for final output. The key is `fmt.Sprintf("%s%s%s%+v", DetectorType.String(), Raw, RawV2, SourceMetadata)` (line 1216) — **note: the key does not include the decoder type**. If the cache already stores a different `DecoderType` for this key (line 1217) the current result is dropped; if it stores the same decoder (or the key is new), the result is dispatched. Postman-source results are always deduped regardless of decoder (line 1218).
 - **The precise order of operations is scanner → (overlap, if multiple detectors match) → detector → notifier/dedup**. Dedup is always the last stage. Non-determinism appears wherever multiple in-flight results share a dedup key but differ in `DecoderType`: whichever reaches the notifier's `dedupeCache.Add` first wins. With default concurrency (`runtime.NumCPU()` scanner workers, `8×concurrency` detector workers, `1×concurrency` overlap and notifier workers per `pkg/engine/engine.go` lines 336–354), goroutine scheduling across the detector and notifier pools decides the race. With `GOMAXPROCS=1` and `--concurrency=1`, scheduling collapses to deterministic FIFO and PLAIN wins 100% of the time.
 - **A single logical secret can yield one or more results depending on source structure, Aho-Corasick span count, and the dedup race**. Identical `Raw` + `SourceMetadata` (same file, same chunk, same detector) deduplicates to one. Different `SourceMetadata` (secret in two files) produces two results. When the Base64 decoder rewrites a base64 run in place inside a chunk that also contains the plaintext, the resulting decoded chunk holds the secret twice; Aho-Corasick produces two non-overlapping ±512-byte spans (`defaultOffsetRadius`, `pkg/engine/ahocorasick/ahocorasickcore.go` line 155); `detectChunk` calls `FromData` once per span (`pkg/engine/engine.go` line 1062); two BASE64 results with identical dedup key survive dedup (same decoder ⇒ intentionally allowed per the comment at line 1213). The `--allow-verification-overlap` flag affects routing and `errOverlap` tagging but not the final dedup outcome.
@@ -91,7 +91,7 @@ sequenceDiagram
         ScannerWorkers->>DetectorWorkers: detectableChunksChan <- detectableChunk (single-detector path, engine.go 807-816)
         ScannerWorkers->>VerificationOverlapWorkers: verificationOverlapChunksChan <- verificationOverlapChunk (multi-detector path, engine.go 796-805)
     and Overlap resolves cross-detector duplicates
-        VerificationOverlapWorkers->>DetectorWorkers: detectableChunksChan <- detectableChunk (re-route surviving detectors, engine.go 1017-1026)
+        VerificationOverlapWorkers->>DetectorWorkers: detectableChunksChan <- detectableChunk (re-route surviving detectors, engine.go 1011-1020)
     and Detectors produce results
         DetectorWorkers->>NotifierWorkers: e.results <- detectors.ResultWithMetadata (engine.go 1186)
     and Notifier dedupes and dispatches
@@ -166,7 +166,7 @@ These names are what ultimately appear in the `DecoderName` field of the JSON ou
 | Decoder | Always fires? | Trigger condition | Transformation | Returns `nil` when | `Type()` line |
 |---|---|---|---|---|---|
 | UTF8 / PLAIN | **Yes** for non-empty text | Any non-empty chunk | Pass-through for valid UTF-8; invalid UTF-8 is sanitised with `U+FFFD` replacement | `chunk == nil \|\| len(chunk.Data) == 0` | `utf8.go` 12-14 |
-| Base64 | No | ≥20-char base64-alphabet run decoding to ASCII | In-place substitution of the run with the decoded bytes | No qualifying run found | `base64.go` 30-32 |
+| Base64 | No | ≥21-char base64-alphabet run (strict `>` vs threshold=20) decoding to ASCII | Sequential `bytes.Buffer` rebuild — each qualifying run is replaced with its decoded bytes via a `bytes.Index` scan | No qualifying run found | `base64.go` 30-32 |
 | UTF16 | No | Paired-null-byte patterns (BE or LE) with printable runes | Extract printable 2-byte UTF-16 characters and re-encode as UTF-8 | Output buffer empty | `utf16.go` 14-16 |
 | EscapedUnicode | No | `U+XXXX` code-point form or `\uXXXX` escape | Clone chunk data; replace every escape with the corresponding UTF-8 | Neither regex pattern matches | `escaped_unicode.go` 28-30 |
 
@@ -194,47 +194,74 @@ func (d *UTF8) FromChunk(chunk *sources.Chunk) *DecodableChunk {
 #### 3.2.2 Base64 — `pkg/decoders/base64.go`
 
 ```go
-// pkg/decoders/base64.go (lines 34-72, abridged)
+// pkg/decoders/base64.go (lines 34-72, abridged — faithful to the actual algorithm)
 func (d *Base64) FromChunk(chunk *sources.Chunk) *DecodableChunk {
+    decodableChunk := &DecodableChunk{Chunk: chunk, DecoderType: d.Type()}
     encodedSubstrings := getSubstringsOfCharacterSet(chunk.Data, 20, b64CharsetMapping, b64EndChars)
     decodedSubstrings := make(map[string][]byte)
+
+    // For each candidate run, attempt BOTH encodings unconditionally. If
+    // both succeed, the RawURLEncoding result overwrites the StdEncoding
+    // result (same map key) — there is no early `continue`.
     for _, str := range encodedSubstrings {
         dec, err := base64.StdEncoding.DecodeString(str)
         if err == nil && len(dec) > 0 && isASCII(dec) {
             decodedSubstrings[str] = dec
-            continue
         }
+
         dec, err = base64.RawURLEncoding.DecodeString(str)
         if err == nil && len(dec) > 0 && isASCII(dec) {
             decodedSubstrings[str] = dec
         }
     }
+
     if len(decodedSubstrings) > 0 {
-        // Replace each encoded substring in-place with its decoded form.
-        for enc, dec := range decodedSubstrings {
-            chunk.Data = bytes.ReplaceAll(chunk.Data, []byte(enc), dec)
+        // Rebuild chunk.Data sequentially with a bytes.Buffer rather than
+        // calling bytes.ReplaceAll. The algorithm walks encodedSubstrings
+        // in discovery order, uses bytes.Index to find each run's offset
+        // forward from the current cursor, writes the surrounding bytes,
+        // then writes the decoded bytes, and advances the cursor past the
+        // run. Trailing bytes after the final run are appended as-is.
+        var result bytes.Buffer
+        result.Grow(len(chunk.Data))
+
+        start := 0
+        for _, encoded := range encodedSubstrings {
+            if decoded, ok := decodedSubstrings[encoded]; ok {
+                end := bytes.Index(chunk.Data[start:], []byte(encoded))
+                if end != -1 {
+                    result.Write(chunk.Data[start : start+end])
+                    result.Write(decoded)
+                    start += end + len(encoded)
+                }
+            }
         }
-        return &DecodableChunk{Chunk: chunk, DecoderType: d.Type()}
+        result.Write(chunk.Data[start:])
+        chunk.Data = result.Bytes()
+        return decodableChunk
     }
+
     return nil
 }
 ```
 
-Three behavioural notes:
-- **Threshold 20.** `getSubstringsOfCharacterSet(chunk.Data, 20, …)` (line 36) passes `threshold=20`; the helper (lines 83–141) uses `count > threshold` so a run of **at least 21 characters** is required to qualify.
-- **Two alphabets.** Both `base64.StdEncoding` (line 40) and `base64.RawURLEncoding` (line 45) are attempted — runs using either alphabet are handled.
-- **In-place substitution.** When at least one substring decodes successfully, the decoder uses `bytes.ReplaceAll` to write the decoded bytes back into `chunk.Data` (lines 51–67). Surrounding non-base64 text is preserved, but the base64 run is replaced with the decoded content. This is the mechanism behind the "BASE64 chunk contains the secret twice" effect observed in Experiment D.
+Four behavioural notes:
+- **Threshold 20 with strict-greater comparison.** `getSubstringsOfCharacterSet(chunk.Data, 20, …)` (line 36) passes `threshold=20`; the helper (lines 83–141) uses `count > threshold` so a run of **at least 21 characters** is required to qualify.
+- **Both alphabets attempted unconditionally.** For every candidate substring, both `base64.StdEncoding` (line 40) *and* `base64.RawURLEncoding` (line 45) are tried — there is no `continue` between them. If both succeed, the RawURLEncoding result (assigned second) overwrites the StdEncoding result in the `decodedSubstrings` map.
+- **Sequential `bytes.Buffer` rebuild (not `bytes.ReplaceAll`).** When at least one substring decodes, the decoder grows a `bytes.Buffer` to the chunk length (line 53), then iterates `encodedSubstrings` in order, locating each run forward from a moving cursor via `bytes.Index` (line 58) and writing the surrounding bytes + decoded bytes into the buffer (lines 60–62). Trailing bytes after the final run are appended at line 66. The rebuilt buffer replaces `chunk.Data` at line 67. Surrounding non-base64 text is preserved exactly; the base64 run's bytes are replaced with its decoded content.
+- **Twice-present secret after substitution.** The mechanism above is what produces the "BASE64 chunk contains the secret twice" effect observed in Experiment D: if the original chunk already contained the plaintext secret **and** a separate base64 run that also decodes to that plaintext, the rebuild leaves the first copy untouched and writes a second copy in place of the base64 run.
 
 #### 3.2.3 UTF16 — `pkg/decoders/utf16.go`
 
 ```go
 // pkg/decoders/utf16.go (lines 18-52, abridged)
 func (d *UTF16) FromChunk(chunk *sources.Chunk) *DecodableChunk {
-    utf8Data, err := utf16ToUTF8(chunk.Data)
-    if err != nil { return nil }
-    if len(utf8Data) == 0 { return nil }
-    chunk.Data = utf8Data
-    return &DecodableChunk{Chunk: chunk, DecoderType: d.Type()}
+    if utf16Data, err := utf16ToUTF8(chunk.Data); err == nil {
+        if len(utf16Data) == 0 { return nil }
+        chunk.Data = utf16Data
+        return &DecodableChunk{Chunk: chunk, DecoderType: d.Type()}
+    }
+    return nil
 }
 
 func utf16ToUTF8(b []byte) ([]byte, error) {
@@ -247,12 +274,13 @@ func utf16ToUTF8(b []byte) ([]byte, error) {
             if isPrintableByte(byte(r)) { bufLE.WriteRune(r) }
         }
     }
-    // Return whichever buffer has more content; empty means no UTF-16 detected.
-    // ...
+    // Concatenate: LE buffer followed by BE buffer (line 51). If both are
+    // empty, the returned byte slice is empty and FromChunk returns nil.
+    return append(bufLE.Bytes(), bufBE.Bytes()...), nil
 }
 ```
 
-The heuristic attempts both byte orders in parallel and keeps whichever produces more printable ASCII characters. Pure-ASCII text never has consecutive null bytes, so UTF16 returns `nil` for virtually every input in our experiments.
+The heuristic attempts both byte orders in parallel; both decoded buffers are concatenated (little-endian content followed by big-endian content) and returned as the decoded byte stream (line 51 — `return append(bufLE.Bytes(), bufBE.Bytes()...), nil`). If both buffers are empty, `utf16ToUTF8` returns a zero-length slice, and `FromChunk` returns `nil` at line 25. Pure-ASCII text never has consecutive null bytes, so UTF16 returns `nil` for virtually every input in our experiments.
 
 #### 3.2.4 EscapedUnicode — `pkg/decoders/escaped_unicode.go`
 
@@ -313,7 +341,7 @@ A direct Go program (see the code block in [§11](#11-runtime-experiments-detail
 | `\u0041\u004b\u0049\u0041…` | raw escape text passthrough | `nil` | `nil` | 20-byte `AKIAWARWQKZNHMZBLY4I` |
 | `[]byte{}` (empty) | `nil` | `nil` | `nil` | `nil` |
 
-This confirms: **PLAIN always fires for non-empty text; the other three fire only when their specific triggers are present.** The AWS plain-text input has no ≥20-char base64 run, no UTF-16 null pattern, and no `\u` escape, so only PLAIN produces output. The base64-encoded form satisfies Base64's ≥20-char criterion, so both PLAIN (raw b64 text) and BASE64 (decoded plaintext) produce output.
+This confirms: **PLAIN always fires for non-empty text; the other three fire only when their specific triggers are present.** The AWS plain-text input has no qualifying base64 run (no alphabet run of at least 21 characters), no UTF-16 null pattern, and no `\u` escape, so only PLAIN produces output. The base64-encoded form satisfies Base64's threshold (at least 21 characters of base64 alphabet, strict `>` vs threshold=20), so both PLAIN (raw b64 text) and BASE64 (decoded plaintext) produce output.
 
 ---
 
@@ -411,13 +439,13 @@ Two preconditions must hold for the overlap path:
 For each incoming `verificationOverlapChunk`, the worker executes a six-step algorithm:
 
 1. **Initialise reusable per-chunk maps** — `detectorKeysWithResults` and `chunkSecrets` (lines 929–930). These are reused across iterations to minimise allocations.
-2. **Run every matching detector without verification** — for each detector (line 933) and each of that detector's match spans (line 938), invoke `FromData(ctx, false, matchBytes)` under a 2-second timeout (lines 939–944). The `verify=false` argument at line 944 is the crucial element: detection runs fully, but no external API calls are made at this stage.
+2. **Run every matching detector without verification** — for each detector (line 933) and each of that detector's match spans (line 938 — loop variable `match` iterating `matchedBytes`), invoke `FromData(ctx, false, match)` under a 2-second timeout (lines 939–941; context deadline set on 939, `FromData` invoked on 940, `cancel()` on 941). The `verify=false` argument at line 940 is the crucial element: detection runs fully, but no external API calls are made at this stage.
 3. **Track detectors that produced any results** via `detectorKeysWithResults[key] = detector` (lines 952–954).
 4. **Filter results** with `e.filterResults(...)` when `chunk.chunk.SecretID == 0` (lines 961–963), which applies detector-specific `CleanResults` (e.g. `aws.CleanResults` collapses duplicate AWS IDs) and the false-positive word list (including `example` from `pkg/detectors/fp_words.txt` line 22, which is the reason `AKIAIOSFODNN7EXAMPLE` is filtered out).
 5. **For each surviving result**, compute the comparison value (`RawV2` if present, else `Raw`, lines 966–971), construct `chunkSecretKey{secret, detectorKey}` (line 977), and call `likelyDuplicate(ctx, key, chunkSecrets)` (line 982):
    - If `likelyDuplicate` returns true, the overlap tracker is incremented (lines 985–987), `res.SetVerificationError(errOverlap)` is attached (line 988), `e.processResult` is invoked directly (lines 989–999), and the detector is removed from `detectorKeysWithResults` (line 1004) so it is *not* re-routed below.
    - Record the secret in `chunkSecrets` so subsequent results of the same chunk can cross-check against it (line 1006).
-6. **Re-route surviving detectors to the direct path** — for every detector still in `detectorKeysWithResults`, push a `detectableChunk` onto `detectableChunksChan` with verification re-enabled via `e.shouldVerifyChunk(...)` (lines 1017–1026). Reset the reusable maps and call `chunk.verificationOverlapWgDoneFn()` (lines 1023–1030).
+6. **Re-route surviving detectors to the direct path** — for every detector still in `detectorKeysWithResults`, push a `detectableChunk` onto `detectableChunksChan` with verification re-enabled via `e.shouldVerifyChunk(...)` (lines 1011–1020). Reset the reusable maps and call `chunk.verificationOverlapWgDoneFn()` (lines 1022–1030; the two cleanup `delete` loops span 1023–1028, and `verificationOverlapWgDoneFn()` is on line 1030).
 
 ### 5.3 The `errOverlap` Error
 
@@ -466,7 +494,7 @@ Three gating conditions apply in order:
 
 ### 5.5 When No Cross-Detector Duplicate Exists
 
-If a chunk is multi-detector keyword-matched but only one detector actually produces regex-level results, `chunkSecrets` contains only that detector's keys, and `likelyDuplicate` is consulted against same-detector entries only. Per the same-detector skip (line 900), the function returns `false`. The detector stays in `detectorKeysWithResults` and is re-routed to the direct path for full verification (lines 1017–1026).
+If a chunk is multi-detector keyword-matched but only one detector actually produces regex-level results, `chunkSecrets` contains only that detector's keys, and `likelyDuplicate` is consulted against same-detector entries only. Per the same-detector skip (line 900), the function returns `false`. The detector stays in `detectorKeysWithResults` and is re-routed to the direct path for full verification (lines 1011–1020).
 
 This is the AWS + Voiceflow case: both detectors keyword-match (AWS on `"AKIA"`, Voiceflow on `"vf"`/`"dm"`), but Voiceflow's regex `\b(VF\.(?:(?:DM|WS)\.)?[a-fA-F0-9]{24}\.[a-zA-Z0-9]{16})\b` does not match AWS key material (`pkg/detectors/voiceflow/voiceflow.go` line 30), so Voiceflow produces zero results and AWS alone is re-routed for verification.
 
@@ -754,13 +782,13 @@ Whether the user sees 1 or 2 results comes down to who wins the race at the noti
 
 ### Q1. Decoder Pipeline — Which decoders fire and which DecoderType is reported?
 
-**Answer:** TruffleHog does not "pick" a decoder. For every chunk, `scannerWorker` iterates *all* decoders in `DefaultDecoders()` order and pushes one decoded variant per decoder that returned non-`nil`. PLAIN fires for any non-empty text input; BASE64 fires when the chunk contains a ≥20-char base64 run that decodes to ASCII; UTF16 fires when paired-null bytes form printable runes; ESCAPED_UNICODE fires when `U+XXXX` or `\uXXXX` sequences are present. Each non-nil decoded variant independently enters the downstream pipeline. Which `DecoderName` appears in the final output is decided later, at the notifier's dedup stage (Q3).
+**Answer:** TruffleHog does not "pick" a decoder. For every chunk, `scannerWorker` iterates *all* decoders in `DefaultDecoders()` order and pushes one decoded variant per decoder that returned non-`nil`. PLAIN fires for any non-empty text input; BASE64 fires when the chunk contains a base64-alphabet run of at least 21 characters (strict `>` vs threshold=20) that decodes to ASCII; UTF16 fires when paired-null bytes form printable runes; ESCAPED_UNICODE fires when `U+XXXX` or `\uXXXX` sequences are present. Each non-nil decoded variant independently enters the downstream pipeline. Which `DecoderName` appears in the final output is decided later, at the notifier's dedup stage (Q3).
 
-#### Thinking / Rationale
+#### Thinking / Rationale — Q1
 
 The fixed ordering `UTF8 → Base64 → UTF16 → EscapedUnicode` is established in `pkg/decoders/decoders.go` lines 8–16, and the deliberate comment on line 10 ("UTF8 must be first for duplicate detection") reveals the architectural reasoning: UTF8 is the guaranteed-firing decoder for text, so placing it first makes PLAIN the *default* decoder-variant to reach the notifier under serial execution.
 
-I verified via a standalone Go program (invoking `decoders.DefaultDecoders()` directly on crafted inputs — see [§11.9](#119-go-level-decoder-trace)) that:
+I verified via a standalone Go program (invoking `decoders.DefaultDecoders()` directly on crafted inputs — see [§11.11](#1111-go-level-decoder-trace)) that:
 - PLAIN returns non-nil for every non-empty text input tested. It only returns nil when `chunk == nil || len(chunk.Data) == 0` (`utf8.go` lines 17–20).
 - BASE64's gate is the `getSubstringsOfCharacterSet(chunk.Data, 20, ...)` check at `base64.go` line 36 with `threshold=20` (requiring >20, i.e. at least 21 characters); for shorter runs, no substring is produced and `FromChunk` returns nil at line 71.
 - UTF16's `utf16ToUTF8` heuristic produces an empty buffer for pure-ASCII input because consecutive null bytes do not appear; `FromChunk` returns nil at line 25–27.
@@ -772,11 +800,11 @@ Because each non-nil variant is pushed to a downstream channel (either `verifica
 
 ### Q2. Verification Overlap — How are multi-detector chunks handled, and what triggers `errOverlap`?
 
-**Answer:** When `scannerWorker` finds that more than one detector keyword-matched a decoded chunk (and `--allow-verification-overlap` is off), the chunk is routed to `verificationOverlapWorker` (`pkg/engine/engine.go` lines 924–1034). The overlap worker runs every matching detector's `FromData` with **verification disabled** (line 944), then for each result computes `chunkSecretKey{secret, detectorKey}` and calls `likelyDuplicate(ctx, key, chunkSecrets)`. `likelyDuplicate` (lines 887–922) compares the result's secret against every secret previously produced on this chunk; it requires cross-detector pairing (`val.detectorKey.Type() != dupeKey.detectorKey.Type()`, line 900), length within 10% (line 894), and either exact string equality (line 906) or Levenshtein similarity strictly greater than 0.9 (lines 911–914). When `likelyDuplicate` returns true, `res.SetVerificationError(errOverlap)` is attached (line 988), the overlap-tracker is incremented (line 987), `processResult` is invoked directly (line 991), and the detector is removed from the re-verification list (line 1004). Non-duplicate detectors are re-routed to `detectableChunksChan` with verification re-enabled (lines 1017–1026).
+**Answer:** When `scannerWorker` finds that more than one detector keyword-matched a decoded chunk (and `--allow-verification-overlap` is off), the chunk is routed to `verificationOverlapWorker` (`pkg/engine/engine.go` lines 924–1034). The overlap worker runs every matching detector's `FromData` with **verification disabled** (line 940), then for each result computes `chunkSecretKey{secret, detectorKey}` and calls `likelyDuplicate(ctx, key, chunkSecrets)`. `likelyDuplicate` (lines 887–922) compares the result's secret against every secret previously produced on this chunk; it requires cross-detector pairing (`val.detectorKey.Type() != dupeKey.detectorKey.Type()`, line 900), length within 10% (line 894), and either exact string equality (line 906) or Levenshtein similarity strictly greater than 0.9 (lines 911–914). When `likelyDuplicate` returns true, `res.SetVerificationError(errOverlap)` is attached (line 988), the overlap-tracker is incremented (line 987), `processResult` is invoked directly (line 991), and the detector is removed from the re-verification list (line 1004). Non-duplicate detectors are re-routed to `detectableChunksChan` with verification re-enabled (lines 1011–1020).
 
-#### Thinking / Rationale
+#### Thinking / Rationale — Q2
 
-The overlap worker exists to prevent the same secret from being sent to **two different provider APIs** for verification — once the engine realises that detector A and detector B both matched the same credential bytes, it cannot safely verify via both because that would leak the credential to the wrong vendor's API. The `errOverlap` message literally reads: *"More than one detector has found this result. For your safety, verification has been disabled."* (`pkg/engine/engine.go` lines 39–42). The code makes this safety decision *before* verification by invoking `FromData(ctx, false, ...)` (line 944) — the `false` flag disables API calls.
+The overlap worker exists to prevent the same secret from being sent to **two different provider APIs** for verification — once the engine realises that detector A and detector B both matched the same credential bytes, it cannot safely verify via both because that would leak the credential to the wrong vendor's API. The `errOverlap` message literally reads: *"More than one detector has found this result. For your safety, verification has been disabled."* (`pkg/engine/engine.go` lines 39–42). The code makes this safety decision *before* verification by invoking `FromData(ctx, false, ...)` (line 940) — the `false` flag disables API calls.
 
 I validated the exact trigger conditions by reading `likelyDuplicate` (lines 887–922) line-by-line:
 - Same-detector results are explicitly excluded (line 900) — this is why "AWS finds the same key twice in one chunk" never triggers `errOverlap`.
@@ -786,7 +814,7 @@ I validated the exact trigger conditions by reading `likelyDuplicate` (lines 887
 The runtime path for a duplicate result is:
 1. `res.SetVerificationError(errOverlap)` at line 988 attaches the error to the result itself.
 2. `e.processResult(ctx, detectableChunk{...}, res, isFalsePositive)` at line 991 sends the result into the normal `processResult` flow (which sets line numbers, copies metadata, etc., and ultimately writes to `e.results`).
-3. `delete(detectorKeysWithResults, detector.Key)` at line 1004 prevents the detector from being re-enqueued for verification on line 1017-1026.
+3. `delete(detectorKeysWithResults, detector.Key)` at line 1004 prevents the detector from being re-enqueued for verification on lines 1011–1020.
 
 The result therefore reaches the notifier with `Verified=false` and `VerificationError=errOverlap`, which the notifier classifies as "unknown" (engine.go lines 1194–1198). The user sees it with a `VerificationError` field populated with the `errOverlap` message text.
 
@@ -807,7 +835,7 @@ I also confirmed in the repository's own tests that this is the behaviour:
 
 Because the key excludes `DecoderType`, a secret appearing in multiple decoded variants produces multiple in-flight results sharing the same key; only one survives. Under concurrent execution, the survivor is whichever result reaches `dedupeCache.Add` (line 1221) first, and goroutine scheduling makes that non-deterministic.
 
-#### Thinking / Rationale
+#### Thinking / Rationale — Q3
 
 The design intent is captured plainly by the comment at lines 1210–1215: the engine wants to *collapse* variants of the same secret that came through different decoders (so the user doesn't see three rows for one secret), but it wants to *retain* same-decoder duplicates (because those represent genuinely distinct findings — e.g. the same key present twice in a file).
 
@@ -837,7 +865,7 @@ This pattern confirms that the non-determinism is *not* a bug in the dedup logic
 
 **Dedup is always the last stage.** Concurrency introduces non-determinism specifically at the transitions between channels (steps 4→5, 4→6, 5→6, 6→7), because each channel is drained by multiple goroutines whose execution order is controlled by the Go runtime scheduler and the OS thread scheduler.
 
-#### Thinking / Rationale
+#### Thinking / Rationale — Q4
 
 I reconstructed the end-to-end flow by reading `startWorkers` (`engine.go` lines 646–660) and `Finish` (lines 723–742). The shutdown sequence in `Finish` — close `verificationOverlapChunksChan` (line 730), wait for overlap workers, close `detectableChunksChan` (line 733), wait for detector workers, close `results` (line 736), wait for notifier workers — is the most definitive proof of the stage ordering. It guarantees that every chunk in flight visits scanner → overlap (if applicable) → detector → notifier before the engine exits.
 
@@ -856,14 +884,14 @@ Importantly, the dedup cache itself is **thread-safe** (`hashicorp/golang-lru/v2
 
 **Answer:** Four mechanisms interact to determine the result count:
 
-1. **Dedup-key distinctness.** Results with different `DetectorType`, `Raw`, `RawV2`, or `SourceMetadata` are never deduped. Two files → two different `SourceMetadata` → two results (Experiment G, [§11.6](#116-experiment-i--two-separate-files-with-identical-secrets)). Chunks larger than 10 KB are split by `sources/chunker.go` and have different per-chunk `SourceMetadata`, so each split produces its own result.
+1. **Dedup-key distinctness.** Results with different `DetectorType`, `Raw`, `RawV2`, or `SourceMetadata` are never deduped. Two files → two different `SourceMetadata` → two results (Experiment I, [§11.9](#119-experiment-i--two-separate-files-with-identical-secrets)). Chunks larger than 10 KB are split by `sources/chunker.go` and have different per-chunk `SourceMetadata`, so each split produces its own result.
 2. **Decoder race outcome.** When the same chunk produces multiple non-nil decoder variants all containing the same secret, multiple in-flight results share the same dedup key but differ in `DecoderType`. Only one survives dedup, and which one depends on goroutine scheduling.
 3. **Aho-Corasick multi-span.** When a decoded chunk contains the same keyword at two non-overlapping locations (classically, BASE64's in-place substitution duplicates the AKIA string inside the decoded chunk), Aho-Corasick produces two spans, `detectChunk` calls `FromData` per span (line 1062), and two results with identical dedup keys *and* identical `DecoderType` are produced. Per the dedup rule on line 1217, same-decoder duplicates are kept → 2 results.
 4. **`--allow-verification-overlap` flag.** The flag only controls the routing at `scannerWorker` line 796 and therefore whether `errOverlap` is attached to results. It does **not** change the final dedup outcome (dedup is unaffected), so the count of surviving results on a single-file single-chunk scan is typically unchanged.
 
 Combining these: if BASE64 wins the race on a chunk where Aho-Corasick produced 2 BASE64 spans, the user sees **2 results**; if PLAIN wins on the same chunk, the user sees **1 result**. This is the "1-or-2" bimodality observed in Experiment D ([§11.4](#114-experiment-d--well-separated-plain--base64-1-or-2-results-per-run)).
 
-#### Thinking / Rationale
+#### Thinking / Rationale — Q5
 
 I arrived at this decomposition by reasoning about each of the four mechanisms in isolation and then validating their interaction experimentally:
 
@@ -900,7 +928,7 @@ All runs used `--no-verification --json`. The AWS test credentials (test-only st
   ```
 - **Command:** `/tmp/trufflehog_bin filesystem --directory=/tmp/trufflehog_tests/A --no-verification --json`
 - **Observed:** Exactly 1 result with `DecoderName=PLAIN`, `DetectorName=AWS`, `Redacted=AKIAWARWQKZNHMZBLY4I`. Deterministic across all runs.
-- **Interpretation:** Only UTF8/PLAIN returns non-nil for this input. BASE64 requires a ≥20-char base64 run — the input contains none. UTF16 requires paired-null bytes — none. ESCAPED_UNICODE requires `\u` or `U+` escapes — none. Single decoded chunk → single `FromData` call → single result → single dispatch.
+- **Interpretation:** Only UTF8/PLAIN returns non-nil for this input. BASE64 requires a base64-alphabet run of at least 21 characters (strict `>` comparison against threshold=20) — the input contains none. UTF16 requires paired-null bytes — none. ESCAPED_UNICODE requires `\u` or `U+` escapes — none. Single decoded chunk → single `FromData` call → single result → single dispatch.
 
 ### 11.2 Experiment B — Base64-encoded AWS key only
 
@@ -1026,7 +1054,7 @@ Confirms the trigger conditions detailed in [§3.2](#32-per-decoder-behaviour).
 
 A standalone Go program invoked `AhoCorasickCore.FindDetectorMatches` directly on a range of inputs:
 
-- Input `AWS_ACCESS_KEY_ID=AKIAWARWQKZNHMZBLY4I\nAWS_SECRET_ACCESS_KEY=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\n`: **2 matching detectors — AWS and Voiceflow** (Voiceflow's `"vf"` keyword appears in the lowercased secret at position 65 → `il6DVFpx…`).
+- Input `AWS_ACCESS_KEY_ID=AKIAWARWQKZNHMZBLY4I\nAWS_SECRET_ACCESS_KEY=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\n`: **2 matching detectors — AWS and Voiceflow** (Voiceflow's `"vf"` keyword appears at byte offset 65 of the full lowercased decoded chunk — counted from the start of the input: 18 bytes for `aws_access_key_id=` + 20 bytes for the AKIA key + 1 newline + 22 bytes for `aws_secret_access_key=` + 4 bytes of the secret to reach `vf` inside `il6DVFpx…`; it is *not* an offset within the secret alone).
 - Input `AKIAWARWQKZNHMZBLY4I` only: **1 matching detector — AWS**.
 - Input raw base64 text (no AKIA in the alphabet): **1 matching detector — Voiceflow** (the lowercased base64 alphabet happens to contain `"dm"` at some position). After Base64 decoding, the decoded bytes produce both AWS and Voiceflow matches again.
 
@@ -1044,7 +1072,7 @@ Confirms the multi-detector routing condition on `engine.go` line 796 fires for 
 | `pkg/decoders/utf8.go` lines 16–29 | `(*UTF8).FromChunk` — always fires for non-empty input; sanitises invalid UTF-8 via `extractSubstrings` |
 | `pkg/decoders/base64.go` lines 16–21 | `b64Charset` covering StdEncoding and RawURLEncoding alphabets |
 | `pkg/decoders/base64.go` lines 30–32 | `(*Base64).Type()` returns `DecoderType_BASE64` |
-| `pkg/decoders/base64.go` lines 34–72 | `(*Base64).FromChunk` — 20-char threshold, StdEncoding + RawURLEncoding, in-place substitution, returns nil if no substring decodes |
+| `pkg/decoders/base64.go` lines 34–72 | `(*Base64).FromChunk` — threshold=20 with strict `>` comparison (requires ≥21-char runs), StdEncoding + RawURLEncoding attempted unconditionally, sequential `bytes.Buffer`+`bytes.Index` in-place substitution, returns nil if no substring decodes |
 | `pkg/decoders/utf16.go` lines 14–16 | `(*UTF16).Type()` returns `DecoderType_UTF16` |
 | `pkg/decoders/utf16.go` lines 18–33 | `(*UTF16).FromChunk` — calls `utf16ToUTF8`; returns nil if output empty |
 | `pkg/decoders/utf16.go` lines 35–52 | `utf16ToUTF8` heuristic BE/LE detection |
