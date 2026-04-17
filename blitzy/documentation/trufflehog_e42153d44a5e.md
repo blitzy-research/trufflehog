@@ -69,7 +69,7 @@ flowchart LR
 
 ### 2.2 Worker Sequence (from `docs/concurrency.md`)
 
-The Mermaid sequence below recreates the worker topology from `docs/concurrency.md` lines 5–42. Each participant maps to a function in `pkg/engine/engine.go`.
+The Mermaid sequence below recreates the worker topology from `docs/concurrency.md` lines 5–43. Each participant maps to a function in `pkg/engine/engine.go`.
 
 ```mermaid
 sequenceDiagram
@@ -459,7 +459,7 @@ var errOverlap = errors.New(
 
 This is the canonical overlap error message. When a duplicate is detected, it is attached to the candidate result via `Result.SetVerificationError(errOverlap)` (line 988). Because the result now has a non-nil verification error, it is classified as **"unknown"** (neither verified nor unverified) by `notifierWorker` (lines 1194–1198); the user sees it only when `--results` includes `unknown` (the default).
 
-The `errOverlap` result is dispatched to `e.results` via a direct `e.processResult` call (line 991) — it **bypasses the detector worker** and goes straight into `notifierWorker`'s dedup path.
+The `errOverlap` result is dispatched to `e.results` via a direct `e.processResult` call (line 989) — it **bypasses the detector worker** and goes straight into `notifierWorker`'s dedup path.
 
 ### 5.4 The `likelyDuplicate` Algorithm
 
@@ -490,7 +490,7 @@ func likelyDuplicate(ctx context.Context, val chunkSecretKey, dupes map[chunkSec
 Three gating conditions apply in order:
 - **Length guard** (line 894) — rejects pairs whose lengths differ by more than 10%, which bounds the cost of the Levenshtein metric. A 40-char AWS secret compared against a 26-char hash, for example, is skipped without computing a Levenshtein distance.
 - **Same-detector skip** (line 900) — *different* detector types are required for a "duplicate". Two AWS findings on the same chunk are never flagged as overlap, which is why the common "AWS finds the same key twice in one chunk" scenario does not trigger `errOverlap`.
-- **Exact match or ε-near match** — exact string equality (line 906) returns `true` immediately; otherwise Levenshtein similarity from `github.com/adrg/strutil/metrics` is computed and compared strictly greater than `0.9`. The ordering reads: `similarity > similarityThreshold` (line 914), so a similarity of exactly 0.9 returns `false`.
+- **Exact match or ε-near match** — exact string equality (line 904) returns `true` immediately; otherwise Levenshtein similarity from `github.com/adrg/strutil/metrics` is computed and compared strictly greater than `0.9`. The ordering reads: `similarity > similarityThreshold` (line 914), so a similarity of exactly 0.9 returns `false`.
 
 ### 5.5 When No Cross-Detector Duplicate Exists
 
@@ -800,7 +800,7 @@ Because each non-nil variant is pushed to a downstream channel (either `verifica
 
 ### Q2. Verification Overlap — How are multi-detector chunks handled, and what triggers `errOverlap`?
 
-**Answer:** When `scannerWorker` finds that more than one detector keyword-matched a decoded chunk (and `--allow-verification-overlap` is off), the chunk is routed to `verificationOverlapWorker` (`pkg/engine/engine.go` lines 924–1034). The overlap worker runs every matching detector's `FromData` with **verification disabled** (line 940), then for each result computes `chunkSecretKey{secret, detectorKey}` and calls `likelyDuplicate(ctx, key, chunkSecrets)`. `likelyDuplicate` (lines 887–922) compares the result's secret against every secret previously produced on this chunk; it requires cross-detector pairing (`val.detectorKey.Type() != dupeKey.detectorKey.Type()`, line 900), length within 10% (line 894), and either exact string equality (line 906) or Levenshtein similarity strictly greater than 0.9 (lines 911–914). When `likelyDuplicate` returns true, `res.SetVerificationError(errOverlap)` is attached (line 988), the overlap-tracker is incremented (line 987), `processResult` is invoked directly (line 991), and the detector is removed from the re-verification list (line 1004). Non-duplicate detectors are re-routed to `detectableChunksChan` with verification re-enabled (lines 1011–1020).
+**Answer:** When `scannerWorker` finds that more than one detector keyword-matched a decoded chunk (and `--allow-verification-overlap` is off), the chunk is routed to `verificationOverlapWorker` (`pkg/engine/engine.go` lines 924–1034). The overlap worker runs every matching detector's `FromData` with **verification disabled** (line 940), then for each result computes `chunkSecretKey{secret, detectorKey}` and calls `likelyDuplicate(ctx, key, chunkSecrets)`. `likelyDuplicate` (lines 887–922) compares the result's secret against every secret previously produced on this chunk; it requires cross-detector pairing (`val.detectorKey.Type() != dupeKey.detectorKey.Type()`, line 900), length within 10% (line 894), and either exact string equality (line 904) or Levenshtein similarity strictly greater than 0.9 (lines 911–914). When `likelyDuplicate` returns true, `res.SetVerificationError(errOverlap)` is attached (line 988), the overlap-tracker is incremented (line 986), `processResult` is invoked directly (line 989), and the detector is removed from the re-verification list (line 1004). Non-duplicate detectors are re-routed to `detectableChunksChan` with verification re-enabled (lines 1011–1020).
 
 #### Thinking / Rationale — Q2
 
@@ -813,7 +813,7 @@ I validated the exact trigger conditions by reading `likelyDuplicate` (lines 887
 
 The runtime path for a duplicate result is:
 1. `res.SetVerificationError(errOverlap)` at line 988 attaches the error to the result itself.
-2. `e.processResult(ctx, detectableChunk{...}, res, isFalsePositive)` at line 991 sends the result into the normal `processResult` flow (which sets line numbers, copies metadata, etc., and ultimately writes to `e.results`).
+2. `e.processResult(ctx, detectableChunk{...}, res, isFalsePositive)` at line 989 sends the result into the normal `processResult` flow (which sets line numbers, copies metadata, etc., and ultimately writes to `e.results`).
 3. `delete(detectorKeysWithResults, detector.Key)` at line 1004 prevents the detector from being re-enqueued for verification on lines 1011–1020.
 
 The result therefore reaches the notifier with `Verified=false` and `VerificationError=errOverlap`, which the notifier classifies as "unknown" (engine.go lines 1194–1198). The user sees it with a `VerificationError` field populated with the `errOverlap` message text.
@@ -1123,7 +1123,7 @@ Confirms the multi-detector routing condition on `engine.go` line 796 fires for 
 | `pkg/output/json.go` line 42 | `DecoderName` field in JSON output struct |
 | `pkg/output/json.go` line 65 | `DecoderName: r.DecoderType.String()` — how the enum becomes the user-visible name |
 | `docs/process_flow.md` lines 7–26 | 4-stage pipeline Mermaid flowchart |
-| `docs/concurrency.md` lines 5–42 | Worker sequence Mermaid diagram |
+| `docs/concurrency.md` lines 5–43 | Worker sequence Mermaid diagram |
 | `go.mod` lines 3, 5 | `go 1.23.1`, `toolchain go1.24.2` |
 | `Makefile` | `CGO_ENABLED=0 go install .` build target |
 | `main.go` | CLI entry point |
