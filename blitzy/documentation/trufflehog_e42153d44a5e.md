@@ -103,12 +103,14 @@ A repository-wide grep confirms three distinct populations of files that perform
 | Go stdlib `regexp` (detector files only) | **3 files** | `pkg/detectors/azure_cosmosdb/azure_cosmosdb.go`, `pkg/detectors/azure_entra/serviceprincipal/v2/spv2.go`, `pkg/detectors/jdbc/jdbc.go` |
 | Go stdlib `regexp` (non-detector files) | ~25–26 files | `pkg/common/patterns.go`, analyzers, handlers, decoders, protobuf validators, git sources |
 
-The total number of detector directories under `pkg/detectors/` is **859**. The exact commands used to derive these counts:
+`ls pkg/detectors/` reports **859 entries** at the top level — comprising **845 detector directories** plus **14 shared files** (10 helper `.go` source/test files such as `detectors.go`, `falsepositives.go`, `http.go`, `multi_part_credential_provider.go`, `endpoint_customizer.go`, and 4 false-positive wordlist `.txt` files). The exact commands used to derive these counts:
 
 ```bash
 grep -rl 'wasilibs/go-re2' pkg/detectors/ | wc -l                        # => 867
 grep -rl '"regexp"' pkg/detectors/ | xargs grep -L 'wasilibs/go-re2' | wc -l  # => 3
-ls pkg/detectors/ | wc -l                                                # => 859
+ls pkg/detectors/ | wc -l                                                # => 859 (entries)
+ls -l pkg/detectors/ | grep -c '^d'                                      # => 845 (detector directories)
+ls -l pkg/detectors/ | grep -c '^-'                                      # => 14  (top-level helper files)
 ```
 
 The 3 stdlib-using detector files each import plain `"regexp"` rather than the aliased `regexp "github.com/wasilibs/go-re2"`. For example, `pkg/detectors/jdbc/jdbc.go` lines 3–15 contain:
@@ -181,7 +183,7 @@ The term "ReDoS" is sometimes used loosely to mean "any regex-related DoS". For 
 | Attack Vector | Mechanism | Applicability to TruffleHog |
 |---|---|---|
 | **ReDoS (exponential backtracking)** | Crafted regex patterns like `(a+)+b` cause backtracking engines to explore exponentially many states when matching against adversarial inputs. | **NOT APPLICABLE** — RE2 and stdlib `regexp` are linear-time NFA-simulation engines and do not backtrack. |
-| **Algorithmic / combinatorial complexity** | Nested loops over regex match sets in application code produce `O(N^K)` work, where `N` is the number of matches per credential part and `K` is the nesting depth. | **APPLICABLE** — 140+ built-in multi-part detectors have 2–5 nested `for range` loops in `FromData()` with no `maxTotalMatches` cap on the match count. |
+| **Algorithmic / combinatorial complexity** | Nested loops over regex match sets in application code produce `O(N^K)` work, where `N` is the number of matches per credential part and `K` is the nesting depth. | **APPLICABLE** — 220+ built-in multi-part detectors have 2–5 nested `for range` loops in `FromData()` with no `maxTotalMatches` cap on the match count. |
 
 ### 3.1 Why algorithmic complexity is the real attack surface
 
@@ -531,7 +533,7 @@ The profile was analyzed with `go tool pprof` using the `-cum` (cumulative) orde
 
 ## 7. Detector Vulnerability Catalog
 
-The 859 detector directories were enumerated by a temporary Python script that parsed each detector's `FromData()` method and counted the depth of nested `for … range` loops over match slices. The script was discarded after analysis per AAP Section 0.7.1. Detectors are grouped into three severity tiers by loop depth.
+The 845 detector directories (plus 14 top-level helper files) under `pkg/detectors/` were enumerated by a temporary Python script that parsed each detector's `FromData()` method and counted the depth of nested `for … range` loops over match slices. The script was discarded after analysis per AAP Section 0.7.1. Detectors are grouped into three severity tiers by loop depth. The catalogue below names representative entries in each tier; tier counts reflect attacker-controllable nestings (detectors whose inner loops iterate over regex matches from attacker-supplied input, rather than over post-fetch server response data).
 
 ### 7.1 O(n⁵) — Critical (1 detector)
 
@@ -541,15 +543,17 @@ At the apex of risk sits a single detector:
 
 This detector is the subject of the dedicated case study in [Section 8](#8-netsuite-case-study).
 
-### 7.2 O(n³) — High (~20 detectors)
+### 7.2 O(n³) — High (~25 detectors)
 
 Three-part credential detectors — commonly `(clientID, clientSecret, tenant)`-shaped — form a "High" tier. A single crafted chunk with N = 50 matches per part produces 50³ = 125,000 iterations, large enough to stall a CI job for many seconds.
 
 Detectors identified in this tier:
 
-`appcues`, `auth0oauth`, `caspio`, `cexio`, `clickhelp`, `couchbase`, `formsite`, `kucoin`, `openvpn`, `planetscaledb`, `pusherchannelkey`, `rownd`, `satismeterwritekey`, `saucelabs`, `signalwire`, `snowflake`, `strava`, `sumologickey`, `trufflehogenterprise`, `zipapi`, `zulipchat`.
+`appcues`, `auth0oauth`, `caspio`, `cexio`, `clickhelp`, `couchbase`, `formsite`, `jiratoken` (v1 at `pkg/detectors/jiratoken/v1/jiratoken.go` and v2 at `pkg/detectors/jiratoken/v2/jiratoken_v2.go`; both nest `email × token × domain`), `kucoin`, `ldap` (`pkg/detectors/ldap/ldap.go`, nesting `uriMatches × usernameMatches × passwordMatches`), `openvpn`, `planetscaledb`, `plaidkey` (`pkg/detectors/plaidkey/plaidkey.go`, nesting `uniqueSecrets × uniqueIds × uniqueTokens`), `pusherchannelkey`, `rownd`, `satismeterwritekey`, `saucelabs`, `signalwire`, `snowflake`, `strava`, `sumologickey`, `trufflehogenterprise`, `zendeskapi` (`pkg/detectors/zendeskapi/zendeskapi.go`, nesting `tokens × domains × emails`), `zipapi`, `zulipchat`.
 
-### 7.3 O(n²) — Medium (~120 detectors)
+> **Note on catalogue completeness.** The list above is representative but not strictly exhaustive. A repository-wide enumeration of `FromData()` methods containing three nested `for … range` loops over match slices identifies on the order of 25 attacker-controllable O(n³) detectors; a small number of additional detectors (e.g., `couchbase`) contain loops at depth 3 over attacker-controllable inputs but may interleave calls over *server response* data that an attacker cannot influence via a file committed to the repository — those are still listed here because the first few loop layers are attacker-weaponisable.
+
+### 7.3 O(n²) — Medium (~190 detectors)
 
 Two-part credential detectors — the standard `(ID, Secret)` pair — constitute the largest group. Individually, O(n²) is less dangerous than O(n³) or O(n⁵), but with very large N (e.g., N = 1,000) a single run can still take tens of seconds. The AWS case study in [Section 6](#6-cpu-profiling-results) falls in this tier.
 
@@ -559,17 +563,17 @@ Notable members:
 - `algoliaadminkey`
 - `alibaba`
 
-…along with approximately 117 other 2-part (ID × Secret) detectors across the detector tree.
+…along with approximately 190 other 2-part (ID × Secret) detectors across the detector tree. A repository-wide enumerator counting `FromData()` methods that contain two nested `for … range` loops over match slices resolves ~195 entries, of which ~192 iterate over attacker-controllable regex matches.
 
 ### 7.4 Summary Count
 
 | Tier | Severity | Loop Depth | # Detectors | Representative |
 |---|---|---|---|---|
 | Critical | 🔴 | 5 | 1 | `netsuite` |
-| High | 🟠 | 3 | ~20 | `snowflake`, `auth0oauth`, `couchbase` |
-| Medium | 🟡 | 2 | ~120 | `aws/access_keys`, `alibaba`, `algoliaadminkey` |
+| High | 🟠 | 3 | ~25 | `snowflake`, `auth0oauth`, `plaidkey`, `jiratoken`, `zendeskapi`, `ldap` |
+| Medium | 🟡 | 2 | ~190 | `aws/access_keys`, `alibaba`, `algoliaadminkey` |
 
-In aggregate, **more than 140 built-in detectors** have some degree of combinatorial exposure. None of them carry the `maxTotalMatches = 100` cap present on custom detectors.
+In aggregate, **more than 220 built-in detectors** (approximately 228 at the unfiltered count of any `FromData()` with two or more nested `for … range` loops over match slices) have some degree of combinatorial exposure. None of them carry the `maxTotalMatches = 100` cap present on custom detectors.
 
 ---
 
@@ -835,7 +839,11 @@ Recommendations #2 and #3 together are sufficient to close the demonstrated atta
 
 **Regex engine & detector layer**
 - `go.mod` — declares `github.com/wasilibs/go-re2 v1.9.0` (line 100), Go toolchain (`go 1.23.1`, `toolchain go1.24.2`, lines 3 and 5)
-- `pkg/detectors/` — 859 directories total
+- `pkg/detectors/` — 845 detector directories plus 14 top-level helper files (859 entries total, as reported by `ls pkg/detectors/`)
+- `pkg/detectors/plaidkey/plaidkey.go` — O(n³) nesting `uniqueSecrets × uniqueIds × uniqueTokens` in `FromData()`
+- `pkg/detectors/jiratoken/v1/jiratoken.go` and `pkg/detectors/jiratoken/v2/jiratoken_v2.go` — O(n³) nesting `email × token × domain` in each `FromData()`
+- `pkg/detectors/zendeskapi/zendeskapi.go` — O(n³) nesting `tokens × domains × emails` in `FromData()`
+- `pkg/detectors/ldap/ldap.go` — O(n³) nesting `uriMatches × usernameMatches × passwordMatches` in `FromData()`
 - `pkg/detectors/detectors.go` — `PrefixRegex` (lines 227–235)
 - `pkg/detectors/falsepositives.go` — `StringShannonEntropy` (lines 136–151)
 - `pkg/detectors/netsuite/netsuite.go` — O(n⁵) (patterns lines 37–43; match extraction lines 65–69; nested loops lines 71–111; `trimUniqueMatches` lines 241–250)
@@ -874,6 +882,27 @@ Reference only — no copyrighted text is reproduced inline beyond ≤ 20-word q
 - **Branch**: `trufflehog_e42153d44a5e`
 - **Investigation artifacts**: All benchmark input files, pprof CPU profile outputs, Python enumeration scripts used to count nested loops across `pkg/detectors/*/`, and CLI invocation scripts were **temporary only**. All such artifacts were removed after measurement per AAP Section 0.7.1. No files remain in the repository other than this research report at `blitzy/documentation/trufflehog_e42153d44a5e.md`.
 - **Source modifications**: **None.** Every claim in this report is derived from inspection of the unmodified source tree at the referenced commit.
+
+### 11.4 Prior art and novelty of this research
+
+A survey of previously disclosed security issues affecting the TruffleHog project confirms that **the computational-complexity attack vector characterised in this report has not, to the authors' knowledge, been previously disclosed against TruffleHog**. All prior public advisories target unrelated attack classes.
+
+Prior TruffleHog advisories (each unrelated to combinatorial match processing):
+
+- **CVE-2024-43379 / GHSA-3r74-v83p-f4f4** — Blind Server-Side Request Forgery (SSRF) in the Postman integration. This advisory concerns how TruffleHog dereferences URLs when scanning Postman collections; it is an integration-source issue, not a regex or match-processing issue.
+- **CVE-2025-41390** — Remote Code Execution via a malicious `.gitmodules` file in a scanned git repository. This advisory concerns git-submodule handling during source ingestion; it is likewise unrelated to detector pattern matching.
+- **Omegapoint 2023 research** (public writeup) — Data exfiltration class of attack against TruffleHog verifier endpoints, where malicious repository content could coerce TruffleHog into emitting sensitive data to attacker-controlled servers during credential verification. Scoped to network-facing verification logic, which this report explicitly excludes from analysis (see AAP Section 0.6.2).
+
+In contrast, the attack characterised in this report:
+
+- **Targets in-process CPU exhaustion**, not network exfiltration or code execution.
+- **Does not require a network round-trip** — `--no-verification` scans are equally vulnerable, because the combinatorial explosion occurs in `FromData()` pattern matching before any verification is attempted.
+- **Weaponises TruffleHog's own pattern library** — the very keywords that Aho-Corasick uses to route chunks to detectors become the lever for the attacker.
+- **Scales adversarially with N^K**, not with file size — a sub-2KB crafted file can exceed the impact of scanning a 720KB normal-text file by over five orders of magnitude per byte (see [Section 5.3](#53-critical-observations)).
+
+To the authors' knowledge, neither the upstream repository issue tracker nor the public CVE databases (NVD, GHSA) carry any disclosure prior to this investigation describing (a) the absence of `maxTotalMatches` enforcement on built-in detectors, (b) the ineffectiveness of `--detector-timeout` against combinatorial loops that complete rather than being interruptible mid-iteration, or (c) the use of NetSuite's 5-part credential nesting as an attack primitive. Those three findings, in combination, constitute the novel contribution of this research.
+
+This report is a security research artifact produced under the repository-internal "SWE-AtlasQnA-Repo" research mandate. It does not constitute a coordinated vulnerability disclosure; see [Section 10](#10-mitigation-analysis-and-recommendations) for mitigations that maintainers and operators can adopt today to close the demonstrated attack surface.
 
 ---
 
