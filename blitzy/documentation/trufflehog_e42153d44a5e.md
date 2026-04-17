@@ -251,8 +251,6 @@ To avoid invoking every detector on every chunk, TruffleHog compiles all detecto
 A crucial constant at `pkg/engine/ahocorasick/ahocorasickcore.go` line 155:
 
 ```go
-// defaultOffsetRadius is the default number of bytes surrounding a keyword
-// match to be included in the span of data sent to the detector.
 const defaultOffsetRadius int64 = 512
 ```
 
