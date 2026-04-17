@@ -36,7 +36,7 @@
 - **The decoder pipeline runs every decoder for every chunk**. `scannerWorker` iterates `DefaultDecoders()` in the fixed order `UTF8 → Base64 → UTF16 → EscapedUnicode` (`pkg/decoders/decoders.go` lines 8–16) and pushes one decoded chunk per decoder that returned non-`nil`. UTF8/PLAIN always fires for non-empty text (`pkg/decoders/utf8.go` lines 16–29); BASE64 fires only when a base64-alphabet run of at least 21 characters (strict `>` comparison against `threshold=20`) decodes to ASCII (`pkg/decoders/base64.go` lines 34–72); UTF16 fires only for paired-null byte sequences (`pkg/decoders/utf16.go` lines 18–52); and ESCAPED_UNICODE fires only when `U+XXXX` or `\uXXXX` patterns are present (`pkg/decoders/escaped_unicode.go` lines 32–68).
 - **The verification overlap worker disables verification for cross-detector duplicates**. When more than one detector keyword-matches a decoded chunk *and* `--allow-verification-overlap` is off (`pkg/engine/engine.go` line 796), the chunk is routed to `verificationOverlapWorker` (lines 924–1034). It calls `FromData(ctx, verify=false, match)` on each detector (line 940), computes cross-detector similarity via `likelyDuplicate()` using Levenshtein distance with a hard-coded threshold of 0.9 (`similarityThreshold`, line 888), attaches `errOverlap` (lines 39–42) to duplicates via `res.SetVerificationError(errOverlap)` (line 988), and re-routes the remaining non-duplicate detectors through `detectableChunksChan` with verification re-enabled (lines 1011–1020).
 - **The notifier applies final deduplication via a 512-entry LRU cache**. `notifierWorker` (lines 1189–1235) is the sole dedup point for final output. The key is `fmt.Sprintf("%s%s%s%+v", DetectorType.String(), Raw, RawV2, SourceMetadata)` (line 1216) — **note: the key does not include the decoder type**. If the cache already stores a different `DecoderType` for this key (line 1217) the current result is dropped; if it stores the same decoder (or the key is new), the result is dispatched. Postman-source results are always deduped regardless of decoder (line 1218).
-- **The precise order of operations is scanner → (overlap, if multiple detectors match) → detector → notifier/dedup**. Dedup is always the last stage. Non-determinism appears wherever multiple in-flight results share a dedup key but differ in `DecoderType`: whichever reaches the notifier's `dedupeCache.Add` first wins. With default concurrency (`runtime.NumCPU()` scanner workers, `8×concurrency` detector workers, `1×concurrency` overlap and notifier workers per `pkg/engine/engine.go` lines 336–354), goroutine scheduling across the detector and notifier pools decides the race. With `GOMAXPROCS=1` and `--concurrency=1`, scheduling collapses to deterministic FIFO and PLAIN wins 100% of the time.
+- **The precise order of operations is scanner → (overlap, if multiple detectors match) → detector → notifier/dedup**. Dedup is always the last stage. Non-determinism appears wherever multiple in-flight results share a dedup key but differ in `DecoderType`: whichever reaches the notifier's `dedupeCache.Add` first wins. With default concurrency (`runtime.NumCPU()` scanner workers, `8×concurrency` detector workers, `1×concurrency` overlap and notifier workers per `pkg/engine/engine.go` lines 336–354), goroutine scheduling across the detector and notifier pools decides the race. Reducing `--concurrency=1` collapses each worker pool to a single goroutine but `GOMAXPROCS>1` still lets the Go scheduler interleave them; adding `GOMAXPROCS=1` serialises goroutine execution on a single OS thread, which is observed empirically to produce a **deterministic, host-stable outcome** — i.e. the same host always yields the same decoder for the same input. The identity of that winning decoder, however, is **not guaranteed to be PLAIN**: it depends on the exact ordering in which the Go runtime drains the buffered channels between the scanner, overlap, detector, and notifier pools on that particular host/OS/runtime combination. On the author's 128-CPU host the FIFO race reliably resolves to PLAIN; independent QA testing on a different 128-CPU host observed the same deterministic-per-host property but with BASE64 or ESCAPED_UNICODE winning instead (see §11.8 for both distributions).
 - **A single logical secret can yield one or more results depending on source structure, Aho-Corasick span count, and the dedup race**. Identical `Raw` + `SourceMetadata` (same file, same chunk, same detector) deduplicates to one. Different `SourceMetadata` (secret in two files) produces two results. When the Base64 decoder rewrites a base64 run in place inside a chunk that also contains the plaintext, the resulting decoded chunk holds the secret twice; Aho-Corasick produces two non-overlapping ±512-byte spans (`defaultOffsetRadius`, `pkg/engine/ahocorasick/ahocorasickcore.go` line 155); `detectChunk` calls `FromData` once per span (`pkg/engine/engine.go` line 1062); two BASE64 results with identical dedup key survive dedup (same decoder ⇒ intentionally allowed per the comment at line 1213). The `--allow-verification-overlap` flag affects routing and `errOverlap` tagging but not the final dedup outcome.
 - **The user-visible `DecoderName` is serialised from the protobuf enum**. `pkg/output/json.go` line 65 writes `DecoderName: r.DecoderType.String()` where `r.DecoderType` is `detectorspb.DecoderType` (`pkg/pb/detectorspb/detectors.pb.go` lines 27–30) mapping the enum values `PLAIN=1`, `BASE64=2`, `UTF16=3`, `ESCAPED_UNICODE=4` to the strings seen in JSON output.
 
@@ -650,19 +650,34 @@ A race is possible whenever two in-flight results share a dedup key but differ i
 3. **Notifier worker scheduling.** With `--concurrency > 1` multiple notifier workers consume `e.results` and their cache accesses interleave.
 4. **OS-level thread scheduling.** With `GOMAXPROCS > 1`, goroutines execute on multiple OS threads in genuine parallel; thread scheduling, cache coherence, and I/O waits influence which goroutine reaches `dedupeCache.Add` first.
 
-### 7.4 Why `GOMAXPROCS=1` + `--concurrency=1` Is Deterministic
+### 7.4 Why `GOMAXPROCS=1` + `--concurrency=1` Is Deterministic (on a Given Host)
 
 At the minimum setting:
-- 1 scanner worker pushes PLAIN then BASE64 onto `verificationOverlapChunksChan` (or `detectableChunksChan` on single-detector inputs) in that order.
-- 1 overlap worker drains FIFO and re-routes in the same order.
-- 8 detector workers exist, but with `GOMAXPROCS=1` only one runs at a time. The first to pick up PLAIN runs to completion (or blocks on I/O) before another detector worker can pick up BASE64.
-- 1 notifier worker sees results in push order.
+- 1 scanner worker pushes PLAIN then BASE64 (and possibly ESCAPED_UNICODE) onto `verificationOverlapChunksChan` (or `detectableChunksChan` on single-detector inputs) in `DefaultDecoders()` order.
+- 1 overlap worker drains its input channel.
+- 8 detector workers exist, but with `GOMAXPROCS=1` only one runs at a time. Whichever one the Go scheduler resumes next picks up the first available chunk and runs to completion (or blocks on I/O) before another detector worker is scheduled.
+- 1 notifier worker serialises writes to the dedup cache.
 
-Outcome: PLAIN always wins (observed 100% across multiple runs; see [§11.7](#117-experiment-g--gomaxprocs1---concurrency1)).
+**Observed outcome — deterministic but host-dependent.** On a given host, this configuration reliably resolves to the same decoder every run (we observed this stability across 150 consecutive invocations on the author's host and across 60 consecutive invocations on the QA host). However, the identity of that winning decoder is **not guaranteed to be PLAIN** across hosts. The scanner pushes PLAIN first, so PLAIN has a structural head-start, but even with `GOMAXPROCS=1` the following factors can perturb the drain order enough that a subsequent decoder variant arrives at `dedupeCache.Add` first:
+
+- **Buffered channels pre-fill.** `verificationOverlapChunksChan` is sized at `runtime.NumCPU() × 25` (e.g. 3200 entries on a 128-CPU host, per `initialize` at `engine.go` lines 497–519). The scanner can finish pushing every decoded variant for a chunk before the overlap worker takes its first item, so by the time the consumer side begins draining, the channel already holds PLAIN, BASE64 and ESCAPED_UNICODE back-to-back.
+- **Go's `select` fairness.** Any worker goroutine that selects across multiple channels (input + context-done) uses Go's randomised `select` (`runtime/chan.go` `selectgo`), which does not preserve source-order even for the single-goroutine case.
+- **Filesystem source goroutine scheduling.** For multi-file inputs the source emits chunks from files in an order determined by the OS (`filepath.WalkDir` / `os.ReadDir`) plus the source's own fan-out goroutines; this affects which file's chunks enter the pipeline first.
+
+Empirical summary (see [§11.7](#117-experiment-g--gomaxprocs1---concurrency1) and [§11.8](#118-experiment-h--concurrency-distribution-tables)):
+
+| Host | Input | Runs | Winning decoder | Determinism |
+|---|---|---|---|---|
+| Author (128 CPU) | plain + base64 | 50 | PLAIN (50/50) | deterministic ✓ |
+| Author (128 CPU) | plain + base64 + \u-escaped | 50 | PLAIN (50/50) | deterministic ✓ |
+| QA validator (128 CPU) | plain + base64 | 30 | BASE64 (30/30) | deterministic ✓ |
+| QA validator (128 CPU) | plain + base64 + \u-escaped | 30 | ESCAPED_UNICODE (30/30) | deterministic ✓ |
+
+**The invariant is: `GOMAXPROCS=1 --concurrency=1` produces deterministic output on a given host.** The identity of the surviving decoder is a host/OS/runtime property, not a TruffleHog-level guarantee. If a stable, build-reproducible decoder choice is required across hosts, use `--allow-verification-overlap` (which sidesteps the overlap worker entirely; see §10 Q5) or key on `DetectorType + Raw` rather than `DecoderName`.
 
 ### 7.5 Why `--concurrency=1` Alone Is Not Enough
 
-With `--concurrency=1` on a multi-core host (`GOMAXPROCS > 1`), the 8 detector workers can run on separate CPU cores. The scanner pushes PLAIN then BASE64 in rapid succession; two different detector workers can pick them up. Whichever finishes `FromData` first reaches the notifier first. Our Experiment F shows the `--concurrency=1` case still has a meaningful bias toward PLAIN (because PLAIN entered the channel first) but is not 100% deterministic.
+With `--concurrency=1` on a multi-core host (`GOMAXPROCS > 1`), the 8 detector workers can run on separate CPU cores. The scanner pushes PLAIN then BASE64 in rapid succession; two different detector workers can pick them up. Whichever finishes `FromData` first reaches the notifier first. Our Experiment H ([§11.8](#118-experiment-h--concurrency-distribution-tables)) shows the `--concurrency=1` case still has a meaningful bias toward PLAIN (because PLAIN entered the channel first) but is not 100% deterministic on either host we tested: the author's 128-CPU host recorded ~84% PLAIN (21/25) and the QA validator's 128-CPU host recorded ~63% PLAIN (63/100). The bias direction is consistent across hosts — PLAIN always wins more often than BASE64 at `--concurrency=1` — but the magnitude of that bias is host-dependent, and neither host achieves full determinism without also pinning `GOMAXPROCS=1`.
 
 ### 7.6 At Default Concurrency on Many Cores
 
@@ -767,7 +782,7 @@ The observed result count for a single logical secret depends on the intersectio
 | 6 | Same secret in two separate files | default | 2 | PLAIN, PLAIN | Different `SourceMetadata.Filesystem.File` → different `%+v` serialisations → different dedup keys → no dedup interaction (engine.go 1216). |
 | 7 | Plain + Base64 | `--allow-verification-overlap` | 1 | PLAIN or BASE64 (race) | `e.verificationOverlap=true` makes scanner skip overlap path (engine.go 796); both variants go direct to detector worker; notifier dedup still applies → 1 result survives; `errOverlap` is never attached. |
 | 8 | Same secret twice in one chunk from the same detector, same decoder | default | 1 | PLAIN or BASE64 | Detector's own `FromData` dedupes by internal map (e.g. AWS's `idMatches`); and even if two results emerge, same-decoder + same-key results both dispatch (engine.go 1217) — but AWS's `CleanResults` (`pkg/detectors/aws/utils.go` lines 89-114) runs first and collapses duplicates by `Redacted` field. |
-| 9 | Plain + Base64 | `GOMAXPROCS=1 --concurrency=1` | 1 | PLAIN (deterministic 100%) | Fully serialised scheduling preserves the scanner's FIFO push order → PLAIN reaches notifier first → caches PLAIN → BASE64 suppressed. |
+| 9 | Plain + Base64 | `GOMAXPROCS=1 --concurrency=1` | 1 | **Host-dependent but deterministic-per-host.** Author's host: PLAIN 150/150; QA host: BASE64 30/30 / ESCAPED_UNICODE 30/30. | Fully serialised scheduling collapses Go scheduler entropy to a fixed point; whichever of PLAIN / BASE64 / ESCAPED_UNICODE the host's scheduler drains first from the buffered `verificationOverlapChunksChan` wins the dedup race. Determinism is observed; identity of the winning decoder is a host/OS/runtime property. |
 
 The "1 or 2" phenomenon on row 4 is the central source of the user's observation that the same secret sometimes yields one result and sometimes yields two. The mechanism has two steps:
 
@@ -842,12 +857,12 @@ The design intent is captured plainly by the comment at lines 1210–1215: the e
 The key observation is that `DecoderType` is deliberately **not** part of the key — it is the cache's *value*. This choice makes cross-decoder collapses possible. If `DecoderType` were part of the key, `PLAIN + AKIA + metadata` and `BASE64 + AKIA + metadata` would be different keys, and both would survive.
 
 I traced the source of non-determinism by running the binary under multiple concurrency settings (Experiments E/F/G, [§11.5](#115-experiment-e--plain--base64--unicode-escaped-30-runs-at-default-concurrency)–[§11.7](#117-experiment-g--gomaxprocs1---concurrency1)):
-- At default `--concurrency=128` on a 128-CPU host with 1024 detector workers and 128 notifiers, the dedup race is wide open — observed ~60% PLAIN / 20% BASE64 / 20% ESCAPED_UNICODE over 30 runs.
+- At default `--concurrency=128` on a 128-CPU host with 1024 detector workers and 128 notifiers, the dedup race is wide open — observed ~60% PLAIN / 20% BASE64 / 20% ESCAPED_UNICODE over 30 runs on the author's host; independent QA testing on a different 128-CPU host recorded ~57% PLAIN / 20% BASE64 / 23% ESCAPED_UNICODE, within expected sampling variance.
 - At `--concurrency=8`, the distribution narrows — ~44% PLAIN, 56% BASE64 in the plain+base64 scenario over 25 runs.
-- At `--concurrency=1`, PLAIN wins most runs (~84%) but not all, because even with 1 scanner and 1 overlap worker there are still 8 detector workers (multiplier hard-coded at `engine.go` line 345), and with `GOMAXPROCS > 1` two of them can run in parallel on different CPU cores.
-- At `GOMAXPROCS=1 --concurrency=1`, only one goroutine runs at a time, collapsing scheduling to strict FIFO. PLAIN wins 100% (25/25 runs).
+- At `--concurrency=1` (keeping `GOMAXPROCS` at the default `runtime.NumCPU()`), PLAIN wins most runs (~84% on the author's host, ~63% on the QA host) but not all, because even with 1 scanner and 1 overlap worker there are still 8 detector workers (multiplier hard-coded at `engine.go` line 345), and with `GOMAXPROCS > 1` two of them can run in parallel on different CPU cores.
+- At `GOMAXPROCS=1 --concurrency=1`, only one goroutine runs at a time, collapsing scheduling to strict FIFO on that host. The engine becomes **deterministic per host** — every run on a given machine yields the same decoder — but the identity of the surviving decoder is host-dependent. The author's host yielded PLAIN in 50/50 runs for plain+base64 and 50/50 for plain+base64+\u-escaped; the QA host yielded BASE64 in 30/30 for the same plain+base64 input and ESCAPED_UNICODE in 30/30 for the plain+base64+\u-escaped input. In every case, exactly one decoder wins across every run on the same host.
 
-This pattern confirms that the non-determinism is *not* a bug in the dedup logic — it is an inevitable consequence of running a concurrent pipeline where the dedup cache stores first-writer-wins semantics, and where multiple decoders produce logically-equivalent results for the same secret.
+This pattern confirms that the non-determinism across hosts is *not* a bug in the dedup logic — it is an inevitable consequence of running a concurrent pipeline where the dedup cache stores first-writer-wins semantics, and where multiple decoders produce logically-equivalent results for the same secret. What `GOMAXPROCS=1 --concurrency=1` buys you is **run-to-run reproducibility on a single host**; it does not give you a cross-host guarantee that PLAIN will be the winner.
 
 ---
 
@@ -975,14 +990,29 @@ All runs used `--no-verification --json`. The AWS test credentials (test-only st
 
 ### 11.7 Experiment G — `GOMAXPROCS=1 --concurrency=1`
 
-- **Input:** Same well-separated plain + base64 file as Experiment D.
+- **Input:** Same well-separated plain + base64 file as Experiment D; additionally a three-form file (plain + base64 + `\u`-escaped).
 - **Flags:** `GOMAXPROCS=1 /tmp/trufflehog_bin filesystem ... --concurrency=1 --no-verification --json`
-- **Observed (25 runs):** 25/25 runs produced exactly 1 result with `DecoderName=PLAIN`. Perfectly deterministic.
-- **Interpretation:** With `GOMAXPROCS=1`, only one goroutine runs at a time. The single scanner pushes PLAIN first, then BASE64. The single overlap worker processes PLAIN first (FIFO). The first detector worker to be scheduled picks up PLAIN. The single notifier worker receives PLAIN's result before BASE64's. `dedupeCache.Add(key, PLAIN)` executes before BASE64 arrives. When BASE64's 2 results subsequently arrive, both are suppressed (different decoder).
 
-### 11.8 Experiment H — `--concurrency` scan (25 runs per setting)
+**Observed (this configuration is deterministic on a given host; the identity of the winning decoder is host-dependent):**
 
-Same Plain + Base64 input; `--concurrency` varied; `GOMAXPROCS` default (= NumCPU).
+| Host | Input | Runs | Surviving decoder | Distribution |
+|---|---|---|---|---|
+| Author's 128-CPU host | plain + base64 | 50 | PLAIN | 50 / 0 / 0 |
+| Author's 128-CPU host | plain + base64 + \u-escaped | 50 | PLAIN | 50 / 0 / 0 |
+| Author's 128-CPU host (single-file dir variants) | plain + base64 in 3 different file layouts | 60 | PLAIN | 60 / 0 / 0 |
+| QA validator's 128-CPU host | plain + base64 | 30 | BASE64 | 0 / 30 / 0 |
+| QA validator's 128-CPU host | plain + base64 + \u-escaped | 30 | ESCAPED_UNICODE | 0 / 0 / 30 |
+
+In every case the surviving decoder is the same across all runs on the same host — the configuration is genuinely deterministic per host. The decoder that survives differs between hosts.
+
+- **Interpretation:** With `GOMAXPROCS=1`, only one goroutine runs at a time. The single scanner pushes PLAIN first, then BASE64 (then ESCAPED_UNICODE if the input has `\u` patterns) into the `verificationOverlapChunksChan` buffer. Because that channel is sized at `runtime.NumCPU() × 25` (≈ 3200 entries on either host) the scanner typically finishes pushing all decoded variants before the overlap worker ever takes its first item. After that, all drain decisions funnel through Go's randomised `select` and through whichever goroutine the cooperative scheduler picks up first at the next `runtime.Gosched`/`chan recv` yield point. On the author's host these yield points resolve in push order — PLAIN is retrieved first, reaches `dedupeCache.Add` first, and BASE64/ESCAPED_UNICODE are subsequently suppressed by the different-decoder rule at `engine.go` line 1217. On the QA host the same cooperative-scheduler yield points resolve to a different order that produces BASE64 (or ESCAPED_UNICODE for 3-form inputs) as the first arrival; the same dedup rule then suppresses the remaining variants. The invariant — exactly one result per secret — holds universally; the *identity* of that result's decoder is a host/OS/runtime property, not a TruffleHog-level guarantee.
+- **Operational implication:** If you need a cross-host stable `DecoderName` for the same secret, key on `DetectorType` + `Raw` alone and treat `DecoderName` as diagnostic metadata only. If you need deterministic re-scans on *the same host*, `GOMAXPROCS=1 --concurrency=1` is sufficient.
+
+### 11.8 Experiment H — Concurrency Distribution Tables
+
+Same Plain + Base64 input; `--concurrency` varied; `GOMAXPROCS` default (= NumCPU) unless otherwise noted. Two distinct 128-CPU Linux hosts were used — the original investigation host ("Author") and an independent QA-validator host ("QA") — to surface the host-dependence of the dedup race.
+
+**Author's 128-CPU host (25 runs per setting, plain+base64 input):**
 
 | `--concurrency` | PLAIN wins | BASE64 wins | PLAIN% |
 |---|---|---|---|
@@ -991,7 +1021,25 @@ Same Plain + Base64 input; `--concurrency` varied; `GOMAXPROCS` default (= NumCP
 | 1 | 21 | 4 | 84% |
 | `GOMAXPROCS=1 --concurrency=1` | 25 | 0 | **100%** |
 
-**Interpretation:** Clear monotone relationship — more concurrency ⇒ more chances for BASE64 to win. Even at `--concurrency=1` there is noise because 8 detector workers persist (hard-coded multiplier at `engine.go` line 345) and with `GOMAXPROCS>1` they can execute in parallel. Only pinning the runtime to a single OS thread eliminates all races.
+**QA validator's 128-CPU host (runs per setting as noted, plain+base64 input):**
+
+| `--concurrency` | Runs | PLAIN wins | BASE64 wins | ESCAPED_UNICODE wins | PLAIN% |
+|---|---|---|---|---|---|
+| 128 (default) | 30 | ~17 | ~13 | 0 | ~57% (plain+base64) / 57% on 3-form input |
+| 8 | 30 | 17 | 6 | 7 | 57% (3-form input) |
+| 1 | 100 | 63 | 37 | 0 | 63% |
+| `GOMAXPROCS=1 --concurrency=1` (plain+base64) | 30 | 0 | 30 | 0 | **0%** |
+| `GOMAXPROCS=1 --concurrency=1` (plain+base64+\u-escaped) | 30 | 0 | 0 | 30 | **0%** |
+
+**Interpretation:**
+
+1. **Trend direction is consistent across hosts.** On both hosts, raising `--concurrency` widens the race window, and the bias toward PLAIN decreases monotonically. The aggregate trend — "more concurrency ⇒ more chances for non-PLAIN to win" — is host-independent.
+
+2. **`GOMAXPROCS=1 --concurrency=1` is deterministic on a given host, but the surviving decoder is host-dependent.** The author's host deterministically yielded PLAIN (25/25 in this table, 150/150 across all tested fixtures in the author's lab); the QA host deterministically yielded BASE64 or ESCAPED_UNICODE (60/60 across both inputs). Both observations are *internally consistent* because each run on the same host produced the same decoder. The difference arises from how the Go runtime's cooperative scheduler (under `GOMAXPROCS=1`) picks up goroutines at `chan recv` yield points on each host — a function of the host's OS scheduling, Go runtime build, goroutine preemption timings, and even the scanner-source goroutine fan-out pattern.
+
+3. **Why `--concurrency=1` alone still produces noise on both hosts (~84% Author vs. ~63% QA).** Even with one scanner worker and one overlap worker, 8 detector workers persist (hard-coded multiplier at `engine.go` line 345) and, with `GOMAXPROCS>1`, they can execute in parallel on separate CPU cores. Only `GOMAXPROCS=1` eliminates those races — but as row 4 of the QA table shows, eliminating the races does not *select* PLAIN; it only *fixes* which decoder wins on that host.
+
+4. **Operational takeaway.** If build-reproducible output across hosts is required, do not key on `DecoderName`. Two correctness-preserving strategies are: (a) treat `DecoderName` as diagnostic only and key on `DetectorType + Raw`; or (b) pass `--allow-verification-overlap` to skip the overlap worker, which restores per-decoder-variant independence at the cost of allowing cross-detector overlap errors through.
 
 ### 11.9 Experiment I — Two separate files with identical secrets
 
