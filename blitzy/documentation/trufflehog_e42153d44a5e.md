@@ -94,7 +94,7 @@ Every gate is deterministic on purpose. Security scanning runs in CI and must be
 
 - Appendix fixtures **(b) vs (c)** show the entropy gate (#4 above) flipping the outcome for the *same ID and same file shape* — `(b)` is missed, `(c)` is detected.
 - Fixtures **(a)** and **(d)** show the false-positive path (#5) producing a miss even when the format is perfect.
-- Fixture **(c)** yields exactly **one** finding, illustrating the one-result-per-ID de-duplication (#8).
+- Fixture **(c)** yields exactly **one** finding — direct evidence of **positive detection** once every gate is cleared. (It is a single ID/secret pair, so this run demonstrates detection, not de-duplication.) The one-result-per-ID de-duplication (#8) is proven by the source itself — `CleanResults` (`…/accesskey.go:L280-L282`) delegating to `aws.CleanResults` (`pkg/detectors/aws/utils.go:L89-L114`) — and is not exercised by these single-pair fixtures.
 
 ---
 
@@ -240,7 +240,7 @@ The phrase "reported differently" almost always reduces to **verification status
 
 | Flag (`main.go`) | Line | Effect on what you see |
 |---|---|---|
-| `--no-verification` | `L59` | Skip live verification; every finding is reported as `unverified`. |
+| `--no-verification` | `L59` | Skip live verification. The result *state* still depends on the verification error (`notifierWorker`, `engine.go:L1193-L1202`): no-error detections are reported as `unverified`; a detection carrying a verification error — e.g. the Q4 overlap, which sets `errOverlap` (`engine.go:L988`) even when verification is skipped — is reported as `unknown` when that state is enabled (default). |
 | `--results` (default `verified,unverified,unknown`) | `L61` | Which result *states* are printed. With `--results=verified`, an unverified finding is **hidden** even though it was detected. |
 | `--allow-verification-overlap` | `L65` | Override the Q4 overlap safety and verify anyway. |
 | `--filter-unverified` | `L66` | Keep only the first unverified result per chunk per detector. |
@@ -321,7 +321,7 @@ Resource_type: Access key
 File: e_base64.txt
 Line: 1
 
-<ts>   info-0  trufflehog   finished scanning   {"chunks": 1, "bytes": 102, "verified_secrets": 0, "unverified_secrets": 1, ...}
+<ts>   info-0  trufflehog   finished scanning   {"chunks": 1, "bytes": 101, "verified_secrets": 0, "unverified_secrets": 1, ...}
 ```
 
 ### Missed — fixtures (a), (b), (d)
