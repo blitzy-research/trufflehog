@@ -10,7 +10,7 @@
 
 ## 1. Overview & Scope
 
-TruffleHog is a single Go module — `github.com/trufflesecurity/trufflehog/v3`, which declares `go 1.23.1` with `toolchain go1.24.2` (`go.mod:3-4`). When you launch a basic filesystem scan, a deterministic startup sequence brings the major subsystems online *before* any data is read. This document explains that sequence by interpreting the trace-level logs the tool emits.
+TruffleHog is a single Go module — `github.com/trufflesecurity/trufflehog/v3`, which declares `go 1.23.1` (`go.mod:3`) with `toolchain go1.24.2` (`go.mod:5`). When you launch a basic filesystem scan, a deterministic startup sequence brings the major subsystems online *before* any data is read. This document explains that sequence by interpreting the trace-level logs the tool emits.
 
 The four questions this document answers, each in its own section with rationale and `file:line` citations:
 
@@ -31,7 +31,7 @@ This section documents exactly how the observable evidence was produced. Buildin
 
 ### 2.1 Toolchain — Go 1.24.2
 
-- **Rationale / source:** `go.mod` declares the language level `go 1.23.1` and the build toolchain `toolchain go1.24.2` (`go.mod:3-4`); the CI workflow independently pins `go-version: "1.24"` (`.github/workflows/test.yml:23`). Building with the documented toolchain is what makes the observed worker counts, channel sizes, and log ordering representative of the real tool rather than an artifact of a different compiler.
+- **Rationale / source:** `go.mod` declares the language level `go 1.23.1` (`go.mod:3`) and the build toolchain `toolchain go1.24.2` (`go.mod:5`); the CI workflow independently pins `go-version: "1.24"` (`.github/workflows/test.yml:23`). Building with the documented toolchain is what makes the observed worker counts, channel sizes, and log ordering representative of the real tool rather than an artifact of a different compiler.
 
 ### 2.2 Build command
 
@@ -289,7 +289,7 @@ The tool communicates between subsystems via **worker pools** (goroutines) conne
 
 ### 7.1 The four worker pools, in the order `startWorkers` launches them
 
-`startWorkers` calls, in this exact order: `startScannerWorkers` (**`engine.go:648`**) → `startDetectorWorkers` (**`engine.go:651`**) → `startVerificationOverlapWorkers` (**`engine.go:654`**) → `startNotifierWorkers` (**`engine.go:659`**). This is the order the four `info-2` lines appear.
+`startWorkers` calls, in this exact order: `startScannerWorkers` (**`engine.go:648`**) → `startDetectorWorkers` (**`engine.go:651`**) → `startVerificationOverlapWorkers` (**`engine.go:655`**) → `startNotifierWorkers` (**`engine.go:659`**). This is the order the four `info-2` lines appear.
 
 | Pool | Count formula | Observed (concurrency = 128) | Count source | Log source |
 |------|---------------|------------------------------|--------------|------------|
@@ -456,7 +456,7 @@ Each row maps an **observed log signal** to its **emitting source location** and
 
 ### Appendix — Evidence provenance
 
-- **Build:** `CGO_ENABLED=0 go build .` with Go 1.24.2 (the toolchain declared at `go.mod:4`), binary version string `dev`.
+- **Build:** `CGO_ENABLED=0 go build .` with Go 1.24.2 (the toolchain declared at `go.mod:5`), binary version string `dev`.
 - **Run:** `trufflehog filesystem <tiny-dir> --no-verification --log-level=5` over a single 69-byte `sample.txt`; exit 0; empty stdout; structured logs on stderr.
 - **Counts (831 / 955 / 914 / 4):** measured by enumerating `defaults.DefaultDetectors()`, each detector's `Keywords()`, and `decoders.DefaultDecoders()` in a throwaway program compiled against the same module **outside** the repository tree (no probe code added to the repository).
 - **Line numbers:** each `file:line` citation was checked against the source on disk; no line number, log line, or count in this document is invented.
