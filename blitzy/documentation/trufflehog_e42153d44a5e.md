@@ -251,7 +251,7 @@ type Detector interface {
 ```
 
 - Optional companion interfaces let detectors opt into extra behavior: `CustomResultsCleaner` `[pkg/detectors/detectors.go:L37]`, `Versioner` `[pkg/detectors/detectors.go:L49]`, `EndpointCustomizer` `[pkg/detectors/detectors.go:L76]`, and `CloudProvider` `[pkg/detectors/detectors.go:L83]`.
-- **No Go plugin system.** A tree-wide search for `plugin.Open` / `plugin.Lookup` across `pkg/` and `main.go` returns **0 matches**, and there is no `import "plugin"` anywhere in the Go sources. (The only textual occurrence of the bare string `"plugin"` is inside a MySQL analyzer test fixture, `pkg/analyzer/analyzers/mysql/expected_output.json`, which is data, not an import.) Combined with the 831 compile-time imports ↔ 845 detector directories from Section 1 and a single ~194 MB statically-linked binary, this proves detectors are embedded at build time, not loaded dynamically.
+- **No Go plugin system.** A tree-wide search for `plugin.Open` / `plugin.Lookup` across `pkg/` and `main.go` returns **0 matches**, and there is no `import "plugin"` anywhere in the Go sources. (The bare string `"plugin"` does occur textually in two non-Go data/example files — as a filter term in `examples/generic_with_filters.yml:L967` and inside the MySQL analyzer test fixture `pkg/analyzer/analyzers/mysql/expected_output.json` — but neither is Go code, let alone a plugin-loading import.) Combined with the 831 compile-time imports ↔ 845 detector directories from Section 1 and a single ~194 MB statically-linked binary, this proves detectors are embedded at build time, not loaded dynamically.
 
 **CLI help (`main.go`, corroborated by captured `--help` / `--help-long`):**
 
