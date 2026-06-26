@@ -69,11 +69,11 @@ With that separation in mind, the three observations resolve cleanly:
 
 | User observed | Why it happens | Deterministic? |
 |---------------|----------------|----------------|
-| **"deduplicated to a single result"** | The plaintext and Base64 variants resolve to the **same source line**, so they produce an **identical dedup key**; the cross-decoder dedup in the notifier drops the second one. | **Count is deterministic** (always 1). *Which* decoder type survives is **not** (see R6). |
-| **"reported twice with different decoder types"** | The variants resolve to **different source lines**, so the line number embedded in `SourceMetadata` makes their dedup keys **differ** → both are kept, one `PLAIN`, one `BASE64`. | Deterministic for a fixed file layout. |
+| **"deduplicated to a single result"** | The plaintext and Base64 variants resolve to the **same source line**, so they produce an **identical dedup key**; the cross-decoder dedup in the notifier drops the colliding one. | The **dedup key is deterministic** (same line ⇒ identical key). The resulting count is **usually 1**, but under default multi-worker concurrency a *rare*, non-atomic notifier `Get`/`Add` race can let **both** survive (count = 2); `--concurrency=1` makes the collapse stable. *Which* decoder type survives a collapse is also non-deterministic (see R6). |
+| **"reported twice with different decoder types"** | The variants resolve to **different source lines**, so the line number embedded in `SourceMetadata` makes their dedup keys **differ** → both are kept, one `PLAIN`, one `BASE64`. | Deterministic for a fixed file layout (different keys never collide, so concurrency is irrelevant here). |
 | **"reported an overlap error"** | **Two or more distinct detectors** matched the **same decoded chunk**, triggering the Stage-3 overlap guard, which attaches `errOverlap` and disables verification. | Deterministic; suppressed by `--allow-verification-overlap`. |
 
-**One-line answer:** the outcome is governed jointly by (a) *which detectors fire on a chunk* (overlap path) and (b) *the cross-decoder dedup key, whose `SourceMetadata` component carries the source line number* (dedup path). Both are deterministic functions of how the file is laid out; the only run-to-run variation is **which** decoder type label survives when two variants collapse to one result — a consequence of concurrent workers, not of randomness in the count.
+**One-line answer:** the outcome is governed jointly by (a) *which detectors fire on a chunk* (overlap path) and (b) *the cross-decoder dedup key, whose `SourceMetadata` component carries the source line number* (dedup path). The **dedup key** is a deterministic function of file layout; what is *not* guaranteed is the **actual output count under concurrent notifier workers** — same-key / different-decoder results **usually** collapse to one, but because the notifier's dedup is a non-atomic `Get`-then-`Add` performed by `concurrency` parallel workers (`pkg/engine/engine.go:L1217-L1221`, `:L705-L706`), a rare race can let both through (count = 2). Separately, *which* decoder-type label survives a collapse is also non-deterministic. Running with `--concurrency=1` removes both forms of run-to-run variation.
 
 ---
 
@@ -106,7 +106,7 @@ flowchart TD
     H -- No --> J[Dispatch result]
 ```
 
-**Worker concurrency** (relevant to R6's non-determinism): the detector pool is sized at `concurrency × 8` (`pkg/engine/engine.go:L343-L345`), the verification-overlap pool at `concurrency × 1` (`:L352-L353`), and the notifier at `concurrency × 1`. Because many detector workers feed a single `ResultsChan`, the *order* in which two variants of the same secret reach the notifier is not guaranteed.
+**Worker concurrency** (relevant to R6's non-determinism): the detector pool is sized at `concurrency × 8` (`pkg/engine/engine.go:L343-L345`), the verification-overlap pool at `concurrency × 1` (`:L352-L353`), and the notifier at `concurrency × 1` (`:L705-L706`, with the notification multiplier defaulting to 1 at `:L348-L349`; `--concurrency` itself defaults to `runtime.NumCPU()`, `main.go:L58`). Two consequences follow. First, because many detector workers feed a single `ResultsChan`, the *order* in which two variants of the same secret reach the notifier is not guaranteed (this drives the label non-determinism of §7.2). Second, because the notifier runs as **multiple** workers and its dedup is a non-atomic `Get`-then-`Add`, the *emitted count* of a same-line collision is not strictly guaranteed either — a rare race can let both variants through (§5.6).
 
 ---
 
@@ -452,6 +452,42 @@ if result.Verified {
 
 So `UnverifiedSecretsFound` reflects the **post-dedup** count — which is why `TestEngine_DuplicateSecrets` (`pkg/engine/engine_test.go:L242`) can assert a precise value of `2` for `testdata/secrets.txt`.
 
+### 5.6 The dedup is **not atomic** — multiple notifier workers can race (the one-vs-two count nuance)
+
+The dedup decision above is **deterministic at the level of the key**: two results that share a key collide, and (outside Postman) a collision with a *different* decoder type is dropped. But the *number of results that actually reach the output* is **not** guaranteed to be the deterministic post-dedup count, because the notifier runs as **multiple concurrent workers** and the dedup is a **non-atomic `Get`-then-`Add`**.
+
+**There is more than one notifier worker by default.** The notifier pool is sized `notificationWorkerMultiplier × concurrency`:
+
+```go
+// pkg/engine/engine.go:L705-L706
+func (e *Engine) startNotifierWorkers(ctx context.Context) {
+	numWorkers := e.notificationWorkerMultiplier * e.concurrency
+```
+
+The multiplier defaults to **1** (`pkg/engine/engine.go:L348-L349`), and `--concurrency` defaults to **`runtime.NumCPU()`** (`main.go:L58`: `cli.Flag("concurrency", …).Default(strconv.Itoa(runtime.NumCPU()))`). So on a typical multi-core host there are **`NumCPU` notifier workers**, all consuming the same `ResultsChan` and all sharing the **same** `dedupeCache`.
+
+**The dedup is a check-then-act with no lock spanning the two steps.** Re-reading the block (`pkg/engine/engine.go:L1216-L1221`):
+
+```go
+key := fmt.Sprintf("%s%s%s%+v", result.DetectorType.String(), result.Raw, result.RawV2, result.SourceMetadata) // L1216
+if val, ok := e.dedupeCache.Get(key); ok && (val != result.DecoderType ||                                       // L1217  ← read
+	result.SourceType == sourcespb.SourceType_SOURCE_TYPE_POSTMAN) {
+	continue
+}
+e.dedupeCache.Add(key, result.DecoderType)                                                                      // L1221  ← write
+```
+
+The LRU cache (`hashicorp/golang-lru/v2`) makes each individual `Get` and `Add` internally thread-safe, but **the `Get`…`Add` pair is not atomic as a unit**. There is a small window between the `Get` at `:L1217` and the `Add` at `:L1221`. If the `PLAIN` variant and the `BASE64` variant of the same secret (same key, different decoder type) are handled by **two different notifier workers** that both execute their `Get` *before* either executes its `Add`, **both** see a cache miss, **both** pass the skip condition, and **both** are dispatched — yielding **two** results for a key that "should" have collapsed to one.
+
+**Consequences for the user's question (R4/R6):**
+
+- The **dedup key equality** is deterministic (a pure function of `DetectorType + Raw + RawV2 + SourceMetadata`).
+- The **actual output count under concurrent notifier workers is *not* guaranteed**: same-line / different-decoder results **usually** collapse to one, but a **rare** `Get`/`Add` race can let both survive (count = 2). This is empirically reproduced in §8.3.
+- Running with **`--concurrency=1`** forces a **single** notifier worker, eliminating the race; the collapse to one result becomes stable (and, as a side effect, *which* decoder survives also stabilizes — see §7.2). This is the reliable way to get the deterministic count the dedup key implies.
+
+> [!NOTE]
+> This race is benign for TruffleHog's purpose (it can only ever *under*-deduplicate, i.e. emit a true secret twice; it never drops a distinct secret). It matters here only because it is the precise reason the user sometimes saw "two results with different decoder types" even from a same-line layout.
+
 ---
 
 ## 6. Ordering: deduplication happens *after* overlap detection (R5)
@@ -506,26 +542,29 @@ For filesystem sources, `SourceMetadata` carries the **file** and the **line num
 
 Because `SourceMetadata` is one of the four components of the dedup key (`:L1216`), **the line number is part of the key.** Therefore:
 
-- **Same resolved line ⇒ identical key ⇒ collapse to ONE.** When the `PLAIN` and `BASE64` variants of the same key resolve to the *same* line (which happens when they share a chunk — recall the Base64 in-place replacement of §3.3), the two results share a dedup key. The first to arrive is cached; the second collides with a **different decoder type** (`val != result.DecoderType`, `:L1217`) and is dropped. **Net: one result.**
-- **Different resolved lines ⇒ different keys ⇒ keep BOTH.** When the variants resolve to *different* lines, their `SourceMetadata` differs, so their keys differ, so **neither collides** and both are kept — one `PLAIN`, one `BASE64`. **Net: multiple results with different decoder types.**
+- **Same resolved line ⇒ identical key ⇒ collapse (usually) to ONE.** When the `PLAIN` and `BASE64` variants of the same key resolve to the *same* line (which happens when they share a chunk — recall the Base64 in-place replacement of §3.3), the two results share a dedup key. Whichever variant reaches the notifier first is cached; the other collides with a **different decoder type** (`val != result.DecoderType`, `:L1217`) and is dropped. **Net: one result — in the overwhelming majority of runs.** The one exception is the rare, non-atomic notifier `Get`/`Add` race of §5.6: if two notifier workers handle the two variants and both read the cache before either writes, both survive (**count = 2**).
+- **Different resolved lines ⇒ different keys ⇒ keep BOTH.** When the variants resolve to *different* lines, their `SourceMetadata` differs, so their keys differ, so **neither collides** and both are kept — one `PLAIN`, one `BASE64`. **Net: multiple results with different decoder types.** (Concurrency is irrelevant here: distinct keys never collide, so there is nothing for the notifier race to affect.)
 
-This is the precise, deterministic explanation of "sometimes one, sometimes two": it is entirely a function of **whether the encodings resolve to the same source line**, which in turn is a function of **file structure** (do the plaintext and the blob share a chunk, and where does each decoded variant resolve to?).
+What is fully deterministic is the **dedup key**: whether the two encodings collide is entirely a function of **whether they resolve to the same source line**, which in turn is a function of **file structure** (do the plaintext and the blob share a chunk, and where does each decoded variant resolve to?). The *output count* then follows from key equality, with one caveat: **different lines reliably give two results**, and **the same line gives one result on essentially every run**, the **only** exception being the §5.6 notifier race that can occasionally bump a same-line collapse back up to two. So "sometimes one, sometimes two" is *primarily* the same-line-vs-different-line question, *plus* a rare concurrency race on the same-line side.
 
-### 7.2 The one genuinely non-deterministic part
+### 7.2 The non-deterministic parts: the label (always) and, rarely, the count
 
-When two variants **do** collapse to a single result, **which decoder type label survives is non-deterministic run-to-run.** The surviving entry is simply *whichever variant reached the notifier first*, and ordering across the `concurrency × 8` detector workers (`pkg/engine/engine.go:L343-L345`) feeding a single `ResultsChan` is not guaranteed.
+Two things vary run-to-run under default multi-worker concurrency, and it is important to keep them separate:
 
-This was directly observed: scanning the *same* single-chunk file 10 times produced a **stable count of 1** every time, but the surviving `DecoderName` alternated between `BASE64` and `PLAIN` (observed sequence: `BASE64, BASE64, BASE64, BASE64, PLAIN, BASE64, PLAIN, BASE64, BASE64, PLAIN`). See Scenario A in the appendix.
+1. **Which decoder-type label survives a collapse — always non-deterministic.** When two variants collapse to one result, the surviving entry is simply *whichever variant reached the notifier first*, and ordering across the `concurrency × 8` detector workers (`pkg/engine/engine.go:L343-L345`) feeding a single `ResultsChan` is not guaranteed.
+2. **Whether the collapse happens at all — rarely non-deterministic.** Because the notifier's dedup is a non-atomic `Get`-then-`Add` performed by `concurrency` parallel workers (§5.6, `pkg/engine/engine.go:L1217-L1221`, `:L705-L706`), a same-line collision can *occasionally* fail to dedupe, leaving **two** results instead of one.
+
+This was directly observed (see Scenario A in the appendix): scanning the *same* single-chunk file produced a count of **1 on essentially every run**, while the surviving `DecoderName` alternated between `BASE64` and `PLAIN` (e.g. `BASE64, BASE64, BASE64, BASE64, PLAIN, BASE64, PLAIN, BASE64, BASE64, PLAIN`). Separately — and far more rarely — the §5.6 notifier race let **both** labels survive, producing a count of **2** (`PLAIN@line1` + `BASE64@line1`) from that very same single-chunk layout; this required heavy concurrent load to surface (≈1 occurrence in several thousand same-line collisions). With **`--concurrency=1`** both effects vanish: the count is a stable **1** and the surviving label is stable too.
 
 > [!IMPORTANT]
-> **The count is deterministic; the surviving decoder-type *label* is not.** This is the subtle point that makes the behaviour *look* random even though the result count is a stable function of file layout.
+> **Separate the *key* from the *count*.** The dedup *key* is deterministic (same line ⇒ identical key). What varies under default concurrency is (a) **which** decoder-type label survives a collapse — non-deterministic on every collapse — and (b) far more rarely, **whether** the collapse happens at all, because the notifier's `Get`/`Add` is not atomic across multiple workers (§5.6). Both forms of variation disappear under `--concurrency=1`. The earlier intuition that "the count is deterministic" holds for the *dedup key*, **not** for the *actual emitted count* under the default concurrent pipeline.
 
 ### 7.3 Putting it together — the user's three observations
 
 ```mermaid
 flowchart TD
     S[One AWS key: plaintext + Base64 in a file] --> Q1{Do the two variants<br/>resolve to the SAME line?}
-    Q1 -- Yes same chunk --> ONE[Cross-decoder dedup collapses to 1 result<br/>surviving DecoderName is PLAIN or BASE64, non-deterministic]
+    Q1 -- Yes same chunk --> ONE[Cross-decoder dedup USUALLY collapses to 1 result<br/>surviving DecoderName PLAIN or BASE64 is non-deterministic<br/>rare notifier Get/Add race can leave 2 — see section 5.6]
     Q1 -- No different lines --> TWO[Both kept: 1x PLAIN + 1x BASE64<br/>different SourceMetadata = different dedup keys]
     S --> Q2{Do 2+ DIFFERENT detectors<br/>match the same chunk?}
     Q2 -- Yes --> OV[errOverlap attached, verification disabled<br/>suppressed by --allow-verification-overlap]
@@ -534,8 +573,8 @@ flowchart TD
 
 | User observation | Governing mechanism | Deterministic part | Non-deterministic part |
 |------------------|---------------------|--------------------|------------------------|
-| "deduplicated to a single result" | cross-decoder dedup, same line (R4/R6) | the **count = 1** | which `DecoderName` survives |
-| "twice with different decoder types" | cross-decoder dedup, different lines (R4/R6) | both kept; **PLAIN + BASE64** | — |
+| "deduplicated to a single result" | cross-decoder dedup, same line (R4/R6) | the **dedup key** (same line ⇒ collision) | **count** (usually 1; rarely 2 via the §5.6 notifier race) **and** which `DecoderName` survives |
+| "twice with different decoder types" | cross-decoder dedup, different lines (R4/R6) | both kept; **PLAIN + BASE64** (distinct keys, concurrency-independent) | — |
 | "an overlap error" | cross-detector overlap (R3) | presence of `errOverlap`; suppressed by flag | which specific result carries it |
 
 ---
@@ -550,13 +589,20 @@ All evidence below was reproduced against the pinned commit. **The binary and al
 # Build out-of-tree (the ./trufflehog binary is .gitignore'd anyway). go1.24.2 matches go.mod's toolchain.
 CGO_ENABLED=0 go build -o /tmp/th/bin/trufflehog .
 
-# Fidelity: the relevant flags exist…
-/tmp/th/bin/trufflehog filesystem --help | grep -iE "allow-verification-overlap|filter-unverified|no-verification|--results|--config|--json"
-# …and the newer iterative-decoding feature does NOT exist at this commit:
-/tmp/th/bin/trufflehog --help | grep -ic max-decode-depth      # -> 0
+# Fidelity: the relevant flags exist.
+# NOTE 1: Kingpin prints --help to STDERR, so redirect 2>&1 before grep (otherwise the pipe
+#         sees nothing and grep exits non-zero).
+# NOTE 2: Kingpin renders boolean flags as "--[no-]<name>" and value flags as "--<name>=<VAL>",
+#         so match the displayed substrings (e.g. `json`, `no-verification`, `--results`, `--config`)
+#         rather than a literal `--json`.
+/tmp/th/bin/trufflehog filesystem --help 2>&1 | grep -iE 'allow-verification-overlap|filter-unverified|no-verification|--results|--config|json'
+
+# …and the newer iterative-decoding feature does NOT exist at this commit. A correct no-match makes
+# `grep -c` print 0 but exit 1, so guard with `|| true` and assert the count is zero explicitly:
+count=$(/tmp/th/bin/trufflehog --help 2>&1 | grep -ic max-decode-depth || true); test "$count" -eq 0 && echo "ok: max-decode-depth absent (count=$count)"
 ```
 
-**Observed:** the `filesystem` sub-command exposes `-j/--json`, `--no-verification`, `--results`, `--allow-verification-overlap`, `--filter-unverified`, and `--config`. The `max-decode-depth` count is **0** at both the top-level and `filesystem` help, and a repository-wide grep for `max-decode-depth|maxDecodeDepth|DecodeDepth` returns **0 matches** — confirming the **single linear decoder pass** of this commit.
+**Observed:** because Kingpin writes help to **stderr**, the `2>&1` redirect is required — without it the pipe to `grep` receives nothing and the command fails (exit 1). With the redirect, the `filesystem` sub-command's help lists the flags in Kingpin's rendered forms: `-j, --[no-]json`, `--[no-]no-verification`, `--results=RESULTS`, `--[no-]allow-verification-overlap`, `--[no-]filter-unverified`, and `--config=CONFIG` (which is exactly why the grep pattern matches the substrings `json` / `no-verification` / `--results` / `--config`, not a literal `--json`). The `max-decode-depth` count is **0** (the `|| true` prevents grep's no-match exit code from aborting the line, and the explicit `test "$count" -eq 0` asserts absence), and a repository-wide grep for `max-decode-depth|maxDecodeDepth|DecodeDepth` (excluding this `blitzy/` document itself) returns **0 matches** — confirming the **single linear decoder pass** of this commit.
 
 The default chunking that drives Scenarios A vs. B is `ChunkSize = 10*1024` (10 KiB) with `PeekSize = 3*1024` (3 KiB overlap), `pkg/sources/chunker.go:L14`/`:L16`.
 
@@ -613,7 +659,7 @@ Note the `"line": 1` inside `SourceMetadata`: this is the lever from R6. (`Sourc
 
 > The example AWS key `AKIAWARWQKZNHMZBLY4I` / secret `s6NbZeygUrUdM95K683Lb6IsILWXOJlJ8ZVd1Kw0` is the harmless test value already present in `pkg/engine/testdata/secrets.txt`. (The AWS-documentation key `AKIAIOSFODNN7EXAMPLE` is filtered out by the detector and yields no results, so it cannot be used for reproduction.)
 
-### 8.3 Scenario A — collapse to one result (user: *"deduplicated to a single result"*)
+### 8.3 Scenario A — same chunk ⇒ *usually* one result (user: *"deduplicated to a single result"*)
 
 **Layout:** plaintext credentials and the Base64 blob of the *same* credentials placed close together so they share **one chunk**:
 
@@ -629,22 +675,57 @@ line 5:  blob=YXdzX2FjY2Vzc19rZXlfaWQ9QUtJQVdBUldRS1pOSE1aQkxZNEkg…   (136-cha
 /tmp/th/bin/trufflehog filesystem /tmp/scratch/A --no-verification --results=verified,unverified,unknown -j
 ```
 
-**Observed — 10 consecutive runs:**
+**Observed — default concurrency, 10 consecutive runs:**
 
 ```
-run  1: count=1 decoders=['BASE64']
+run  1: count=1 decoders=['PLAIN']
 run  2: count=1 decoders=['BASE64']
 run  3: count=1 decoders=['BASE64']
-run  4: count=1 decoders=['BASE64']
-run  5: count=1 decoders=['PLAIN']
+run  4: count=1 decoders=['PLAIN']
+run  5: count=1 decoders=['BASE64']
 run  6: count=1 decoders=['BASE64']
-run  7: count=1 decoders=['PLAIN']
+run  7: count=1 decoders=['BASE64']
 run  8: count=1 decoders=['BASE64']
 run  9: count=1 decoders=['BASE64']
 run 10: count=1 decoders=['PLAIN']
 ```
 
-**Interpretation:** the count is **always 1** — both the `PLAIN` and `BASE64` variants resolve to line 1 (Base64 in-place replacement, §3.3), so they share a dedup key and the cross-decoder dedup (`:L1217`) drops the second. The **surviving `DecoderName` alternates** because it is whichever variant reached the notifier first — the R6 non-determinism, with a stable count.
+The count is **1 on every run**, but the **surviving `DecoderName` alternates** (`PLAIN` vs `BASE64`) — that is the §7.2 label non-determinism (whichever variant reached the notifier first wins).
+
+**Pinning to a single notifier worker makes both the count and the label stable:**
+
+```bash
+/tmp/th/bin/trufflehog filesystem /tmp/scratch/A --no-verification --results=verified,unverified,unknown -j --concurrency=1
+```
+
+```
+run 1..10: count=1 decoders=['PLAIN']     # stable count AND stable label across all 10 runs
+```
+
+**The rare count = 2 race (honest reporting).** The single-file loop above did **not** exhibit the §5.6 notifier `Get`/`Add` race in dozens of runs — under default concurrency the same-line collapse is reliable in practice, but it is **not guaranteed**. To actually surface the race, the same-line collision must be exercised at scale under heavy scheduling pressure. Scanning a directory of **60 independent copies** of the same single-chunk fixture (each copy collides `PLAIN`+`BASE64` at its *own* line 1, so each is an independent collision) across **many parallel scans** exposed it:
+
+```bash
+# 60 identical single-chunk fixtures; each is expected to collapse to exactly 1 result.
+# Run many scans in parallel to oversubscribe CPUs and widen the notifier Get→Add window.
+for r in $(seq 1 6); do
+  for p in $(seq 1 24); do
+    /tmp/th/bin/trufflehog filesystem /tmp/scratch/Amany --no-verification \
+      --results=verified,unverified,unknown -j --no-update > /tmp/out_${r}_${p}.json 2>/dev/null &
+  done; wait
+done
+# baseline expectation = 144 scans × 60 files = 8640 AWS results (one per file)
+```
+
+**Observed:** across the 144 scans (**8 640** independent same-line collisions) the total AWS-result count was **8 641** — exactly **one** extra. That extra came from a single file that emitted **two** AWS results at the same location:
+
+```json
+{ "DetectorName":"AWS", "DecoderName":"PLAIN",  "SourceMetadata":{"Data":{"Filesystem":{"file":".../creds_3.txt","line":1}}}, "Raw":"AKIAWARWQKZNHMZBLY4I" }
+{ "DetectorName":"AWS", "DecoderName":"BASE64", "SourceMetadata":{"Data":{"Filesystem":{"file":".../creds_3.txt","line":1}}}, "Raw":"AKIAWARWQKZNHMZBLY4I" }
+```
+
+Both records share an identical dedup key (`AWS` + `AKIAWARWQKZNHMZBLY4I` + identical `RawV2` + identical `file`/`line`); they "should" have collapsed to one. Two notifier workers raced the non-atomic `Get`/`Add` (§5.6) and both survived — `BASE64@line1` **and** `PLAIN@line1`, which is precisely the "reported twice with different decoder types" outcome the user occasionally saw from a same-line layout.
+
+**Interpretation:** both the `PLAIN` and `BASE64` variants resolve to line 1 (Base64 in-place replacement, §3.3), so they share a dedup key and the cross-decoder dedup (`:L1217`) **usually** drops the colliding one — hence count = 1 with an alternating surviving label. **Usually**, not *always*: because the notifier runs `concurrency` workers (`pkg/engine/engine.go:L705-L706`, default `runtime.NumCPU()` via `main.go:L58`) and the dedup is a non-atomic `Get`-then-`Add` (`:L1217-L1221`), a rare race lets both variants survive (count = 2), as reproduced above. Running with **`--concurrency=1`** removes the race (a single notifier worker), yielding a stable count of 1 **and** a stable `PLAIN` label.
 
 ### 8.4 Scenario B — two results, different decoder types (user: *"reported twice with different decoder types"*)
 
@@ -738,15 +819,15 @@ A concise statement of *why* each answer is what it is, with the decisive citati
 
 - **R1 — How are multiple encodings handled?** A fixed four-decoder chain `[UTF8, Base64, UTF16, EscapedUnicode]` is applied in a **single linear pass**; every non-nil variant is independently keyword-matched. *Why we conclude this:* `DefaultDecoders()` (`pkg/decoders/decoders.go:L8-L16`) and the single `for _, decoder := range e.decoders` loop (`pkg/engine/engine.go:L784`) with per-variant matching at `:L795`. There is no feedback loop re-decoding outputs at this commit (§11).
 
-- **R2 — Which `DecoderType` values appear?** `PLAIN`, `BASE64`, `UTF16`, `ESCAPED_UNICODE` (and `UNKNOWN=0`). *Why:* the enum at `pkg/pb/detectorspb/detectors.pb.go:L26-L30` plus each decoder's `Type()` (`utf8.go:L12-L14`, `base64.go:L30-L32`, `utf16.go:L14-L16`, `escaped_unicode.go:L28-L30`). In JSON the value surfaces as `DecoderName` (`pkg/output/json.go:L65`).
+- **R2 — Which `DecoderType` values appear?** `PLAIN`, `BASE64`, `UTF16`, `ESCAPED_UNICODE` (and `UNKNOWN=0`). *Why:* the enum at `pkg/pb/detectorspb/detectors.pb.go:L26-L30` plus each decoder's `Type()` (`pkg/decoders/utf8.go:L12-L14`, `pkg/decoders/base64.go:L30-L32`, `pkg/decoders/utf16.go:L14-L16`, `pkg/decoders/escaped_unicode.go:L28-L30`). In JSON the value surfaces as `DecoderName` (`pkg/output/json.go:L65`).
 
 - **R3 — When does overlap detection occur?** Only when **`len(matchingDetectors) > 1`** for a chunk **and** `--allow-verification-overlap` is off. *Why:* the trigger at `pkg/engine/engine.go:L796`, the worker at `:L924-L1034`, the duplicate gate `likelyDuplicate` at `:L887-L921`, and the `errOverlap` sentinel at `:L39-L42`.
 
-- **R4 — How does dedup reduce the count?** The notifier's LRU cache (size 512) keys on `DetectorType + Raw + RawV2 + SourceMetadata` — **excluding** `DecoderType` — and drops a later result whose key collides with a **different** cached decoder type. *Why:* the key at `pkg/engine/engine.go:L1216` and the skip condition at `:L1217-L1218`, with the Postman force-dedup exception in the same condition.
+- **R4 — How does dedup reduce the count?** The notifier's LRU cache (size 512) keys on `DetectorType + Raw + RawV2 + SourceMetadata` — **excluding** `DecoderType` — and drops a later result whose key collides with a **different** cached decoder type. *Why:* the key at `pkg/engine/engine.go:L1216` and the skip condition at `:L1217-L1218`, with the Postman force-dedup exception in the same condition. **Concurrency caveat (feeds R6):** the dedup is a non-atomic `Get`-then-`Add` (`:L1217-L1221`) run by `concurrency` notifier workers (`:L705-L706`, default `runtime.NumCPU()` via `main.go:L58`, multiplier default 1 at `:L348-L349`). So *key equality* is deterministic, but the *emitted count* is not strictly guaranteed — a rare two-worker race can let a same-key collision survive twice (§5.6, reproduced in §8.3); `--concurrency=1` removes it.
 
 - **R5 — Dedup before or after overlap?** **After.** *Why:* overlap runs in the Stage-3 `verificationOverlapWorker` (`pkg/engine/engine.go:L924-L1034`) and dedup runs in the Stage-4 `notifierWorker` (`:L1189-L1235`); the channel wiring forces results through Stage 3 before Stage 4 (`:L1011-L1020` → `detectorWorker` `:L1036` → `ResultsChan` → notifier `:L1190`).
 
-- **R6 — Why one vs. many (and why does the label flicker)?** The dedup key includes the **source line number** (inside `SourceMetadata`, `:L1216`). Same line ⇒ same key ⇒ collapse to one; different lines ⇒ different keys ⇒ keep both. When a collapse occurs, the surviving `DecoderName` is whichever variant reached the notifier first across the `concurrency × 8` detector workers (`:L343-L345`), so the **count is stable but the surviving label is not** — confirmed empirically in §8.3.
+- **R6 — Why one vs. many (and why does the label flicker)?** The dedup key includes the **source line number** (inside `SourceMetadata`, `:L1216`). Same line ⇒ same key ⇒ collapse (usually) to one; different lines ⇒ different keys ⇒ keep both. Under the default concurrent pipeline two run-to-run variations remain: **(a)** when a collapse occurs, the surviving `DecoderName` is whichever variant reached the notifier first across the `concurrency × 8` detector workers (`:L343-L345`) — *always* non-deterministic; and **(b)** far more rarely, the same-line collapse can fail entirely because the notifier's dedup `Get`/`Add` is non-atomic across `concurrency` notifier workers (`:L1217-L1221`, `:L705-L706`, `main.go:L58`), leaving two results. So the **dedup key is deterministic, but the emitted count is only *usually* 1** (rarely 2) and the **surviving label is non-deterministic** — both confirmed empirically in §8.3, and both eliminated by `--concurrency=1`.
 
 ---
 
@@ -756,6 +837,7 @@ All defined in `main.go`:
 
 | Flag | Effect | Citation |
 |------|--------|----------|
+| `--concurrency` | Number of concurrent workers; **defaults to `runtime.NumCPU()`**. It sizes every worker pool, including the notifier pool (`notificationWorkerMultiplier × concurrency`). Setting **`--concurrency=1`** forces a single notifier worker, which removes the non-atomic dedup race of §5.6 (stable count) and the label non-determinism of §7.2. | `main.go:L58` |
 | `--no-verification` | Don't verify results (used throughout this investigation so scans are side-effect-free). | `main.go:L59` |
 | `--results` | Which result classes to output: `verified`, `unknown`, `unverified`, `filtered_unverified`. **Defaults to `verified,unverified,unknown`.** Results carrying a verification error (e.g. `errOverlap`) are classed **`unknown`** (§5.4). | `main.go:L61` |
 | `--allow-verification-overlap` | **Disables the overlap guard** (`e.verificationOverlap`), so chunks matched by multiple detectors verify normally and carry no `errOverlap`. | `main.go:L65` |
