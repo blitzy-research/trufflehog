@@ -11,7 +11,28 @@ The confusion comes from conflating **two independent mechanisms** that the code
 
 These two stages run in a fixed architectural order: **overlap detection (Stage 3) always runs before LRU deduplication (Stage 4).**
 
-> **Pin‑to‑commit note.** Everything below describes the pinned `HEAD` only. Iterative / chained decoding (`--max-decode-depth`) **does not exist at this commit** — a source‑wide search for `max-decode-depth` / `maxDecodeDepth` / `DecodeDepth` returns zero matches — so the decoder stage is a **single pass** over `DefaultDecoders()` (`pkg/engine/engine.go:784`). No iterative decoding is attributed to this version.
+> **Pin‑to‑commit note.** Everything below describes the pinned `HEAD` only. Iterative / chained decoding (`--max-decode-depth`) **does not exist at this commit** — a source‑wide search for `max-decode-depth` / `maxDecodeDepth` / `DecodeDepth` returns zero matches (evidence immediately below) — so the decoder stage is a **single pass** over `DefaultDecoders()` (`pkg/engine/engine.go:784`). No iterative decoding is attributed to this version.
+
+Searching every tracked file **except** this generated answer document (which necessarily contains those strings) yields no matches — `git grep` exits `1` when nothing matches:
+
+```
+# command  (run from the repository root)
+$ git grep -n -e 'max-decode-depth' -e 'maxDecodeDepth' -e 'DecodeDepth' -- ':!blitzy/'; echo "exit=$?"
+
+# verbatim output (no lines printed; exit code 1 = no matches)
+exit=1
+```
+
+Confirming the *only* tracked file that contains any of those strings is this document itself:
+
+```
+# command
+$ git grep -l -e 'max-decode-depth' -e 'maxDecodeDepth' -e 'DecodeDepth'; echo "exit=$?"
+
+# verbatim output
+blitzy/documentation/trufflehog_e42153d44a5e.md
+exit=0
+```
 
 ---
 
@@ -80,11 +101,10 @@ aws_secret_access_key = zeSwzZZQ1MD9YuS6DqmeHNKcAPNROmsC6ZuYNBYJ
 ```
 
 ```
-# command
-$ /tmp/th-investigation/trufflehog filesystem plain.txt --no-verification
+# command  (human-readable results go to stdout; the banner + info logs go to stderr, dropped with 2>/dev/null)
+$ /tmp/th-investigation/trufflehog filesystem plain.txt --no-verification 2>/dev/null
 
 # verbatim output
-🐷🔑🐷  TruffleHog. Unearth your secrets. 🐷🔑🐷
 Found unverified result 🐷🔑❓
 Detector Type: AWS
 Decoder Type: PLAIN
@@ -92,7 +112,18 @@ Raw result: AKIAWTNVF3N27L9HX6D3
 Resource_type: Access key
 File: plain.txt
 Line: 1
-… "chunks": 1, … "unverified_secrets": 1, … "trufflehog_version": "dev" …
+```
+
+The run summary is emitted on **stderr** as a single `finished scanning` log line whose `scan_duration` varies run‑to‑run, so its stable count fields are quoted verbatim via `grep -o`:
+
+```
+# command
+$ /tmp/th-investigation/trufflehog filesystem plain.txt --no-verification 2>&1 | grep -o '"chunks": [0-9]*\|"unverified_secrets": [0-9]*\|"trufflehog_version": "[^"]*"'
+
+# verbatim output
+"chunks": 1
+"unverified_secrets": 1
+"trufflehog_version": "dev"
 ```
 
 The `UTF8` decoder passes valid UTF‑8 through unchanged, and the AWS detector matches the plain id → **`Decoder Type: PLAIN`**.
@@ -229,61 +260,126 @@ Inside that worker, for each result it builds a comparison string — `val = Raw
 
 `overlap.txt` = `cred = AKIAWTNVF3N27L9HX6D3:zeSwzZZQ1MD9YuS6DqmeHNKcAPNROmsC6ZuYNBYJ`. A custom detector `OverlapProbe` (keyword `AKIA`, regex `(AKIA[A-Z0-9]{16}:[A-Za-z0-9+/]{40})`) captures the same `id:secret` string, so its `Raw` (~61 chars) closely matches the AWS `RawV2` (`idMatch + ":" + secretMatch`, `pkg/detectors/aws/access_keys/accesskey.go:140`).
 
+First, that the overlap banner fires (count the console `Verification issue` line — it goes to stdout, so no redirection is needed, but `2>&1` is harmless):
+
 ```
 # command
-$ /tmp/th-investigation/trufflehog filesystem overlap.txt --config custom.yaml --results=verified,unverified,unknown
+$ /tmp/th-investigation/trufflehog filesystem overlap.txt --config custom.yaml --results=verified,unverified,unknown 2>&1 | grep -c 'Verification issue'
 
-# verbatim console output
+# verbatim output
+1
+```
+
+The exact banner text, quoted verbatim:
+
+```
+# command
+$ /tmp/th-investigation/trufflehog filesystem overlap.txt --config custom.yaml --results=verified,unverified,unknown 2>&1 | grep 'Verification issue'
+
+# verbatim output
 Verification issue: More than one detector has found this result. For your safety, verification has been disabled.You can override this behavior by using the --allow-verification-overlap flag.
-Detector Type: CustomRegex
-Decoder Type: PLAIN
-Detector Type: AWS
-Decoder Type: PLAIN
-… "unverified_secrets": 2 …
 ```
 
-Note the exact literal `disabled.You` with **no space** — an artifact of the two‑line string concatenation at `pkg/engine/engine.go:40-41`. Also note the count is still **2**: overlap **disables verification, it does not delete a result**.
+Note the exact literal `disabled.You` with **no space** — an artifact of the two‑line string concatenation at `pkg/engine/engine.go:40-41`.
 
-The machine‑readable view confirms the error lands on exactly **one** of the two detectors:
+The result count is still **2** — overlap **disables verification, it does not delete a result**. The stable count field from the `finished scanning` stats line, quoted verbatim via `grep -o`:
 
 ```
 # command
-$ /tmp/th-investigation/trufflehog filesystem overlap.txt --config custom.yaml --results=verified,unverified,unknown --json
+$ /tmp/th-investigation/trufflehog filesystem overlap.txt --config custom.yaml --results=verified,unverified,unknown 2>&1 | grep -o '"unverified_secrets": [0-9]*'
 
-# parsed verbatim
-DetectorName=CustomRegex  VerificationError='More than one detector has found this result. For your safety, verification has been disabled.You can override this behavior by using the --allow-verification-overlap flag.'
-DetectorName=AWS          VerificationError=None
+# verbatim output
+"unverified_secrets": 2
 ```
 
-Which detector receives `errOverlap` depends on **which is processed second** (the results are iterated from a map, so it is iteration‑order dependent). In this run it was `CustomRegex`; `AWS` came through clean.
+The machine‑readable `--json` view confirms the **invariant**: both results survive and exactly **one** of the two carries `errOverlap` while the other is clean. This aggregate parser is reproducible run‑to‑run:
+
+```
+# command
+$ /tmp/th-investigation/trufflehog filesystem overlap.txt --config custom.yaml --results=verified,unverified,unknown --json 2>/dev/null \
+    | python3 -c 'import sys,json
+r=[json.loads(x) for x in sys.stdin if x.strip()]
+werr=[o["DetectorName"] for o in r if o.get("VerificationError")]
+print("results=%d  with_errOverlap=%d  clean=%d"%(len(r),len(werr),len(r)-len(werr)))'
+
+# verbatim output
+results=2  with_errOverlap=1  clean=1
+```
+
+*Which* detector receives `errOverlap` is **iteration‑order dependent** (the surviving results are drained from a map, so the order is not fixed). Printing the flagged detector once per run over 8 runs shows it alternate — both `CustomRegex` and `AWS` appear as the flagged detector:
+
+```
+# command
+$ for i in $(seq 8); do /tmp/th-investigation/trufflehog filesystem overlap.txt --config custom.yaml --results=verified,unverified,unknown --json 2>/dev/null \
+    | python3 -c 'import sys,json
+r=[json.loads(x) for x in sys.stdin if x.strip()]
+print("run:", [o["DetectorName"] for o in r if o.get("VerificationError")][0])'; done
+
+# verbatim output (which detector is flagged varies run-to-run)
+run: CustomRegex
+run: CustomRegex
+run: CustomRegex
+run: CustomRegex
+run: CustomRegex
+run: AWS
+run: CustomRegex
+run: CustomRegex
+```
 
 ### Evidence — three conditions under which overlap does NOT fire
 
 **(a) The `--allow-verification-overlap` flag.** The flag is defined at `main.go:65` (help text: *"Allow verification of similar credentials across detectors"*). When set, `e.verificationOverlap` is true, so the gate `len(matchingDetectors) > 1 && !e.verificationOverlap` (`pkg/engine/engine.go:796`) is false and the chunk bypasses the overlap worker entirely:
 
 ```
-# command
-$ /tmp/th-investigation/trufflehog filesystem overlap.txt --config custom.yaml --results=verified,unverified,unknown --allow-verification-overlap
+# command — count the console overlap banner (0 = overlap suppressed)
+$ /tmp/th-investigation/trufflehog filesystem overlap.txt --config custom.yaml --results=verified,unverified,unknown --allow-verification-overlap 2>&1 | grep -c 'Verification issue'
 
-# verbatim: 'Verification issue' lines = 0 ; "unverified_secrets": 2
+# verbatim output
+0
 ```
 
-**(b) Same detector type is skipped.** `likelyDuplicate` skips any pair sharing a detector type — `if val.detectorKey.Type() == dupeKey.detectorKey.Type() { continue }` (`pkg/engine/engine.go:900`). All custom detectors emit `DetectorType_CustomRegex` (`pkg/custom_detectors/custom_detectors.go:199`, `Raw`‑only at `:201`, `Type()` at `:346`), so two custom detectors matching one string never overlap. Input `sametype.txt` scanned with two `CustomRegex` detectors (`sametype.yaml`):
-
 ```
-# command
-$ /tmp/th-investigation/trufflehog filesystem sametype.txt --config sametype.yaml --results=verified,unverified,unknown --json | grep -c DetectorName
+# command — both results still emitted (count unchanged)
+$ /tmp/th-investigation/trufflehog filesystem overlap.txt --config custom.yaml --results=verified,unverified,unknown --allow-verification-overlap --json 2>/dev/null | grep -c DetectorName
+
+# verbatim output
 2
-# console: 'Verification issue' lines = 0
+```
+
+**(b) Same detector type is skipped.** `likelyDuplicate` skips any pair sharing a detector type — `if val.detectorKey.Type() == dupeKey.detectorKey.Type() { continue }` (`pkg/engine/engine.go:900`). All custom detectors emit `DetectorType_CustomRegex` (`pkg/custom_detectors/custom_detectors.go:199`, `Raw`‑only at `:201`, `Type()` at `:346`), so two custom detectors matching one string never overlap. To isolate this from the built‑in AWS detector (which would otherwise also match an `id:secret` string and overlap with the customs), `sametype.txt` holds a **non‑AWS** token — `tok = MYAPICRED_abcdefghijklmnopqrstuvwxyzABCDEF` — that only the two `CustomRegex` detectors in `sametype.yaml` match (both keyword `MYAPICRED`, regex `(MYAPICRED_[A-Za-z]{32})`):
+
+```
+# command — no overlap banner (the same-type pair is skipped)
+$ /tmp/th-investigation/trufflehog filesystem sametype.txt --config sametype.yaml --results=verified,unverified,unknown 2>&1 | grep -c 'Verification issue'
+
+# verbatim output
+0
+```
+
+```
+# command — both same-type results survive
+$ /tmp/th-investigation/trufflehog filesystem sametype.txt --config sametype.yaml --results=verified,unverified,unknown --json 2>/dev/null | grep -c DetectorName
+
+# verbatim output
+2
 ```
 
 **(c) The length gate.** Before any similarity is computed, `likelyDuplicate` rejects pairs whose lengths differ by more than ~10%: `if len(dupe)*10 < len(valStr)*9 || len(dupe)*10 > len(valStr)*11 { continue }` (`pkg/engine/engine.go:894`). A custom detector `IdOnlyProbe` capturing only the 20‑char id (`(AKIA[A-Z0-9]{16})`) versus the AWS `RawV2` (~61 chars, `id:secret`) is outside the band (`20*10 = 200 < 61*9 = 549`), so the comparison is skipped:
 
 ```
-# command
-$ /tmp/th-investigation/trufflehog filesystem overlap.txt --config idonly.yaml --results=verified,unverified,unknown --json | grep -c DetectorName
+# command — no overlap banner (the length gate rejects the pair)
+$ /tmp/th-investigation/trufflehog filesystem overlap.txt --config idonly.yaml --results=verified,unverified,unknown 2>&1 | grep -c 'Verification issue'
+
+# verbatim output
+0
+```
+
+```
+# command — both results survive
+$ /tmp/th-investigation/trufflehog filesystem overlap.txt --config idonly.yaml --results=verified,unverified,unknown --json 2>/dev/null | grep -c DetectorName
+
+# verbatim output
 2
-# console: 'Verification issue' lines = 0
 ```
 
 When the length gate and same‑type checks are both passed and the strings are close, similarity is measured with Levenshtein distance — `strutil.Similarity(valStr, dupe, metrics.NewLevenshtein())` (`pkg/engine/engine.go:911`, backed by `github.com/adrg/strutil v0.3.1`, `go.mod:19`) — and overlap fires when `similarity > similarityThreshold`, where `const similarityThreshold = 0.9` (`pkg/engine/engine.go:888`, compared at `:914`). Exact matches short‑circuit to `true` (`if valStr == dupe`, `pkg/engine/engine.go:904`).
@@ -315,43 +411,62 @@ So the key is `DetectorType + Raw + RawV2 + SourceMetadata`. For the *same logic
 
 `adjacent.txt` has the raw id+secret on line 1 and the Base64 blob on line 2:
 
+The `--json` result stream (one JSON object per surviving result, on stdout) is aggregated with a small `python3` parser that prints the count and the distinct line number(s) the id resolves to — both of which are deterministic:
+
 ```
 # command
-$ /tmp/th-investigation/trufflehog filesystem adjacent.txt --no-verification --json
+$ /tmp/th-investigation/trufflehog filesystem adjacent.txt --no-verification --json 2>/dev/null \
+    | python3 -c 'import sys,json
+r=[json.loads(x) for x in sys.stdin if x.strip()]
+lines=sorted(set(o["SourceMetadata"]["Data"]["Filesystem"]["line"] for o in r))
+print("RESULT COUNT =", len(r))
+print(" -> id resolves to line(s):", lines)'
 
-# parsed verbatim (repeatable): RESULT COUNT = 1
+# verbatim output
 RESULT COUNT = 1
- -> Detector=AWS  Decoder=PLAIN  Line=1
+ -> id resolves to line(s): [1]
 ```
 
 `far.txt` has the raw id+secret on line 1, then 20 blank lines, then the Base64 blob on line 22:
 
 ```
 # command
-$ /tmp/th-investigation/trufflehog filesystem far.txt --no-verification --json
+$ /tmp/th-investigation/trufflehog filesystem far.txt --no-verification --json 2>/dev/null \
+    | python3 -c 'import sys,json
+r=[json.loads(x) for x in sys.stdin if x.strip()]
+lines=sorted(set(o["SourceMetadata"]["Data"]["Filesystem"]["line"] for o in r))
+print("RESULT COUNT =", len(r))
+print(" -> id resolves to line(s):", lines)'
 
-# parsed verbatim (repeatable): RESULT COUNT = 1
+# verbatim output
 RESULT COUNT = 1
- -> Detector=AWS  Decoder=BASE64  Line=1
+ -> id resolves to line(s): [1]
 ```
 
-In both, the `PLAIN` and `BASE64` results resolve the id to **line 1** (see Sub‑part 6 for why), so the keys collide and the count deduplicates to **1**. Across 12 repetitions each, `adjacent.txt` and `far.txt` **always** returned exactly one result.
+In both, the `PLAIN` and `BASE64` copies of the id resolve to **line 1** (see Sub‑part 6 for why), so the dedup keys collide and the count deduplicates to **1**. The **count** is the deterministic fact here; the *surviving* decoder label (`PLAIN` vs `BASE64`) is itself non‑deterministic and is quantified separately in Sub‑part 6. Across 12 repetitions each (loop shown in Sub‑part 6), `adjacent.txt` and `far.txt` **always** returned exactly one result.
 
 ### Evidence — no collapse (different lines) → count stays 2
 
 `b64first_far.txt` has the Base64 blob on line 1, 20 blank lines, then the raw id+secret on line 22:
 
+Here the two results resolve to **different lines**, so both survive and each has a fixed decoder→line pairing (the parser sorts by line for a stable ordering):
+
 ```
 # command
-$ /tmp/th-investigation/trufflehog filesystem b64first_far.txt --no-verification --json
+$ /tmp/th-investigation/trufflehog filesystem b64first_far.txt --no-verification --json 2>/dev/null \
+    | python3 -c 'import sys,json
+r=[json.loads(x) for x in sys.stdin if x.strip()]
+print("RESULT COUNT =", len(r))
+for o in sorted(r, key=lambda o: o["SourceMetadata"]["Data"]["Filesystem"]["line"]):
+    print(" -> Detector=%s Decoder=%s Line=%s" % (o["DetectorName"], o["DecoderName"], o["SourceMetadata"]["Data"]["Filesystem"]["line"]))'
 
-# parsed verbatim (stable across 12 runs): RESULT COUNT = 2
+# verbatim output
 RESULT COUNT = 2
- -> Detector=AWS  Decoder=BASE64  Line=1
- -> Detector=AWS  Decoder=PLAIN   Line=22
+ -> Detector=AWS Decoder=BASE64 Line=1
+ -> Detector=AWS Decoder=PLAIN Line=22
 ```
 
-Here the two results resolve to **different lines** (1 vs 22), so their `SourceMetadata` differs, the keys differ, and both survive — the count stays **2**.
+The two results resolve to **different lines** (1 vs 22), so their `SourceMetadata` differs, the keys differ, and both survive — the count stays **2**. (Unlike the collapse cases, the decoder→line pairing here *is* deterministic: `BASE64` always lands at line 1 — where the blob is decoded in place — and `PLAIN` always at line 22 — the raw copy; verified stable across repeated runs.)
 
 > **Distinction from overlap (Sub‑part 3).** Deduplication actually **removes** a result (2 → 1). Overlap detection does **not** — in the overlap evidence the count remained 2; overlap only attaches `errOverlap` and disables verification.
 
@@ -390,21 +505,9 @@ flowchart TD
 
 The crux is that the dedup key includes `SourceMetadata`, i.e. the **line number** (`pkg/engine/engine.go:1216`). The reported line is the **first occurrence** of the id within each decoder's (possibly rewritten) chunk. Because the `Base64` decoder **substitutes decoded bytes in place** (`chunk.Data = result.Bytes()`, `pkg/decoders/base64.go:67`), the decoded id lands at the byte position where the Base64 blob was. So the line the id resolves to depends on **where the encodings sit relative to each other**:
 
-- **Raw appears first / on the same line as the blob** (`adjacent.txt`, `far.txt`): the `PLAIN` result finds the raw id at line 1; the `BASE64` result's chunk still contains that same raw id at line 1 (plus the decoded copy later). Both resolve to **line 1** → identical dedup keys → the later result is dropped → **1 result**. Because `UTF8` is first in the chain (`pkg/decoders/decoders.go:10`, *"UTF8 must be first for duplicate detection"*), this "same line ⇒ collapse" is the intended design.
+- **Raw appears first / on the same line as the blob** (`adjacent.txt`, `far.txt`): the `PLAIN` result finds the raw id at line 1; the `BASE64` result's chunk still contains that same raw id at line 1 (plus the decoded copy later). Both resolve to **line 1** → identical dedup keys → the later result is dropped → **1 result** (the command‑backed `RESULT COUNT = 1` / `line(s): [1]` evidence is in Sub‑part 4). Because `UTF8` is first in the chain (`pkg/decoders/decoders.go:10`, *"UTF8 must be first for duplicate detection"*), this "same line ⇒ collapse" is the intended design.
 
-  ```
-  # far.txt (raw line 1, blob line 22) — repeatable
-  RESULT COUNT = 1
-  ```
-
-- **Base64 blob appears first, raw far below** (`b64first_far.txt`): the `PLAIN` result finds the raw id only at **line 22** (the blob at line 1 is not valid `AKIA…` text), while the `Base64` decoder's in‑place substitution puts the decoded id at **line 1**. Different lines → different `SourceMetadata` → different keys → **both survive → 2 results**.
-
-  ```
-  # b64first_far.txt (blob line 1, raw line 22) — stable across 12 runs
-  RESULT COUNT = 2
-   -> Decoder=BASE64  Line=1
-   -> Decoder=PLAIN   Line=22
-  ```
+- **Base64 blob appears first, raw far below** (`b64first_far.txt`): the `PLAIN` result finds the raw id only at **line 22** (the blob at line 1 is not valid `AKIA…` text), while the `Base64` decoder's in‑place substitution puts the decoded id at **line 1**. Different lines → different `SourceMetadata` → different keys → **both survive → 2 results** (the command‑backed `RESULT COUNT = 2` with `BASE64 Line=1` / `PLAIN Line=22` evidence is in Sub‑part 4).
 
 So the **result count** is deterministic and is governed entirely by whether the two encodings resolve the id to the *same* line (collapse to 1) or *different* lines (stay at 2).
 
@@ -412,14 +515,32 @@ So the **result count** is deterministic and is governed entirely by whether the
 
 The AAP dossier predicted that when the count collapses to 1 the survivor is deterministically `PLAIN` (because `UTF8` is first in the decoder chain). **My runtime observation differs, and per the "report exactly what is observed" rule I record it here:** the *count* is deterministic (always 1 for the same‑line cases), but the *surviving decoder label* is **not**.
 
+The loop below runs each same‑line input 12 times and prints, per run, `<result-count>:<surviving-decoder>`, then aggregates with `sort | uniq -c`:
+
 ```
-# adjacent.txt — survivor decoder over 12 runs (count:decoder)
-      8   1:BASE64
-      4   1:PLAIN
-# far.txt — survivor decoder over 12 runs
-     10   1:BASE64
-      2   1:PLAIN
+# command
+$ for i in $(seq 12); do /tmp/th-investigation/trufflehog filesystem adjacent.txt --no-verification --json 2>/dev/null \
+    | python3 -c 'import sys,json
+r=[json.loads(x) for x in sys.stdin if x.strip()]
+print("%d:%s" % (len(r), r[0]["DecoderName"]))'; done | sort | uniq -c
+
+# verbatim output (one batch)
+     12 1:BASE64
 ```
+
+```
+# command
+$ for i in $(seq 12); do /tmp/th-investigation/trufflehog filesystem far.txt --no-verification --json 2>/dev/null \
+    | python3 -c 'import sys,json
+r=[json.loads(x) for x in sys.stdin if x.strip()]
+print("%d:%s" % (len(r), r[0]["DecoderName"]))'; done | sort | uniq -c
+
+# verbatim output (one batch)
+     11 1:BASE64
+      1 1:PLAIN
+```
+
+In **every** line of both batches the count component is `1:` — collapse to a single result is **deterministic**. The decoder label after the colon (`BASE64` vs `PLAIN`) is **not**: it splits differently from batch to batch (this `adjacent.txt` batch happened to be all `BASE64`, while the `far.txt` batch shows both `BASE64` and `PLAIN`; re‑running the same loop yields other splits). That race is explained next.
 
 The cause is concurrency downstream of the single decoder pass. The engine spawns `numWorkers := e.concurrency * e.detectorWorkerMultiplier` detector workers (`pkg/engine/engine.go:676`) with `detectorWorkerMultiplier` defaulting to `8` (`pkg/engine/engine.go:345`) — i.e. 32 workers on this 4‑core host — feeding a shared `e.results` channel drained by `numWorkers := e.notificationWorkerMultiplier * e.concurrency` notifier workers (`pkg/engine/engine.go:706`), with `notificationWorkerMultiplier` defaulting to `1` (`pkg/engine/engine.go:349`) — i.e. 4 notifier workers sharing one `dedupeCache`. The LRU keeps whichever result with a given key is **added first** (`e.dedupeCache.Add(key, result.DecoderType)`, `pkg/engine/engine.go:1221`); since the arrival order across concurrent workers is a race, the surviving `DecoderType` (`PLAIN` vs `BASE64`) varies run‑to‑run. This does not change the user‑visible answer to "one vs many" — the **count** is what the dedup key determines, and that remains deterministic.
 
@@ -455,7 +576,7 @@ Every named item from the question is addressed:
 - [x] **AWS `idPat` / `Raw` / `RawV2`** (`pkg/detectors/aws/access_keys/accesskey.go:65`, `:138`, `:140`).
 - [x] **AWS session‑key detector** (`pkg/detectors/aws/session_keys/sessionkey.go:61`, `:68`, `:116`).
 - [x] **Custom detectors** (`pkg/custom_detectors/custom_detectors.go:199`, `:201`, `:346`).
-- [x] **Pin‑to‑commit** — no iterative `--max-decode-depth` at this commit (zero source matches).
+- [x] **Pin‑to‑commit** — no iterative `--max-decode-depth` at this commit (zero source matches; `git grep` command + verbatim `exit=1` output in the *Pin‑to‑commit note* near the top).
 - [x] **Two mechanisms kept distinct** — overlap disables verification (count unchanged); dedup removes a result (2 → 1).
 
 ### Mapping back to the user's three observed symptoms
@@ -468,5 +589,45 @@ Every named item from the question is addressed:
 
 ## Read‑only compliance
 
-All investigation artifacts — the compiled `trufflehog` binary, the crafted input files (`plain.txt`, `b64.txt`, `escaped.txt`, `utf16le.txt`, `utf16_bom.txt`, `utf16_newline.txt`, `overlap.txt`, `adjacent.txt`, `far.txt`, `b64first_far.txt`, `sametype.txt`) and the custom‑detector configs (`custom.yaml`, `idonly.yaml`, `sametype.yaml`) — were created under `/tmp/th-investigation`, **outside** the repository tree, and deleted after the investigation. The build used the committed `go.sum` in read‑only module mode (no `-mod=mod`), so neither `go.mod` nor `go.sum` was modified. No existing repository file was changed; the only addition to the repository is **this document**. A final `git status --porcelain` from the repository root shows only this new file (see the commit accompanying this document), confirming the source tree is otherwise byte‑for‑byte unchanged.
+All investigation artifacts — the compiled `trufflehog` binary, the crafted input files (`plain.txt`, `b64.txt`, `escaped.txt`, `utf16le.txt`, `utf16_bom.txt`, `utf16_newline.txt`, `overlap.txt`, `adjacent.txt`, `far.txt`, `b64first_far.txt`, `sametype.txt`) and the custom‑detector configs (`custom.yaml`, `idonly.yaml`, `sametype.yaml`) — were created under `/tmp/th-investigation`, **outside** the repository tree, and deleted after the investigation. The build used the committed `go.sum` in read‑only module mode (no `-mod=mod`), so neither `go.mod` nor `go.sum` was modified. No existing repository file was changed; the only addition to the repository is **this document**.
+
+The evidence below keeps **two independent facts distinct** (they are easy to conflate): the **baseline diff** — the *net* change this branch introduces relative to the pre‑work head commit `e42153d4` — versus **working‑tree cleanliness** *after* the commit that adds this document.
+
+**(a) Scratch artifacts removed.** The entire `/tmp/th-investigation` tree (binary, crafted inputs, YAML configs) no longer exists:
+
+```
+# command
+$ ls -d /tmp/th-investigation
+
+# verbatim output
+ls: cannot access '/tmp/th-investigation': No such file or directory
+```
+
+**(b) Baseline diff — exactly one *added* file relative to the pre‑work head `e42153d4`.** The leading `A` (added) and the single path prove no existing source/config/test/build/dependency file was created, modified, or deleted — only this document was added:
+
+```
+# command
+$ git diff --name-status e42153d4..HEAD
+
+# verbatim output
+A	blitzy/documentation/trufflehog_e42153d44a5e.md
+```
+
+**(c) Working‑tree cleanliness after the commit.** This is a *separate* fact from the baseline diff: after committing this document, the working tree carries no uncommitted modifications, no staged‑but‑uncommitted changes, and no untracked leftovers (e.g. stray scratch files). Both `git status --porcelain` and `git diff --stat` emit nothing; counting their lines yields `0`, quoted verbatim:
+
+```
+# command  (count porcelain status lines; 0 ⇒ clean working tree, nothing modified/staged/untracked)
+$ git status --porcelain | wc -l
+
+# verbatim output
+0
+
+# command  (count diff-stat lines; 0 ⇒ no unstaged/uncommitted changes)
+$ git diff --stat | wc -l
+
+# verbatim output
+0
+```
+
+Together these confirm the source tree is byte‑for‑byte unchanged apart from the single added document: the baseline diff shows exactly one `A` entry (fact **b**), and the working tree is clean after the commit (fact **c**).
 
