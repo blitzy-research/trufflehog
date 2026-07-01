@@ -40,8 +40,11 @@ here is a **minimal `filesystem` scan** with:
   ```go
   noVerification      = cli.Flag("no-verification", "Don't verify the results.").Bool()
   ```
-- **`--no-update`** — suppresses self‑update. (The self‑update overseer is also
-  already disabled for `dev` builds; see §1.3.)
+- **`--no-update`** — suppresses self‑update. Flag declared at `main.go:L73`:
+  ```go
+  noUpdate             = cli.Flag("no-update", "Don't check for updates.").Bool()
+  ```
+  (The self‑update overseer is also already disabled for `dev` builds; see §1.3.)
 - a **tiny, secret‑free directory *outside* the repository** as the target, so
   the run is deterministic and cannot find or verify anything.
 
@@ -83,16 +86,24 @@ runs; combined with `--no-update`, the run performs no update activity.
 
 ### 1.4 The safe / "dry" run (observed)
 
+The trace output (stdout + stderr) is redirected to `/tmp/th_capture.log` so that
+**every** measured value below can be reproduced with its own exact command:
+
 ```bash
 mkdir -p /tmp/th_probe
 printf 'hello world\nthis is a plain text sample with no secrets\n' > /tmp/th_probe/sample.txt
-/tmp/trufflehog_bin filesystem /tmp/th_probe --log-level=5 --no-verification --no-update
+/tmp/trufflehog_bin filesystem /tmp/th_probe --log-level=5 --no-verification --no-update > /tmp/th_capture.log 2>&1
+echo "exit=$?"        # → exit=0
 ```
 
 `--log-level=5` (trace) is what makes the initialization lines observable:
-messages emitted at V(4)/V(3)/V(2)/V(0) all print at level 5 (see §1.6). The
-probe file is **56 bytes** (`wc -c` → `56 /tmp/th_probe/sample.txt`) and contains
-no secrets.
+messages emitted at V(4)/V(3)/V(2)/V(0) all print at level 5 (see §1.6). The probe
+file is **56 bytes** and contains no secrets — verified with its producing command:
+
+```bash
+$ wc -c /tmp/th_probe/sample.txt
+56 /tmp/th_probe/sample.txt
+```
 
 ### 1.5 Host & run facts (observed on THIS host — reported exactly)
 
@@ -103,12 +114,12 @@ no secrets.
 | `runtime.NumCPU()` | **128** |
 | `runtime.GOMAXPROCS(0)` | **128** |
 | Probe file size | **56 bytes** |
-| Total log lines captured | **163** |
+| Total log lines captured | **145** (clean `/tmp`; see §1.8 reconciliation) |
 | scanner / verificationOverlap / notifier workers | **128** each |
 | detector workers | **1024** (= 128 × 8) |
 | `"finished scanning chunks"` lines | **128** (128 distinct `scanner_worker_id`) |
-| `scan_duration` (this run) | **`"5.88645ms"`** |
-| `source_manager_worker_id` (this run) | **`"cLHmR"`** |
+| `scan_duration` (this run) | **`"4.89677ms"`** |
+| `source_manager_worker_id` (this run) | **`"T82iE"`** |
 
 > **Important host nuance (reported exactly, not normalized).** `nproc` reports
 > **4** on this host, yet TruffleHog started **128** scanner workers. This is not
@@ -121,12 +132,35 @@ no secrets.
 > `runtime.NumCPU()` differs, these counts will differ and must be read from the
 > logs, not assumed.**
 
-Directly observed CPU facts (from a tiny throwaway program run outside the repo):
-```text
+Directly observed CPU facts. These were produced by a **tiny throwaway Go program**
+(written and run **outside** the repository tree, then removed) plus the `nproc`
+shell utility — showing the exact code and commands that produced each value:
+
+```go
+// /tmp/cpucheck.go — throwaway; removed after capture (lives outside the repo tree)
+package main
+
+import (
+	"fmt"
+	"runtime"
+)
+
+func main() {
+	fmt.Printf("runtime.NumCPU()=%d\n", runtime.NumCPU())
+	fmt.Printf("runtime.GOMAXPROCS(0)=%d\n", runtime.GOMAXPROCS(0))
+}
+```
+
+```bash
+$ go run /tmp/cpucheck.go
 runtime.NumCPU()=128
 runtime.GOMAXPROCS(0)=128
-nproc=4
+$ nproc
+4
 ```
+
+The scratch file `/tmp/cpucheck.go` was deleted after capture; because it lives
+outside the repository tree, the working tree is unaffected (see the Appendix).
 
 ### 1.6 Reading the logs: the `info-N` token and the V‑level convention
 
@@ -135,7 +169,7 @@ fields: `<timestamp>\t<info-N>\t<service>\t<message>[\t<json-fields>]`. One
 untrimmed line, exactly as captured:
 
 ```text
-2026-07-01T22:05:23Z	info-2	trufflehog	trufflehog dev
+2026-07-01T22:33:49Z	info-2	trufflehog	trufflehog dev
 ```
 
 - The timestamp is RFC3339 — grounded at `pkg/log/log.go:L117`:
@@ -191,19 +225,24 @@ flowchart TD
     M -->|"info-0 finished scanning chunks=1 bytes=56 [main.go:L566]"| N["scan complete (exit 0)"]
 ```
 
+> **Note.** This is a *startup code‑to‑log sequence* map (which log line each stage
+> emits, in order), **not** the inter‑pool chunk‑routing graph. The four worker pools
+> run concurrently; how chunks actually flow *between* them — the **direct** path
+> (`scanner → detector → notifier`) and the **overlap** path
+> (`scanner → verificationOverlap → detector → notifier`) — is detailed in §5.2.1.
+
 ### 1.8 The captured startup log (verbatim; timestamps trimmed, repeats collapsed)
 
-The full capture is **163 lines**. Below, the leading `2026-07-01T22:05:23Z\t`
+The full capture is **145 lines**. Below, the leading `2026-07-01T22:33:49Z\t`
 timestamp prefix is **trimmed for readability** (stated here explicitly), and the
-two large repeated groups are **collapsed with their exact counts** — every other
-line is reproduced exactly as captured:
+one large repeated group (the 128 `finished scanning chunks` lines) is **collapsed
+with its exact count** — every other line is reproduced exactly as captured:
 
 ```text
 info-2  trufflehog  trufflehog dev
 🐷🔑🐷  TruffleHog. Unearth your secrets. 🐷🔑🐷
                                             (1 blank line — from the banner's trailing "\n\n")
 info-4  trufflehog  default engine options set
-info-4  trufflehog  Deleted orphaned temp artifact  {"artifact": "/tmp/trufflehog-135951-3805937651"}   (×17 total, interleaved; see §5.5)
 info-4  trufflehog  engine initialized
 info-4  trufflehog  setting up aho-corasick core
 info-4  trufflehog  set up aho-corasick core
@@ -211,24 +250,38 @@ info-2  trufflehog  starting scanner workers  {"count": 128}
 info-2  trufflehog  starting detector workers  {"count": 1024}
 info-2  trufflehog  starting verificationOverlap workers  {"count": 128}
 info-2  trufflehog  starting notifier workers  {"count": 128}
-info-0  trufflehog  running source  {"source_manager_worker_id": "cLHmR", "with_units": true}
-info-2  trufflehog  enumerating source  {"source_manager_worker_id": "cLHmR"}
-info-3  trufflehog  chunking unit  {"source_manager_worker_id": "cLHmR", "unit_kind": "unit", "unit": "/tmp/th_probe/sample.txt"}
-info-3  trufflehog  scanning file  {"source_manager_worker_id": "cLHmR", "unit_kind": "unit", "unit": "/tmp/th_probe/sample.txt", "path": "/tmp/th_probe/sample.txt"}
-info-5  trufflehog  dataErrChan closed, all chunks processed  {"source_manager_worker_id": "cLHmR", "unit_kind": "unit", "unit": "/tmp/th_probe/sample.txt", "path": "/tmp/th_probe/sample.txt", "mime": "text/plain; charset=utf-8", "timeout": 60}
-info-4  trufflehog  finished scanning chunks  {"scanner_worker_id": "v9dWT"}   (×128 — exactly one per scanner worker; IDs are random 5-char, e.g. "v9dWT", "18loG", "uRYhz", …)
-error   trufflehog  error cleaning temp artifacts  {"error": "error deleting temp artifact (dir: false) /tmp/trufflehog-135951-3252364618: remove /tmp/trufflehog-135951-3252364618: no such file or directory"}
-info-0  trufflehog  finished scanning  {"chunks": 1, "bytes": 56, "verified_secrets": 0, "unverified_secrets": 0, "scan_duration": "5.88645ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
+info-0  trufflehog  running source  {"source_manager_worker_id": "T82iE", "with_units": true}
+info-2  trufflehog  enumerating source  {"source_manager_worker_id": "T82iE"}
+info-3  trufflehog  chunking unit  {"source_manager_worker_id": "T82iE", "unit_kind": "unit", "unit": "/tmp/th_probe/sample.txt"}
+info-3  trufflehog  scanning file  {"source_manager_worker_id": "T82iE", "unit_kind": "unit", "unit": "/tmp/th_probe/sample.txt", "path": "/tmp/th_probe/sample.txt"}
+info-5  trufflehog  dataErrChan closed, all chunks processed  {"source_manager_worker_id": "T82iE", "unit_kind": "unit", "unit": "/tmp/th_probe/sample.txt", "path": "/tmp/th_probe/sample.txt", "mime": "text/plain; charset=utf-8", "timeout": 60}
+info-4  trufflehog  finished scanning chunks  {"scanner_worker_id": "OXGaT"}   (×128 — exactly one per scanner worker; IDs are random 5-char, e.g. "OXGaT", "dP01l", "9sXI6", …)
+info-0  trufflehog  finished scanning  {"chunks": 1, "bytes": 56, "verified_secrets": 0, "unverified_secrets": 0, "scan_duration": "4.89677ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
 ```
 
-**Exact 163‑line reconciliation (this host):**
-`128` (`finished scanning chunks`, one per scanner worker) `+ 17`
-(`Deleted orphaned temp artifact`) `+ 1` (`error cleaning temp artifacts`) `+ 4`
-(the four `starting … workers` lines) `+ 1` (blank line after the banner) `+ 12`
-unique core lines (`trufflehog dev`; banner; `default engine options set`;
-`engine initialized`; `setting up aho-corasick core`; `set up aho-corasick core`;
-`running source`; `enumerating source`; `chunking unit`; `scanning file`;
-`dataErrChan closed…`; `finished scanning`) **= 163**.
+**Exact 145‑line reconciliation (this clean‑`/tmp` run)** — every term verified by its
+own command against the captured log:
+
+```bash
+$ wc -l < /tmp/th_capture.log
+145
+$ grep -c 'finished scanning chunks' /tmp/th_capture.log
+128
+$ grep -cE 'starting (scanner|detector|verificationOverlap|notifier) workers' /tmp/th_capture.log
+4
+$ grep -c '^$' /tmp/th_capture.log
+1
+$ grep -c 'Deleted orphaned temp artifact' /tmp/th_capture.log
+0
+```
+
+`128` (`finished scanning chunks`, one per scanner worker) `+ 4` (the four
+`starting … workers` lines) `+ 1` (blank line after the banner) `+ 12` unique core
+lines (`trufflehog dev`; banner; `default engine options set`; `engine initialized`;
+`setting up aho-corasick core`; `set up aho-corasick core`; `running source`;
+`enumerating source`; `chunking unit`; `scanning file`; `dataErrChan closed…`;
+`finished scanning`) **= 145**. There are **no** temp‑artifact lines because `/tmp`
+was clean (the final `grep -c` is `0`; mechanism explained in §5.5).
 
 ---
 
@@ -436,14 +489,33 @@ efficiently.
 
 TruffleHog's runtime is a set of **decoupled producer/consumer goroutine pools**
 connected by **buffered Go channels**. A **source manager** decomposes the target
-into *source → unit → chunk*, and those chunks flow scanner → detector →
-verificationOverlap → notifier. The topology is corroborated by the repository's
-own `docs/concurrency.md` (which names `ScannerWorkers`,
-`VerificationOverlapWorkers`, `DetectorWorkers`, `NotifierWorkers` and the
-channels `e.ChunksChan()`, `e.detectableChunksChan`,
-`e.verificationOverlapChunksChan`) and `docs/process_flow.md` (Source
-Decomposition → Detector Matching → Secret Detection → Result Notification).
-Below, each claim is grounded in an **observed line** from this run.
+into *source → unit → chunk*, and those chunks are routed through the pipeline over
+**two distinct paths**, chosen *per chunk* by how many detectors match its keywords:
+
+- **Direct path — `scanner → detector → notifier`.** Taken when a chunk matches **at
+  most one** detector: the scanner sends it straight to the detector pool over
+  `e.detectableChunksChan`.
+- **Overlap path — `scanner → verificationOverlap → detector → notifier`.** Taken
+  when a chunk matches **more than one** detector (and `--allow-verification-overlap`
+  is not set): the scanner sends it to the verificationOverlap pool over
+  `e.verificationOverlapChunksChan`; that pool decides which detector(s) should run
+  and forwards the selected work to the detector pool over `e.detectableChunksChan`.
+
+In **both** paths the detector pool writes results to `e.results`, and the notifier
+pool reads them from `e.ResultsChan()`. The verification-overlap stage is therefore
+**not** downstream of the detector stage — it sits **between** the scanner and the
+detector for multi-detector chunks. Each hop is grounded in source at §5.2.1 and
+corroborated by the repository's own `docs/concurrency.md`, which names
+`ScannerWorkers`, `VerificationOverlapWorkers`, `DetectorWorkers`, `NotifierWorkers`
+and shows exactly these edges: `ScannerWorkers → DetectorWorkers` via
+`e.detectableChunksChan` (`docs/concurrency.md:L29`), `ScannerWorkers →
+VerificationOverlapWorkers` via `e.verificationOverlapChunksChan`
+(`docs/concurrency.md:L31`), `VerificationOverlapWorkers → DetectorWorkers` via
+`e.detectableChunksChan` (`docs/concurrency.md:L34`), and `DetectorWorkers →
+NotifierWorkers` via `e.ResultsChan()|e.results` (`docs/concurrency.md:L37`);
+`docs/process_flow.md` corroborates the coarse flow (Source Decomposition → Detector
+Matching → Secret Detection → Result Notification). Below, each claim is grounded in
+an **observed line** from this run or an exact source citation.
 
 ### 5.1 The four worker pools (started in `startWorkers`)
 
@@ -478,7 +550,7 @@ This is why the counts are **128, not `nproc`'s 4**: `runtime.NumCPU()` on this
 host is **128** (directly observed; §1.5). The engine's *fallback* to
 `runtime.NumCPU()` at `pkg/engine/engine.go:L337-L340` (which would also emit a
 `"No concurrency specified, defaulting to max"` line) **did not fire** — that log
-line is **absent** from the 163‑line capture, confirming `e.concurrency` came
+line is **absent** from the 145‑line capture, confirming `e.concurrency` came
 from the flag default rather than the fallback. **On a host with a different
 `runtime.NumCPU()` these counts will differ and must be read from the logs.**
 
@@ -504,6 +576,49 @@ The pools communicate over buffered channels allocated in `initialize`
 does not block the scanner while detectors are busy; sizing off
 `runtime.NumCPU()` scales the buffers with the worker‑pool sizes.
 
+### 5.2.1 Chunk routing — the two paths (grounded in source)
+
+The per‑chunk routing decision lives in `scannerWorker`
+(`pkg/engine/engine.go:L777`), which reads chunks from `e.ChunksChan()`
+(`pkg/engine/engine.go:L781`). After decoding, it asks the Aho‑Corasick prefilter
+which detectors match, then branches on the match count:
+
+```go
+matchingDetectors := e.AhoCorasickCore.FindDetectorMatches(decoded.Chunk.Data)  // engine.go:L795
+if len(matchingDetectors) > 1 && !e.verificationOverlap {                        // engine.go:L796
+    wgVerificationOverlap.Add(1)
+    e.verificationOverlapChunksChan <- verificationOverlapChunk{ ... }           // engine.go:L798-L803  → OVERLAP path
+    continue
+}
+for _, detector := range matchingDetectors {                                     // engine.go:L807
+    ...
+    e.detectableChunksChan <- detectableChunk{ ... }                             // engine.go:L810      → DIRECT path
+}
+```
+
+So the branch is explicit: **> 1 matching detector ⇒ verificationOverlap first;
+otherwise ⇒ detector directly.** The exact channel wiring, hop by hop:
+
+| Hop | Producer → Consumer | Channel | Source `file:line` | `docs/concurrency.md` |
+|-----|---------------------|---------|--------------------|-----------------------|
+| Direct | scanner → detector | `e.detectableChunksChan` | send `engine.go:L810` (loop `L807`); recv `engine.go:L1037` | `L29` |
+| Overlap (in) | scanner → verificationOverlap | `e.verificationOverlapChunksChan` | send `engine.go:L798-L803`; recv `engine.go:L924` (`verificationOverlapWorker`) | `L31` |
+| Overlap (out) | verificationOverlap → detector | `e.detectableChunksChan` | send `engine.go:L1014` (loop `L1011-L1019`); recv `engine.go:L1037` | `L34` |
+| Results | detector → notifier | `e.results` / `e.ResultsChan()` | write `engine.go:L1186`; `ResultsChan()` `engine.go:L748-L750`; recv `engine.go:L1190` (`notifierWorker` `L1189`) | `L37` |
+
+**Rationale (and the honest scope of this run's evidence).** When several detectors
+claim the same chunk (`len(matchingDetectors) > 1`), the scanner routes to
+verificationOverlap so a single detector is chosen to own verification — avoiding
+duplicate verification of the same credential; otherwise it routes straight to the
+detector pool. Because this safe run scanned a **secret‑free plain‑text file**, no
+chunk produced detector results to *observe* traversing detector → notifier (the
+summary reports `verified_secrets: 0` / `unverified_secrets: 0`, §5.4). The routing
+above is therefore grounded in **exact source citations** and corroborated by
+`docs/concurrency.md:L29-L37`, consistent with the methodology's "ground every claim
+in a code reference or observed output." The key correction over a naive reading:
+verificationOverlap is **not** a stage *after* the detector — it sits **between** the
+scanner and the detector, and only for multi‑detector chunks.
+
 ### 5.3 The source‑manager pipeline: source → unit → chunk (observed order)
 
 The source manager (`sources.NewManager`, `pkg/sources/source_manager.go:L107`,
@@ -514,7 +629,7 @@ its emitting site**:
 
 1. **running source** — `info-0`:
    ```text
-   info-0  trufflehog  running source  {"source_manager_worker_id": "cLHmR", "with_units": true}
+   info-0  trufflehog  running source  {"source_manager_worker_id": "T82iE", "with_units": true}
    ```
    Emitted at `pkg/sources/source_manager.go:L363-L364` (the `runWithUnits`
    branch of `run`). `with_units: true` confirms the units pipeline. This is a
@@ -522,7 +637,7 @@ its emitting site**:
 
 2. **enumerating source** — `info-2`:
    ```text
-   info-2  trufflehog  enumerating source  {"source_manager_worker_id": "cLHmR"}
+   info-2  trufflehog  enumerating source  {"source_manager_worker_id": "T82iE"}
    ```
    Emitted at `pkg/sources/source_manager.go:L531` (inside `runWithUnits`).
    (The similarly‑named `enumerate` function definition at
@@ -531,14 +646,14 @@ its emitting site**:
 
 3. **chunking unit** — `info-3`:
    ```text
-   info-3  trufflehog  chunking unit  {"source_manager_worker_id": "cLHmR", "unit_kind": "unit", "unit": "/tmp/th_probe/sample.txt"}
+   info-3  trufflehog  chunking unit  {"source_manager_worker_id": "T82iE", "unit_kind": "unit", "unit": "/tmp/th_probe/sample.txt"}
    ```
    Emitted at `pkg/sources/source_manager.go:L557`. The single unit is our probe
    file, named exactly.
 
 4. **scanning file** — `info-3`:
    ```text
-   info-3  trufflehog  scanning file  {"source_manager_worker_id": "cLHmR", "unit_kind": "unit", "unit": "/tmp/th_probe/sample.txt", "path": "/tmp/th_probe/sample.txt"}
+   info-3  trufflehog  scanning file  {"source_manager_worker_id": "T82iE", "unit_kind": "unit", "unit": "/tmp/th_probe/sample.txt", "path": "/tmp/th_probe/sample.txt"}
    ```
    Emitted at `pkg/sources/filesystem/filesystem.go:L179` (a filesystem‑source
    line, not the source manager).
@@ -546,7 +661,7 @@ its emitting site**:
 5. **dataErrChan closed, all chunks processed** — `info-5` (the highest
    verbosity; only visible at level 5):
    ```text
-   info-5  trufflehog  dataErrChan closed, all chunks processed  {"source_manager_worker_id": "cLHmR", "unit_kind": "unit", "unit": "/tmp/th_probe/sample.txt", "path": "/tmp/th_probe/sample.txt", "mime": "text/plain; charset=utf-8", "timeout": 60}
+   info-5  trufflehog  dataErrChan closed, all chunks processed  {"source_manager_worker_id": "T82iE", "unit_kind": "unit", "unit": "/tmp/th_probe/sample.txt", "path": "/tmp/th_probe/sample.txt", "mime": "text/plain; charset=utf-8", "timeout": 60}
    ```
    Emitted at `pkg/handlers/handlers.go:L413`. Note the observed `"mime":
    "text/plain; charset=utf-8"` and `"timeout": 60` — reported exactly.
@@ -560,20 +675,35 @@ pool — the concrete instance of the source→unit→chunk decomposition.
 **Claim:** each scanner worker logs completion exactly once as the pipeline
 drains. **Evidence (verbatim, one representative of many):**
 ```text
-info-4  trufflehog  finished scanning chunks  {"scanner_worker_id": "v9dWT"}
+info-4  trufflehog  finished scanning chunks  {"scanner_worker_id": "OXGaT"}
 ```
 **Citation:** `ctx.Logger().V(4).Info("finished scanning chunks")` at
 `pkg/engine/engine.go:L840` (inside `scannerWorker`, defined at
 `pkg/engine/engine.go:L777`). **Observed magnitude (reported exactly):** this line
 appears **128 times**, carrying **128 distinct** `scanner_worker_id` values —
 i.e. **exactly one per scanner worker** (matching the `count: 128` from §5.1).
-The IDs are random 5‑character strings (`common.RandomID(5)`), e.g. `"v9dWT"`,
-`"18loG"`, `"uRYhz"` — run‑specific, reported as observed.
+The IDs are random 5‑character strings (`common.RandomID(5)`), e.g. `"OXGaT"`,
+`"dP01l"`, `"9sXI6"` — run‑specific, reported as observed.
+
+**Producing commands (verbatim; `/tmp/th_capture.log` is the redirected trace output
+of the §1.4 run):**
+```bash
+$ grep -c 'finished scanning chunks' /tmp/th_capture.log
+128
+$ grep 'finished scanning chunks' /tmp/th_capture.log \
+    | grep -o '"scanner_worker_id": "[^"]*"' | sort -u | wc -l
+128
+```
+The first command counts the completion lines; the second extracts every
+`scanner_worker_id`, de‑duplicates (`sort -u`), and counts — confirming **128 lines
+carrying 128 distinct IDs**, exactly one per scanner worker. (The specific ID
+*values* differ every run; the *count* is stable at `e.concurrency` = 128 on this
+128‑CPU host.)
 
 **Claim:** the run then prints a single completion summary. **Evidence
 (verbatim, this run):**
 ```text
-info-0  trufflehog  finished scanning  {"chunks": 1, "bytes": 56, "verified_secrets": 0, "unverified_secrets": 0, "scan_duration": "5.88645ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
+info-0  trufflehog  finished scanning  {"chunks": 1, "bytes": 56, "verified_secrets": 0, "unverified_secrets": 0, "scan_duration": "4.89677ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
 ```
 **Citation:** `logger.Info("finished scanning", ...)` at `main.go:L566`, with
 fields `"chunks"` (`main.go:L567`), `"bytes"` (`main.go:L568`), `"scan_duration"`
@@ -582,34 +712,36 @@ notifier stage aggregates results and this `V(0)` summary is the terminal signal
 of the pipeline: `chunks: 1` (the one chunk from our one file), `bytes: 56` (the
 probe's exact size), `verified_secrets: 0` / `unverified_secrets: 0` (a
 secret‑free target scanned with `--no-verification`), and `scan_duration:
-"5.88645ms"` for this particular run. The process then exits `0`.
+"4.89677ms"` for this particular run. The process then exits `0`.
 
-### 5.5 Also observed at startup (reported exactly, even though incidental)
+### 5.5 Startup temp‑artifact housekeeping (mechanism; **0** lines on this clean run)
 
-At level 5 the capture also contained startup **temp‑artifact cleanup** activity —
-part of "coming online," so reported honestly:
+Part of "coming online" is TruffleHog's own temp‑artifact housekeeping. At startup a
+goroutine (`main.go:L386-L388`) calls `cleantemp.CleanTempArtifacts`
+(`pkg/cleantemp/cleantemp.go:L47`), which deletes leftover `/tmp/trufflehog-*` files
+from **prior** runs; each deletion logs `Deleted orphaned temp artifact` at `V(4)`
+(`pkg/cleantemp/cleantemp.go:L113`). A second, deferred cleanup runs at the end of
+`runSingleScan` (`main.go:L694-L697`).
 
-- **17×** `Deleted orphaned temp artifact` — `info-4`:
-  ```text
-  info-4  trufflehog  Deleted orphaned temp artifact  {"artifact": "/tmp/trufflehog-135951-3805937651"}
-  ```
-  Emitted at `pkg/cleantemp/cleantemp.go:L113` (`V(4)`). These delete leftover
-  `/tmp/trufflehog-*` files from **prior** TruffleHog runs; the count (17 here) is
-  host/run‑specific.
+**On this run these produced *zero* log lines**, because `/tmp` contained no leftover
+`trufflehog-*` files. Reported exactly, with the producing commands:
+```bash
+$ grep -c 'Deleted orphaned temp artifact' /tmp/th_capture.log
+0
+$ grep -c 'error cleaning temp artifacts' /tmp/th_capture.log
+0
+```
+This is why the 145‑line total (§1.8) carries **no** temp‑artifact noise.
 
-- **1×** an `error`‑level line (note: the token is the literal `"error"`, not
-  `info-N`, per `pkg/log/log.go:L120-L121`):
-  ```text
-  error   trufflehog  error cleaning temp artifacts  {"error": "error deleting temp artifact (dir: false) /tmp/trufflehog-135951-3252364618: remove /tmp/trufflehog-135951-3252364618: no such file or directory"}
-  ```
-  Emitted at `main.go:L697` (`ctx.Logger().Error(err, "error cleaning temp
-  artifacts")`). **Cause (rationale):** `cleantemp.CleanTempArtifacts`
-  (`pkg/cleantemp/cleantemp.go:L47`) runs both from a startup goroutine
-  (`main.go:L387`) and a deferred cleanup in `runSingleScan` (`main.go:L696`);
-  they can race and one removes a temp file the other already deleted, yielding
-  `no such file or directory`. **This is benign — the process still exited `0`.**
-  Reported here because the methodology requires reporting exactly what is
-  observed, including the unexpected.
+**Rationale and honest caveat (reported exactly).** When `/tmp` *does* contain
+leftover `trufflehog-*` files (e.g. after a prior run was killed before its own
+cleanup), each is deleted and logged at `V(4)`, so the total line count rises by one
+per orphaned file — a host/run‑specific amount. The startup and deferred cleanups can
+also race on the same file, in which case the loser logs a benign `error` line —
+`error cleaning temp artifacts` (`main.go:L697`; note the console token is the literal
+`"error"`, not `info-N`, per `pkg/log/log.go:L120-L121`) — and the process still exits
+`0`. Neither occurred on this clean‑`/tmp` run (both `grep -c` counts are `0` above),
+so nothing is asserted here that was not observed.
 
 ---
 
@@ -624,11 +756,18 @@ Every named item, confirmed with where it is addressed:
 - [x] **(c) detector preparation** — §4; verbatim `setting up aho-corasick core`
   / `set up aho-corasick core` + `pkg/engine/engine.go:L529` & `L531` + rationale.
 - [x] **(d) component communication** — §5; verbatim four `starting … workers`
-  lines + lifecycle lines + `finished scanning` + citations + rationale.
+  lines + lifecycle lines + `finished scanning` + citations + rationale. **Pipeline
+  topology (corrected & source‑grounded, §5.2.1):** the **direct** path
+  `scanner → detector → notifier` (≤ 1 matching detector) and the **overlap** path
+  `scanner → verificationOverlap → detector → notifier` (> 1 matching detector) —
+  verificationOverlap sits **between** scanner and detector, **not** after it
+  (channels `e.detectableChunksChan` / `e.verificationOverlapChunksChan` /
+  `e.results`; corroborated by `docs/concurrency.md:L29-L37`).
 - [x] **kingpin CLI + flags** — §2.1: `--log-level` (`main.go:L50`), `--debug`
   (`L51`), `--trace` (`L52`), `--concurrency` (`L58`), `--no-verification` (`L59`);
   parse at `kingpin.MustParse` (`main.go:L301`).
-- [x] **`--no-verification` + `--no-update` "dry‑run" interpretation** — §1.2.
+- [x] **`--no-verification` (`main.go:L59`) + `--no-update` (`main.go:L73`)
+  "dry‑run" interpretation** — §1.2 (both flags cited with their exact declarations).
 - [x] **`config.Read` / YAML** (`pkg/config/config.go:L18`, `NewYAML` `L27`,
   invoked `main.go:L463`) — §2.3, explicitly marked **not exercised** this run.
 - [x] **`maxprocs.Set()`** container‑aware `GOMAXPROCS` (`main.go:L260`) — §2.2.
@@ -650,12 +789,18 @@ Every named item, confirmed with where it is addressed:
   `L363`, `enumerating source` `L531`, `chunking unit` `L557`) — §5.3.
 - [x] **`info-N` token meaning** (`pkg/log/log.go:L123`) + **V‑level convention**
   (`CONTRIBUTING.md:L30-L37`) — §1.6.
-- [x] **host CPU count, `bytes`, `scan_duration`, worker IDs reported exactly** —
-  §1.5, §5.1, §5.4 (`nproc`=4, `runtime.NumCPU()`=128, `bytes`=56,
-  `scan_duration`=`"5.88645ms"`, `source_manager_worker_id`=`"cLHmR"`,
-  `scanner_worker_id` e.g. `"v9dWT"`).
-- [x] **unexpected output reported honestly** — §5.5 (17× temp‑artifact deletes;
-  1× benign `error cleaning temp artifacts`).
+- [x] **host CPU count, `bytes`, `scan_duration`, total log lines, worker IDs
+  reported exactly (each with its producing command)** — §1.5, §1.8, §5.1, §5.4
+  (`nproc`=4, `runtime.NumCPU()`=128, `bytes`=56, **total log lines=145** on clean
+  `/tmp`, `scan_duration`=`"4.89677ms"`, `source_manager_worker_id`=`"T82iE"`,
+  `scanner_worker_id` e.g. `"OXGaT"`); measured values shown with their producing
+  commands (`wc -c`, `wc -l`, `grep -c`, distinct‑ID pipeline, `go run`, `nproc`).
+- [x] **observations reported exactly (incl. the clean‑`/tmp` result)** — §5.5:
+  the temp‑artifact housekeeping **mechanism** is documented, and on this clean run
+  **0** `Deleted orphaned temp artifact` lines and **0** `error cleaning temp
+  artifacts` lines were observed (`grep -c` → `0` for both), so the 145‑line total
+  (§1.8) carries no housekeeping noise. Caveat stated: a noisy prior‑run `/tmp` would
+  add host/run‑specific cleanup lines.
 - [x] **read‑only honored + scratch artifacts removed** — see Appendix.
 
 ---
@@ -669,11 +814,13 @@ export PATH=$PATH:/usr/local/go/bin
 CGO_ENABLED=0 go build -o /tmp/trufflehog_bin .          # build outside the repo tree
 mkdir -p /tmp/th_probe
 printf 'hello world\nthis is a plain text sample with no secrets\n' > /tmp/th_probe/sample.txt
-/tmp/trufflehog_bin filesystem /tmp/th_probe --log-level=5 --no-verification --no-update
+/tmp/trufflehog_bin filesystem /tmp/th_probe --log-level=5 --no-verification --no-update > /tmp/th_capture.log 2>&1
 ```
-Worker counts scale with `runtime.NumCPU()`; `bytes`, `scan_duration`, the
-`Deleted orphaned temp artifact` count, and the random 5‑char worker IDs are
-run‑specific — **read them from your own logs**.
+On a **clean `/tmp`** (no leftover `trufflehog-*` files) the capture is a
+deterministic **145 lines** (§1.8; `wc -l < /tmp/th_capture.log` → `145`). Worker
+counts scale with `runtime.NumCPU()`; `bytes`, `scan_duration`, the `Deleted orphaned
+temp artifact` count (**0** here), and the random 5‑char worker IDs are run‑specific
+— **read them from your own logs**.
 
 **Safety.** The target is secret‑free and local; `--no-verification` performs no
 external verification and no network egress; the `dev` build + `--no-update`
