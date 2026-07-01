@@ -45,7 +45,7 @@ flowchart TD
     I -- no --> K["Verify via STS unless --no-verification"]
     J --> L["filterResults engine.go:1126"]
     K --> L
-    L --> M{"retainFalsePositives?<br/>--results=filtered_unverified<br/>engine.go:317-318, 1141"}
+    L --> M{"retainFalsePositives?<br/>--results=filtered_unverified<br/>engine.go:317-318, 1141-1142"}
     M -- no --> N["FilterKnownFalsePositives<br/>drops 'example' etc."]
     M -- yes --> O["Keep filtered results"]
     N --> P["Output · plain.go:55-65"]
@@ -96,20 +96,32 @@ flowchart TD
 
 `FromData` (`accesskey.go:105`) only emits a result when it finds **both** an ID (`idPat`) and a secret (`SecretPat`) inside that one span; there is no ID-only result path. So if the secret sits farther than 1024 bytes from the `AKIA` keyword, the ID and secret are never in the same window, and **nothing is reported** — even though both strings are physically in the file.
 
-**Observed — the same pair, close vs. far apart (both `--no-verification`):**
+**Observed — the same pair, close vs. far apart (both `--no-verification`).** Each block below is the verbatim `finished scanning` summary line that TruffleHog writes to **stderr**. The leading RFC3339 timestamp and the `scan_duration` field vary from run to run; every other field — notably `bytes` and the `verified_secrets`/`unverified_secrets` counts — is exact and reproducible.
+
+`proximity_close.txt` (ID → secret gap ~24 bytes) — **one** finding:
 
 ```
-proximity_close.txt  (ID -> secret gap ~24 bytes)                 -> unverified_secrets: 1
-proximity_far.txt    (AKIA at byte 0, secret at ~byte 2825; gap 2805 > 1024) -> unverified_secrets: 0
-proximity_far.txt    + --results=filtered_unverified              -> unverified_secrets: 0
+2026-07-01T06:26:26Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 106, "verified_secrets": 0, "unverified_secrets": 1, "scan_duration": "4.771814ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
 ```
 
-**Observed — determinism (same file, three consecutive runs):**
+`proximity_far.txt` (`AKIA` at byte 0, secret ~2825 B later; gap 2805 > 1024) — **no** finding:
 
 ```
-run1: "unverified_secrets": 1
-run2: "unverified_secrets": 1
-run3: "unverified_secrets": 1
+2026-07-01T06:26:28Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 2866, "verified_secrets": 0, "unverified_secrets": 0, "scan_duration": "4.47386ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
+```
+
+The far case stays empty **even with `--results=filtered_unverified`** — the ID and secret are never evaluated together, so no result is ever produced to recover:
+
+```
+2026-07-01T06:26:29Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 2866, "verified_secrets": 0, "unverified_secrets": 0, "scan_duration": "3.487287ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
+```
+
+**Observed — determinism (same file `entropy_above.txt`, three consecutive runs).** These are the three verbatim stderr summary lines; only the timestamp and `scan_duration` change — the count (`"unverified_secrets": 1`) is identical every time:
+
+```
+2026-07-01T06:35:03Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 116, "verified_secrets": 0, "unverified_secrets": 1, "scan_duration": "5.267185ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
+2026-07-01T06:35:05Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 116, "verified_secrets": 0, "unverified_secrets": 1, "scan_duration": "5.487618ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
+2026-07-01T06:35:06Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 116, "verified_secrets": 0, "unverified_secrets": 1, "scan_duration": "4.61583ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
 ```
 
 **Answer.** Detection is deterministic; the *apparent* inconsistency is layout-driven. If the credential ID and secret are within the ±1024-byte AWS window they are detected; if a file separates them by more than that, the pair is never evaluated together and produces no finding.
@@ -160,7 +172,7 @@ Line: 1
 
 ### Q3 — Why are credentials in test fixtures "in the right format" never flagged?
 
-**Mechanism.** The AWS detector's `Raw` value is the **access-key ID** (see the `Raw result:` line in every capture). After results are produced, the engine runs `FilterKnownFalsePositives` (`pkg/engine/engine.go:1141`), which calls `IsKnownFalsePositive`. That function returns true when the lowercased value **contains** any default term — `pkg/detectors/falsepositives.go:97-98`:
+**Mechanism.** The AWS detector's `Raw` value is the **access-key ID** (see the `Raw result:` line in every capture). After results are produced, the engine runs `FilterKnownFalsePositives` (called at `pkg/engine/engine.go:1142`, guarded by `if !e.retainFalsePositives {` at `:1141`), which calls `IsKnownFalsePositive`. That function returns true when the lowercased value **contains** any default term — `pkg/detectors/falsepositives.go:97-98`:
 
 ```go
 for fp := range falsePositives {
@@ -179,23 +191,23 @@ DefaultFalsePositives = map[FalsePositive]struct{}{
 
 The canonical AWS documentation credential — access-key ID `AKIAIOSFODNN7EXAMPLE`, secret `wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY` — lowercases to `akiaiosfodnn7example`, which **contains** `example`. So it is filtered as a known false positive. (This is the AWS-documented example pair, which is exactly what tends to appear in fixtures and docs.)
 
-Crucially this filter runs **after** the result exists, and the engine skips it when `retainFalsePositives` is set from `--results=filtered_unverified` — `pkg/engine/engine.go:317-318` and `:1141`:
+Crucially this filter runs **after** the result exists, and the engine skips it when `retainFalsePositives` is set from `--results=filtered_unverified` — `pkg/engine/engine.go:317-318` and `:1141-1142` (guard at `:1141`, call at `:1142`):
 
 ```go
 if _, ok = results["filtered_unverified"]; ok {
     engine.retainFalsePositives = ok            // :318
 ...
-if !e.retainFalsePositives {
-    results = detectors.FilterKnownFalsePositives(ctx, detector.Detector, results)  // :1141
+if !e.retainFalsePositives {                                                       // :1141 (guard)
+    results = detectors.FilterKnownFalsePositives(ctx, detector.Detector, results)  // :1142 (call)
 }
 ```
 
 **Observed — the example key: default vs. false-positives retained:**
 
-Default (`--no-verification`) → **nothing printed**, and the summary reports zero:
+Default (`--no-verification`) → **nothing is printed to stdout**; the verbatim stderr summary line reports zero findings (note the comma-separated JSON context; timestamp and `scan_duration` vary per run):
 
 ```
-"verified_secrets": 0 "unverified_secrets": 0
+2026-07-01T06:26:21Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 116, "verified_secrets": 0, "unverified_secrets": 0, "scan_duration": "5.055558ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
 ```
 
 With `--no-verification --results=filtered_unverified` → it comes back:
@@ -249,11 +261,39 @@ var errOverlap = errors.New(
 
 Note the concatenation joins `disabled.` and `You` with **no space** — the output literally reads `disabled.You`. Verification is disabled so TruffleHog does not send the same candidate secret to multiple providers' verification endpoints.
 
-**Observed — a value matched by both the AWS detector and a custom "shadow" detector** (`--config=aws_overlap.yaml --no-verification`). The message is rendered by `pkg/output/plain.go:57` (`"Verification issue: %s\n"`):
+**Observed — a value matched by both the AWS detector and a custom "shadow" detector** (`--config=aws_overlap.yaml --no-verification`). Both results are always reported (the finding **count is deterministic** — the scan always reports two unverified secrets); what is *not* fixed between runs is **which** of the two results carries the `Verification issue` line (see the non-determinism note below). The warning is rendered by `pkg/output/plain.go:57` (`"Verification issue: %s\n"`). The following is a representative run — the common case:
 
 ```
 Found unverified result 🐷🔑❓
 Verification issue: More than one detector has found this result. For your safety, verification has been disabled.You can override this behavior by using the --allow-verification-overlap flag.
+Detector Type: CustomRegex
+Decoder Type: PLAIN
+Raw result: AKIAZ24FK7QW8XV5N3PB:P0TTvYvuuQDeV22HVDXu5Xl0YcMZvMxvvpCeCVNQ
+Name: aws-overlap-shadow
+File: /tmp/th_fixtures/aws_overlap.txt
+Line: 1
+
+Found unverified result 🐷🔑❓
+Detector Type: AWS
+Decoder Type: PLAIN
+Raw result: AKIAZ24FK7QW8XV5N3PB
+Resource_type: Access key
+File: /tmp/th_fixtures/aws_overlap.txt
+Line: 1
+```
+
+The verbatim summary line (stderr) confirms both results are reported — `unverified_secrets: 2` (the leading RFC3339 timestamp and `scan_duration` vary per run; every other field, including `bytes` and the counts, reproduces exactly):
+
+```
+2026-07-01T06:26:21Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 75, "verified_secrets": 0, "unverified_secrets": 2, "scan_duration": "5.493409ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
+```
+
+**Non-determinism — which result carries the warning.** The overlap worker loops over the chunk's matched detectors — `pkg/engine/engine.go:932-933`. Whichever detector is processed **first** seeds the `chunkSecrets` map and is queued for normal output; the detector processed **second** is detected as a likely-duplicate, has its verification error set to `errOverlap` (`pkg/engine/engine.go:988`), and is emitted **immediately** via `processResult` — so the result carrying the warning is the one that **prints first**. The iteration order over the matched detectors is not fixed between runs, so which detector receives the warning varies. Across **12 consecutive runs** of the exact command above, the warning landed on **CustomRegex 10 times and on AWS 2 times** (in every run the warning-carrying result was the one printed first). The block above shows the common case — it should **not** be read as "the AWS result always carries the warning"; either detector may.
+
+Re-running with `--allow-verification-overlap` **removes** the `Verification issue` line entirely; both detectors report normally (in that run the AWS result printed first, then CustomRegex — again reflecting the non-fixed ordering, but with no warning on either):
+
+```
+Found unverified result 🐷🔑❓
 Detector Type: AWS
 Decoder Type: PLAIN
 Raw result: AKIAZ24FK7QW8XV5N3PB
@@ -270,8 +310,6 @@ File: /tmp/th_fixtures/aws_overlap.txt
 Line: 1
 ```
 
-Re-running with `--allow-verification-overlap` **removes** the `Verification issue` line entirely; both detectors report normally.
-
 **Answer.** The warning appears whenever **two or more detectors match the same (or near-identical) value** in a chunk. TruffleHog suppresses verification to avoid sending one secret to multiple providers' endpoints. Override with `--allow-verification-overlap`.
 
 ---
@@ -287,7 +325,7 @@ A credential is reported only if it clears **every** gate below, in order. Each 
 | 3 | `idPat` and `SecretPat` both match | `accesskey.go:65`; `common.go:10` | value doesn't match the regex shape |
 | 4 | ID entropy ≥ 3.0 **and** secret entropy ≥ 4.25 | `accesskey.go:122,132`; `common.go:6-7` | either entropy is below threshold (**dropped pre-result**) |
 | 5 | (unverified) secret not hex `[a-f0-9]{40}` | `accesskey.go:202`; `utils.go:47` | unverified secret looks like a 40-char hex hash |
-| 6 | value not a known false positive | `falsepositives.go:17-18,97`; engine `:1141` | value contains `example`/`sample`/`xxxxxx`/… (**recoverable** via `--results=filtered_unverified`) |
+| 6 | value not a known false positive | `falsepositives.go:17-18,97`; engine `:1141-1142` | value contains `example`/`sample`/`xxxxxx`/… (**recoverable** via `--results=filtered_unverified`) |
 | 7 | value not a cross-detector overlap duplicate | `engine.go:796,887,988` | 2+ detectors match same value → verification disabled (still reported) |
 
 The regexes themselves define the "correct format":
@@ -315,13 +353,13 @@ File: /tmp/th_fixtures/entropy_above.txt
 Line: 2
 ```
 
-**Missed / filtered** — the `example` key by default prints nothing; the summary line (stderr) reports:
+**Missed / filtered** — the `example` key (`example_fixture.txt`) by default prints nothing to stdout; the verbatim stderr summary line reports zero findings (timestamp and `scan_duration` vary per run):
 
 ```
-"verified_secrets": 0 "unverified_secrets": 0
+2026-07-01T06:26:21Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 116, "verified_secrets": 0, "unverified_secrets": 0, "scan_duration": "5.055558ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
 ```
 
-Findings tally across the fixture set (all `--no-verification`; `+filtered` = also with `--results=filtered_unverified`):
+**Derived summary** (not raw CLI output) — findings tally across the fixture set, aggregated from each scan's `unverified_secrets` count (all `--no-verification`; `+filtered` = also with `--results=filtered_unverified`). Verbatim per-fixture summary lines for the highlighted cases (proximity in Q1, the `example` key in Q3/Q6, and the entropy boundary in Q7) appear in those sections:
 
 | Fixture | ID / secret | Findings | +filtered |
 |---------|-------------|----------|-----------|
@@ -359,17 +397,22 @@ func StringShannonEntropy(input string) float64 {
 }
 ```
 
-**Observed at the boundary.** Two fixtures share the same passing ID (`AKIAZ24FK7QW8XV5N3PB`, H=4.1219 ≥ 3.0) and differ only in the secret's entropy, straddling 4.25:
+**Observed at the boundary.** Two fixtures share the same passing ID (`AKIAZ24FK7QW8XV5N3PB`, H=4.1219 ≥ 3.0) and differ only in the secret's entropy, straddling 4.25. The blocks below are verbatim stderr summary lines (timestamp and `scan_duration` vary per run). Below-threshold secret `fJAFNsa03DDFF0fGDdG66qFBJ3D5maa2mNBqMEBc` (H=4.2342 < 4.25) → **no** finding:
 
 ```
-entropy_below.txt  secret fJAFNsa03DDFF0fGDdG66qFBJ3D5maa2mNBqMEBc  H=4.2342 (< 4.25) -> findings = 0
-entropy_above.txt  secret P0TTvYvuuQDeV22HVDXu5Xl0YcMZvMxvvpCeCVNQ  H=4.2939 (>= 4.25) -> findings = 1
+2026-07-01T06:26:17Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 116, "verified_secrets": 0, "unverified_secrets": 0, "scan_duration": "5.260464ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
 ```
 
-And critically, the below-threshold case stays at **0 even with `--results=filtered_unverified`**:
+Above-threshold secret `P0TTvYvuuQDeV22HVDXu5Xl0YcMZvMxvvpCeCVNQ` (H=4.2939 ≥ 4.25) → **one** finding:
 
 ```
-entropy_below.txt --no-verification --results=filtered_unverified -> "unverified_secrets": 0
+2026-07-01T06:26:15Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 116, "verified_secrets": 0, "unverified_secrets": 1, "scan_duration": "5.984313ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
+```
+
+And critically, the below-threshold case stays at `unverified_secrets: 0` **even with `--results=filtered_unverified`**:
+
+```
+2026-07-01T06:26:19Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 116, "verified_secrets": 0, "unverified_secrets": 0, "scan_duration": "3.901932ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
 ```
 
 because the entropy gate is detector-internal (pre-result). Contrast the low-entropy **ID** case `lowid.txt` (`AKIAAAAAAAAAAAAAAAAA`, H=0.5690 < 3.0): 0 findings, and still 0 with `--results=filtered_unverified` — the ID gate also drops it before a result exists.
@@ -404,7 +447,7 @@ because the entropy gate is detector-internal (pre-result). Contrast the low-ent
 | Secret entropy < 4.25 | Slips | gate `accesskey.go:132`; `common.go:7` | **No** (detector-internal, pre-result) |
 | ID entropy < 3.0 | Slips | gate `accesskey.go:122`; `common.go:6` | **No** (pre-result) |
 | Unverified secret is hex `[a-f0-9]{40}` | Slips | `accesskey.go:202`; `utils.go:47` | No |
-| Value contains `example`/`sample`/… | Slips (filtered) | `falsepositives.go:17-18,97`; engine `:1141` | **Yes** (engine-level) |
+| Value contains `example`/`sample`/… | Slips (filtered) | `falsepositives.go:17-18,97`; engine `:1141-1142` | **Yes** (engine-level) |
 | Same value found by 2+ detectors | Caught, but **verification disabled** | `engine.go:796,887,988` | n/a (still reported) |
 
 ---
@@ -474,6 +517,11 @@ credentials: AKIAZ24FK7QW8XV5N3PB:P0TTvYvuuQDeV22HVDXu5Xl0YcMZvMxvvpCeCVNQ
 
 Relevant CLI flags — `main.go`: `--no-verification` (:59), `--results` (:61, "Defaults to verified,unverified,unknown."), `--allow-verification-overlap` (:65), `--filter-entropy` (:67, "Start with 3.0.").
 
-**External corroboration (code remains the source of truth).** AWS documents the example pair as access-key ID `AKIAIOSFODNN7EXAMPLE` and secret `wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY`, with access-key IDs being 20-character strings prefixed `AKIA` (long-term) or `ASIA` (temporary) — consistent with `idPat` (`(?:AKIA|ABIA|ACCA)[A-Z0-9]{16}`) and the 40-character `SecretPat`.
+**External corroboration (code remains the source of truth).** AWS's own documentation confirms both the example pair and the prefix format used above:
+
+- **Example pair** — access-key ID `AKIAIOSFODNN7EXAMPLE`, secret `wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY` — appears in the AWS IAM User Guide, *"Manage access keys for IAM users"* (`https://docs.aws.amazon.com/IAM/latest/UserGuide/id_credentials_access-keys.html`) and in the *AWS SDKs and Tools Reference*, *"AWS access keys"* (`https://docs.aws.amazon.com/sdkref/latest/guide/feature-static-credentials.html`).
+- **Prefix format** — access-key IDs beginning with `AKIA` are long-term credentials and those beginning with `ASIA` are temporary (AWS STS) credentials — is documented in the *AWS STS API Reference*, *"GetAccessKeyInfo"* (`https://docs.aws.amazon.com/STS/latest/APIReference/API_GetAccessKeyInfo.html`) and the AWS IAM User Guide, *"Secure access keys"* (`https://docs.aws.amazon.com/IAM/latest/UserGuide/securing_access-keys.html`).
+
+Both are consistent with the detector's `idPat` (`(?:AKIA|ABIA|ACCA)[A-Z0-9]{16}`, a 20-character ID) and its 40-character `SecretPat`. (These references corroborate the code; the repository source remains the authoritative source of truth for TruffleHog's behavior.)
 
 **Cleanup.** All fixtures, helper scripts, and the binary live outside the repository (`/tmp/…`) and are removed after investigation; `git status --porcelain` remains empty aside from this document.
