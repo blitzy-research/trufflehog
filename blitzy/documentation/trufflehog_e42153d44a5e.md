@@ -246,10 +246,12 @@ detectors:
       api_key: \b(PMAK-[a-zA-Z-0-9]{59})\b
   - name: detector2
     keywords:
-      - "ost "
+      - ost 
     regex:
       api_key: \b([a-zA-Z-0-9]{59})\b
 ```
+
+**Fidelity note.** `detector2`'s keyword is shown above exactly as the fixture stores it — an *unquoted plain scalar with a trailing space* (`pkg/engine/testdata/verificationoverlap_detectors.yaml:11`). YAML trims trailing whitespace from unquoted plain scalars, so TruffleHog's config parser (`protoyaml.UnmarshalStrict`, `pkg/config/config.go:30`) loads `detector2`'s keyword as the 3-character string `ost` (trailing space trimmed) — verified by parsing the fixture through that exact code path. Had it been written as the quoted scalar `"ost "`, the trailing space would be preserved, yielding a 4-character keyword.
 
 Scanning a file whose line 2 is `POSTMAN_API_KEY="PMAK-qnwfsLyRSyfCwfpHaQP1UzDhrgpWvHjbYzjpRCMshjt417zWcrzyHUArs7r"` makes **three distinct detectors** match the same span: the **built-in `Postman`** detector (`pkg/detectors/postman/postman.go:29`, `keyPat = regexp.MustCompile(` `` `\b(PMAK-[a-zA-Z-0-9]{59})\b` `` `)`, keyword `"PMAK-"` at `:35`) plus the two `CustomRegex` detectors from the config. Because `Postman` and `CustomRegex` are **distinct types**, `likelyDuplicate` does *not* skip the comparison and the overlap error is attached. Command and observed console output (one representative run):
 
