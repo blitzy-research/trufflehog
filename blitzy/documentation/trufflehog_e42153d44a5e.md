@@ -130,7 +130,7 @@ func buildDetectorList() []detectors.Detector {
 	}
 }
 ```
-(`defaults.go:839-1701`; first element `&abyssale.Scanner{}` at `defaults.go:840`,
+(`defaults.go:839-1701`; first element `&abyssale.Scanner{}` at `defaults.go:841`,
 last two `&zonkafeedback.Scanner{}` / `&zulipchat.Scanner{}` at
 `defaults.go:1699-1700`)
 
@@ -144,7 +144,7 @@ config.
 
 **Detector count.** At this commit, `buildDetectorList()` contains **831 active
 default detectors**. This was counted directly from the slice literal
-(`defaults.go:840-1700`): 829 entries of the form `&pkg.Scanner{}` plus 2
+(`defaults.go:841-1700`): 829 entries of the form `&pkg.Scanner{}` plus 2
 constructor-style entries (`aws_access_keys.New()`, `aws_session_keys.New()`),
 with 28 further entries commented out (inactive). Public sources quote varying
 figures (600+, 700+, 800+) and are therefore **not** authoritative for a specific
@@ -850,7 +850,7 @@ and pointing to where.
   `defaults.go:839`); `--config` only augments with custom detectors.
 - (c) *What initialization messages report which detectors get registered?* —
   Answered in Q1(c) with the verbatim 8-line startup sequence (JSON and console
-  forms) and the detector count of **831** (`defaults.go:840-1700`).
+  forms) and the detector count of **831** (`defaults.go:841-1700`).
 
 **Q2 — Verification Architecture**
 
