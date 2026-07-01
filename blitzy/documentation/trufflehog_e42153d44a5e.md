@@ -335,11 +335,31 @@ idPat     (accesskey.go:65):  \b((?:AKIA|ABIA|ACCA)[A-Z0-9]{16})\b
 SecretPat (common.go:10):     (?:[^A-Za-z0-9+/]|\A)([A-Za-z0-9+/]{40})(?:[^A-Za-z0-9+/]|\z)
 ```
 
+**Observed — the boundary in action (both `--no-verification`).** A credential that clears *every* gate above is reported; one that trips any gate is not. `entropy_above.txt` (`AKIAZ24FK7QW8XV5N3PB` / secret H=4.2939) clears all seven gates → **one** finding on stdout:
+
+```
+Found unverified result 🐷🔑❓
+Detector Type: AWS
+Decoder Type: PLAIN
+Raw result: AKIAZ24FK7QW8XV5N3PB
+Resource_type: Access key
+File: /tmp/th_fixtures/entropy_above.txt
+Line: 2
+```
+
+The canonical example key `example_fixture.txt` (`AKIAIOSFODNN7EXAMPLE`) instead trips **gate 6** — its value contains `example` — so by default it prints **nothing** to stdout; the verbatim stderr summary reports zero findings (only the timestamp and `scan_duration` vary per run; `bytes` and the counts are exact):
+
+```
+2026-07-01T06:26:21Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 116, "verified_secrets": 0, "unverified_secrets": 0, "scan_duration": "5.055558ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
+```
+
 **The critical distinction:** gate 4 (entropy) is **detector-internal** and drops candidates **before** a result object is created, so `--results=filtered_unverified` **cannot** recover them. Gate 6 (known-false-positive) is **engine-level** and runs **after** the result exists, so `--results=filtered_unverified` **can** recover it. This asymmetry is why an `example` key can be brought back but a low-entropy key cannot (see Q3 vs. Q7).
 
 ---
 
 ### Q6 — Actual scan output: detected vs. missed/filtered
+
+**Mechanism.** The two outcomes below are produced by the *same* pipeline diverging at a single gate. `entropy_above.txt` clears **every** gate — `idPat` and `SecretPat` both match (`accesskey.go:65`; `common.go:10`), the ID's Shannon entropy ≥ 3.0 **and** the secret's ≥ 4.25 (gates at `accesskey.go:122,132`; thresholds at `common.go:6-7`), and the value is not a known false positive — so a result object is created and printed (`plain.go:55,63-65`). The `example` key is *also* matched and *also* clears both entropy gates, but its lowercased value **contains** `example`, so `IsKnownFalsePositive` returns `true` via the contains-term rule (`falsepositives.go:97-98`) and the engine's `FilterKnownFalsePositives` drops it — **unless** `--results=filtered_unverified` set `retainFalsePositives`, which skips that filter (`engine.go:1141-1142`). That single-gate difference is exactly why the first case prints a finding and the second prints nothing by default (and comes back when false positives are retained).
 
 **Detected** — `entropy_above.txt` (`--no-verification`):
 
