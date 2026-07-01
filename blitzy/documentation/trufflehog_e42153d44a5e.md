@@ -39,12 +39,10 @@ Deduplication happens **strictly after** overlap detection (SQ5).
 ```console
 $ CGO_ENABLED=0 go build -o /tmp/trufflehog_bin .
 $ /tmp/trufflehog_bin --version
-🐷🔑🐷  TruffleHog. Unearth your secrets. 🐷🔑🐷
-
 trufflehog dev
 ```
 
-The build produced a ~194 MB static binary; the binary self-reports version `trufflehog dev`.
+The build produced a ~194 MB static binary; the binary self-reports version `trufflehog dev` (written to stderr; `--version` produces no other output — stdout is empty). Note that the startup banner `🐷🔑🐷  TruffleHog. Unearth your secrets. 🐷🔑🐷` is **not** part of `--version` output; it is printed to stderr only on the scan path, gated at `main.go:497` (`if !*jsonLegacy && !*jsonOut`) — kingpin's `--version` handler, registered at `main.go:270` (`cli.Version("trufflehog " + version.BuildVersion)`), calls `os.Exit` before that line is reached. The banner therefore appears in the scan reproductions below (e.g., the plaintext scan), where it legitimately shows up as the first stderr line.
 
 **Scan command template (AWS cases):**
 
