@@ -297,8 +297,8 @@ proof that verification is a live network operation.
 
 **Verbatim evidence #2 — verification is measurably concurrent.** The same scan
 was timed with verification off and on. With `--no-verification` the scan
-finished in `8.778892ms`; with verification enabled it finished in
-`152.605276ms`:
+finished in `8.581503ms`; with verification enabled it finished in
+`255.892046ms`:
 
 ```bash
 # verification OFF
@@ -306,7 +306,7 @@ finished in `8.778892ms`; with verification enabled it finished in
 ```
 
 ```json
-{"level":"info-0","ts":"2026-07-01T05:14:28Z","logger":"trufflehog","msg":"finished scanning","chunks":7,"bytes":9305,"verified_secrets":0,"unverified_secrets":6,"scan_duration":"8.778892ms","trufflehog_version":"dev","verification_caching":{"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
+{"level":"info-0","ts":"2026-07-01T05:14:28Z","logger":"trufflehog","msg":"finished scanning","chunks":7,"bytes":9305,"verified_secrets":0,"unverified_secrets":6,"scan_duration":"8.581503ms","trufflehog_version":"dev","verification_caching":{"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
 ```
 
 ```bash
@@ -315,14 +315,14 @@ finished in `8.778892ms`; with verification enabled it finished in
 ```
 
 ```json
-{"level":"info-0","ts":"2026-07-01T05:14:30Z","logger":"trufflehog","msg":"finished scanning","chunks":7,"bytes":9305,"verified_secrets":0,"unverified_secrets":6,"scan_duration":"152.605276ms","trufflehog_version":"dev","verification_caching":{"Hits":0,"Misses":6,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":550}}
+{"level":"info-0","ts":"2026-07-01T05:14:30Z","logger":"trufflehog","msg":"finished scanning","chunks":7,"bytes":9305,"verified_secrets":0,"unverified_secrets":6,"scan_duration":"255.892046ms","trufflehog_version":"dev","verification_caching":{"Hits":0,"Misses":6,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":550}}
 ```
 
 Two facts in that verification-on line prove concurrency:
 
 1. `"VerificationTimeSpentMS":550` is the **aggregate** verification time across
-   all attempts, yet the wall-clock `"scan_duration":"152.605276ms"` is far
-   smaller. The only way aggregate work (550 ms) can complete in ~153 ms of wall
+   all attempts, yet the wall-clock `"scan_duration":"255.892046ms"` is far
+   smaller. The only way aggregate work (550 ms) can complete in ~256 ms of wall
    clock is if verification attempts ran **in parallel**.
 2. `"verification_caching":{…,"Misses":6}` shows all six candidate secrets were
    dispatched for verification (they missed the cache), each on a detector worker.
@@ -860,7 +860,7 @@ and pointing to where.
 - (b) *Parallel or sequential?* — Answered explicitly in Q2(b): **parallel** —
   four worker pools (`engine.go:646/663/678/693/708`), verification in
   `detectorWorker` (`engine.go:1036`), with verbatim DNS errors and the
-  `VerificationTimeSpentMS:550` > `scan_duration:152.605276ms` concurrency proof.
+  `VerificationTimeSpentMS:550` > `scan_duration:255.892046ms` concurrency proof.
 
 **Q3 — JSON Output Schema**
 
