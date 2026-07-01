@@ -51,22 +51,26 @@ detector call approaches the 10-second per-detector budget. Even forcing `--dete
 **ran to completion** and the watchdog log never fired.
 
 **The real, demonstrable effect is a bounded constant-factor *amplification*, not a denial of service.** By packing a
-100 KB file with the maximum diversity of detector *keywords*, the Aho-Corasick prefilter selects a very large number of
-detectors, each of which then executes its RE2 regex over the matched spans, multiplied by the four default decoders.
-On this box that produced a measured **≈49× increase in `scan_duration`** at *identical* file size (benign median
-`5.488 ms` vs. crafted median `268.900 ms` for two `102400`-byte files) — while emitting **zero** verified and **zero**
-unverified secrets (the keywords are fake, so the extra work is pure wasted CPU). The magnitude scales with keyword
-diversity: a modest 16-keyword payload produced only ≈2.8×, whereas the maximal all-keyword payload produced ≈49×.
-Crucially, the crafted scan still **finished in ~0.27 s** — this is a *slowdown*, not a *hang*, and it is bounded by
+100 KB file with a dense set of distinct detector *keywords*, the Aho-Corasick prefilter selects many detectors, each of
+which then executes its RE2 regex over the matched spans, multiplied by the four default decoders. On this box, a
+realistic keyword-dense crafted file (**52** distinct detector keywords) produced a measured **≈4× increase in
+`scan_duration`** at *identical* file size — benign median `5.273 ms` vs. crafted median `21.009 ms` for two
+`102400`-byte files (median ratio `3.98×`, mean ratio `3.92×`, over 20 interleaved runs) — while emitting **zero**
+verified and **zero** unverified secrets (the keywords are fake, so the extra work is pure wasted CPU). The magnitude
+scales with keyword diversity: a modest 16-keyword payload produced only ≈`1.12×`, and — as a deliberately extreme,
+clearly **secondary** exploratory *upper bound* — cycling **all 958** extracted detector keywords produced ≈`50×`
+(crafted median `269.502 ms`), still finishing in ~`0.27 s`. In every case this is a *slowdown*, not a *hang*, bounded by
 several built-in controls (`--detector-timeout`, `--concurrency`, `--exclude-detectors`, `--archive-max-*`,
-span-limiting).
+span-limiting). (Absolute timings are somewhat elevated by this shared box's background load — 1-minute load fluctuated
+`3.4`–`11` during measurement — but the **≈4× ratio is load-invariant**, since both files are scanned back-to-back under
+identical conditions; see Section 5.)
 
 | Sub-question | One-line answer |
 |---|---|
-| **Q1** hang/time-out | **No.** RE2 is linear and per-detector input is chunk-bounded; `--detector-timeout=1ms` still completes (`303.14515ms`), watchdog never fires. |
+| **Q1** hang/time-out | **No.** RE2 is linear and per-detector input is chunk-bounded; `--detector-timeout=1ms` still completes (`20.172629ms`), watchdog never fires. |
 | **Q2** vulnerable? | **Not to exponential ReDoS** (RE2 forbids backtracking). **Yes** to a *bounded linear-time amplification* (constant factor). |
-| **Q3** which patterns? | **No single super-linear pattern.** Cost is *aggregate*: Aho-Corasick keyword fan-out × matched spans × 4 decoder passes, dominated by go-re2/wazero RE2 execution (`runtime._ExternalCode` 37.59% flat). |
-| **Q4** how much slower? | **≈49× median** (`45.58×` mean) at equal `102400`-byte size on this box, with a maximal all-keyword payload; ≈2.8× with a modest payload. |
+| **Q3** which patterns? | **No single super-linear pattern.** Cost is *aggregate*: Aho-Corasick keyword fan-out × matched spans × 4 decoder passes, dominated by go-re2/wazero RE2 execution (`runtime._ExternalCode` 40.67% flat). |
+| **Q4** how much slower? | **≈4× median** (`3.98×` median, `3.92×` mean) at equal `102400`-byte size (benign `5.273 ms` vs crafted `21.009 ms`) with a realistic 52-keyword payload; scales from ≈`1.12×` (16-keyword) up to ≈`50×` for an extreme all-958-keyword upper bound. |
 | **Q5** evidence | Provided: verbatim `scan_duration` runs, `go tool pprof` `top`, per-detector `ns/op`, `--detector-timeout=1ms` result, `--print-avg-detector-time` gating output. |
 
 ---
@@ -175,7 +179,7 @@ PeekSize       = 3 * 1024             // pkg/sources/chunker.go:16
 TotalChunkSize = ChunkSize + PeekSize // pkg/sources/chunker.go:18  (= 13312 bytes)
 ```
 
-A per-detector RE2 match on a ≤13 KB span costs ≈7.3 ns/byte (measured in Section 4), i.e. tens-to-hundreds of
+A per-detector RE2 match on a ≤13 KB span costs ≈5.31 ns/byte (measured in Section 4), i.e. tens-to-hundreds of
 microseconds — five to six orders of magnitude below the 10-second budget.
 
 ### 2.3 Empirical proof — an extreme `--detector-timeout=1ms` still completes
@@ -185,10 +189,10 @@ microseconds — five to six orders of magnitude below the 10-second budget.
 ```
 
 ```
-finished scanning	{"chunks": 10, "bytes": 130048, "verified_secrets": 0, "unverified_secrets": 0, "scan_duration": "303.14515ms", "trufflehog_version": "dev", ...}
+finished scanning	{"chunks": 10, "bytes": 130048, "verified_secrets": 0, "unverified_secrets": 0, "scan_duration": "20.172629ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
 ```
 
-The scan **completed** (`303.14515ms`), and grepping the full output for the watchdog message returned **count = 0**:
+The scan **completed** (`20.172629ms`), and grepping the full output for the watchdog message returned **count = 0**:
 
 ```bash
 /tmp/thog filesystem /tmp/redos_val/crafted --no-verification --no-update --detector-timeout=1ms 2>&1 | grep -c "ignored the context timeout"
@@ -205,15 +209,26 @@ work.
 ### 2.4 A larger file stays bounded (no hang)
 
 ```bash
-/tmp/thog filesystem /tmp/redos_val/big1 --no-verification --no-update   # a 524288-byte crafted file
+/tmp/thog filesystem /tmp/redos_val/big1 --no-verification --no-update   # a 524288-byte (512 KB) crafted file (52 keywords)
 ```
 
 ```
-finished scanning	{"chunks": 52, "bytes": 679936, "verified_secrets": 0, "unverified_secrets": 0, "scan_duration": "875.599331ms", "trufflehog_version": "dev", ...}
+finished scanning	{"chunks": 52, "bytes": 679936, "verified_secrets": 0, "unverified_secrets": 0, "scan_duration": "71.012223ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
 ```
 
-A 512 KB crafted file scans as **52 chunks** in `875.599331ms` — finite, bounded, and still emitting zero results.
-There is no hang.
+A 512 KB crafted file (the realistic 52-keyword content) scans as **52 chunks** in `71.012223ms` — finite, bounded, and
+still emitting zero results. Even the **artificial worst case** — a 512 KB file cycling *all* `958` extracted keywords —
+stays bounded and finishes in well under a second:
+
+```bash
+/tmp/thog filesystem /tmp/redos_sec/max512b --no-verification --no-update   # 524288-byte all-958-keyword file
+```
+
+```
+finished scanning	{"chunks": 52, "bytes": 679936, "verified_secrets": 0, "unverified_secrets": 0, "scan_duration": "674.824744ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
+```
+
+`52` chunks, `674.824744ms`, zero results — a slowdown, **not a hang**.
 
 ### 2.5 Conclusion for Q1
 
@@ -235,7 +250,7 @@ The grounding is twofold:
 1. **Engine (Section 1):** all 867 detector files use `go-re2` v1.9.0 [go.mod:100]; the only backtracking engine in the
    graph, `dlclark/regexp2` [go.mod:187], is `// indirect` and imported by **0** detectors. Exponential ReDoS requires a
    backtracking engine; there is none on the detector path.
-2. **Measured scaling (Section 4):** per-detector benchmarks scale **≈10–11.5× for a 10× input increase** with a
+2. **Measured scaling (Section 4):** per-detector benchmarks scale **≈10–11.7× for a 10× input increase** with a
    **constant** number of allocations at every size. Linear time and constant allocations are the empirical signature of
    a non-backtracking automaton; a super-linear/backtracking pattern would show explosive growth in both.
 
@@ -276,8 +291,8 @@ Each factor is bounded and linear, so the product is a bounded constant-factor m
 
 ### 4.2 Whole-engine CPU profile (verbatim `go tool pprof top`)
 
-A ~301 MB crafted corpus (600 × 512 KB keyword-dense files) was scanned with `--profile`, which starts a pprof + fgprof
-server on `:18066` [main.go:53]. A 10-second CPU profile was captured:
+A ~101 MB crafted corpus (200 × 512 KB keyword-dense files) was scanned with `--profile`, which starts a pprof + fgprof
+server on `:18066` [main.go:53]. A 10-second CPU profile was captured while the scan was still running:
 
 ```bash
 /tmp/thog filesystem /tmp/redos_val/big --no-verification --no-update --profile &
@@ -286,38 +301,42 @@ go tool pprof -top -nodecount=20 "http://localhost:18066/debug/pprof/profile?sec
 
 ```
 File: thog
+Build ID: 4e49fdf6cc5382d4e0f87dedb5b74dc2aa5076a1
 Type: cpu
-Duration: 10.14s, Total samples = 39.35s (388.09%)
-Showing nodes accounting for 25.88s, 65.77% of 39.35s total
-Dropped 993 nodes (cum <= 0.20s)
-Showing top 20 nodes out of 168
+Time: 2026-07-01 06:47:58 UTC
+Duration: 10.11s, Total samples = 39.39s (389.50%)
+Showing nodes accounting for 26.38s, 66.97% of 39.39s total
+Dropped 924 nodes (cum <= 0.20s)
+Showing top 20 nodes out of 172
       flat  flat%   sum%        cum   cum%
-    14.79s 37.59% 37.59%     14.79s 37.59%  runtime._ExternalCode
-     1.21s  3.07% 40.66%      3.17s  8.06%  internal/sync.(*Mutex).Unlock (inline)
-     0.94s  2.39% 43.05%      0.94s  2.39%  runtime.memmove
-     0.88s  2.24% 45.29%      4.24s 10.78%  internal/sync.(*Mutex).Lock (inline)
-     0.88s  2.24% 47.52%      1.40s  3.56%  runtime.lock2
-     0.77s  1.96% 49.48%      1.09s  2.77%  runtime.findObject
-     0.65s  1.65% 51.13%      0.65s  1.65%  runtime.(*mspan).base (inline)
-     0.64s  1.63% 52.76%      0.84s  2.13%  github.com/BobuSumisu/aho-corasick.(*Trie).Walk
-     0.63s  1.60% 54.36%      3.36s  8.54%  internal/sync.(*Mutex).lockSlow
-     0.59s  1.50% 55.86%      0.59s  1.50%  runtime.memclrNoHeapPointers
-     0.54s  1.37% 57.23%      2.22s  5.64%  runtime.scanobject
-     0.41s  1.04% 58.27%     17.21s 43.74%  github.com/trufflesecurity/trufflehog/v3/pkg/engine.(*Engine).verificationOverlapWorker
-     0.41s  1.04% 59.31%      0.42s  1.07%  runtime.(*itabTableType).find
-     0.41s  1.04% 60.36%      0.57s  1.45%  runtime.fpTracebackPartialExpand
-     0.39s  0.99% 61.35%      0.39s  0.99%  runtime.futex
-     0.38s  0.97% 62.31%      0.38s  0.97%  runtime.cansemacquire (inline)
-     0.38s  0.97% 63.28%      0.38s  0.97%  runtime.procyield
-     0.35s  0.89% 64.17%      0.41s  1.04%  container/list.(*List).remove (inline)
-     0.33s  0.84% 65.01%      0.33s  0.84%  runtime.nextFreeFast (inline)
-     0.30s  0.76% 65.77%      0.36s  0.91%  container/list.(*List).insert (inline)
+    16.02s 40.67% 40.67%     16.02s 40.67%  runtime._ExternalCode
+     1.11s  2.82% 43.49%      2.60s  6.60%  internal/sync.(*Mutex).Unlock (inline)
+     0.86s  2.18% 45.67%      1.18s  3.00%  runtime.findObject
+     0.81s  2.06% 47.73%      0.81s  2.06%  runtime.memmove
+     0.75s  1.90% 49.63%      0.75s  1.90%  runtime.(*mspan).base (inline)
+     0.70s  1.78% 51.41%      3.49s  8.86%  internal/sync.(*Mutex).Lock (inline)
+     0.65s  1.65% 53.06%      2.79s  7.08%  internal/sync.(*Mutex).lockSlow
+     0.64s  1.62% 54.68%      2.83s  7.18%  runtime.scanobject
+     0.63s  1.60% 56.28%      1.08s  2.74%  runtime.lock2
+     0.52s  1.32% 57.60%      0.67s  1.70%  github.com/BobuSumisu/aho-corasick.(*Trie).Walk
+     0.49s  1.24% 58.85%     16.57s 42.07%  github.com/trufflesecurity/trufflehog/v3/pkg/engine.(*Engine).verificationOverlapWorker
+     0.47s  1.19% 60.04%      0.47s  1.19%  runtime.nextFreeFast (inline)
+     0.39s  0.99% 61.03%      0.39s  0.99%  runtime.memclrNoHeapPointers
+     0.38s  0.96% 62.00%      0.56s  1.42%  runtime.fpTracebackPartialExpand
+     0.37s  0.94% 62.93%      0.37s  0.94%  runtime.futex
+     0.34s  0.86% 63.80%      0.34s  0.86%  runtime.cansemacquire (inline)
+     0.33s  0.84% 64.64%      0.70s  1.78%  regexp.(*Regexp).tryBacktrack
+     0.32s  0.81% 65.45%      0.37s  0.94%  container/list.(*List).remove (inline)
+     0.31s  0.79% 66.24%      0.31s  0.79%  runtime.(*itabTableType).find
+     0.29s  0.74% 66.97%      0.29s  0.74%  runtime.procyield
 ```
 
-The single dominant cost is **`runtime._ExternalCode` at 37.59% flat** — this is the go-re2/wazero WebAssembly module
+The single dominant cost is **`runtime._ExternalCode` at 40.67% flat** — this is the go-re2/wazero WebAssembly module
 executing the detectors' RE2 regexes as "external" (WASM-JIT'd) code. The keyword prefilter,
-**`aho-corasick.(*Trie).Walk`**, appears at `1.63%` flat / `2.13%` cum — this is the fan-out mechanism itself. The
-`verificationOverlapWorker` frame (`43.74%` cum) is the engine's per-span detection worker.
+**`aho-corasick.(*Trie).Walk`**, appears at `1.32%` flat / `1.70%` cum — this is the fan-out mechanism itself. The
+`verificationOverlapWorker` frame (`42.07%` cum) is the engine's per-span detection worker. (The lone
+`regexp.(*Regexp).tryBacktrack` frame at `0.84%` flat is the stdlib **decoder** backtracker, not a detector — see the
+attribution note in Section 4.3.)
 
 ### 4.3 Cumulative call chain — the cost is explicitly go-re2 RE2 execution
 
@@ -328,26 +347,44 @@ go tool pprof -top -cum -nodecount=22 /tmp/thog /root/pprof/pprof.thog.samples.c
 ```
 
 ```
+File: thog
+Build ID: 4e49fdf6cc5382d4e0f87dedb5b74dc2aa5076a1
+Type: cpu
+Time: 2026-07-01 06:47:58 UTC
+Duration: 10.11s, Total samples = 39.39s (389.50%)
+Showing nodes accounting for 18.61s, 47.25% of 39.39s total
+Dropped 924 nodes (cum <= 0.20s)
+Showing top 22 nodes out of 172
       flat  flat%   sum%        cum   cum%
-         0     0%     0%     17.21s 43.74%  ...pkg/engine.(*Engine).startVerificationOverlapWorkers.func1
-     0.41s  1.04%  1.04%     17.21s 43.74%  ...pkg/engine.(*Engine).verificationOverlapWorker
-    14.79s 37.59% 38.63%     14.79s 37.59%  runtime._ExternalCode
-         0     0% 38.63%     14.79s 37.59%  runtime._System
-     0.08s   0.2% 38.83%      9.44s 23.99%  github.com/wasilibs/go-re2/internal.(*Regexp).FindAllStringSubmatch
-     0.05s  0.13% 38.96%      8.75s 22.24%  github.com/wasilibs/go-re2/internal.(*lazyFunction).callWithStack
-     0.01s 0.025% 38.98%      5.13s 13.04%  github.com/wasilibs/go-re2/internal.(*lazyFunction).Call1
-         0     0% 38.98%      4.25s 10.80%  github.com/wasilibs/go-re2/internal.getChildModule
-     0.05s  0.13% 41.35%      4.17s 10.60%  github.com/wasilibs/go-re2/internal.(*Regexp).findAllSubmatch
-     0.02s 0.051% 41.40%      4.16s 10.57%  github.com/wasilibs/go-re2/internal.matchFrom
-     0.05s  0.13% 41.65%      4.03s 10.24%  github.com/trufflesecurity/trufflehog/v3/pkg/context.WithTimeout
-         0     0% 41.73%      3.47s  8.82%  ...pkg/engine.(*Engine).scannerWorker
+         0     0%     0%     16.57s 42.07%  github.com/trufflesecurity/trufflehog/v3/pkg/engine.(*Engine).startVerificationOverlapWorkers.func1
+     0.49s  1.24%  1.24%     16.57s 42.07%  github.com/trufflesecurity/trufflehog/v3/pkg/engine.(*Engine).verificationOverlapWorker
+    16.02s 40.67% 41.91%     16.02s 40.67%  runtime._ExternalCode
+         0     0% 41.91%     16.02s 40.67%  runtime._System
+     0.14s  0.36% 42.27%      8.50s 21.58%  github.com/wasilibs/go-re2/internal.(*Regexp).FindAllStringSubmatch
+     0.04s   0.1% 42.37%      7.60s 19.29%  github.com/wasilibs/go-re2/internal.(*lazyFunction).callWithStack
+         0     0% 42.37%      4.62s 11.73%  github.com/wasilibs/go-re2/internal.(*lazyFunction).Call1
+         0     0% 42.37%      4.41s 11.20%  github.com/trufflesecurity/trufflehog/v3/pkg/context.WithTimeout
+     0.01s 0.025% 42.40%      4.28s 10.87%  runtime.systemstack
+     0.13s  0.33% 42.73%      3.88s  9.85%  github.com/wasilibs/go-re2/internal.getChildModule
+     0.01s 0.025% 42.75%      3.67s  9.32%  github.com/wasilibs/go-re2/internal.(*Regexp).findAllSubmatch
+     0.03s 0.076% 42.83%      3.49s  8.86%  github.com/wasilibs/go-re2/internal.matchFrom
+     0.70s  1.78% 44.61%      3.49s  8.86%  internal/sync.(*Mutex).Lock (inline)
+         0     0% 44.61%      3.49s  8.86%  sync.(*Mutex).Lock (inline)
+     0.08s   0.2% 44.81%      3.46s  8.78%  github.com/wasilibs/go-re2/internal.(*lazyFunction).Call8
+     0.01s 0.025% 44.83%      3.13s  7.95%  github.com/wasilibs/go-re2/internal.putChildModule
+     0.18s  0.46% 45.29%      3.10s  7.87%  runtime.mallocgc
+         0     0% 45.29%      2.97s  7.54%  runtime.gcBgMarkWorker
+         0     0% 45.29%      2.97s  7.54%  runtime.gcBgMarkWorker.func2
+     0.13s  0.33% 45.62%      2.97s  7.54%  runtime.gcDrain
+     0.64s  1.62% 47.25%      2.83s  7.18%  runtime.scanobject
+         0     0% 47.25%      2.80s  7.11%  runtime.gcDrainMarkWorkerDedicated (inline)
 ```
 
-The chain is decisive: `verificationOverlapWorker` → **`go-re2/internal.(*Regexp).FindAllStringSubmatch` (23.99% cum)**
-→ `wazero (*lazyFunction).callWithStack` (22.24%) → `Call1` (13.04%) → `runtime._ExternalCode` (the leaf, reached via
-`runtime._System`). In other words, **the detectors' RE2 regex execution via go-re2/wazero is the overwhelming cost**.
-The `context.WithTimeout` frame (`10.24%` cum) is the per-detector timeout wrapping from [pkg/engine/engine.go:1066],
-invoked once per detector call.
+The chain is decisive: `verificationOverlapWorker` (`42.07%` cum) → **`go-re2/internal.(*Regexp).FindAllStringSubmatch`
+(21.58% cum)** → `wazero (*lazyFunction).callWithStack` (19.29%) → `Call1` (11.73%) → `runtime._ExternalCode` (the leaf,
+reached via `runtime._System`). In other words, **the detectors' RE2 regex execution via go-re2/wazero is the
+overwhelming cost**. The `context.WithTimeout` frame (`11.20%` cum) is the per-detector timeout wrapping from
+[pkg/engine/engine.go:1066], invoked once per detector call.
 
 **Honesty note — the stdlib `regexp.backtrack` line is the EscapedUnicode DECODER, not a detector.** Scanning the full
 profile shows the Go standard-library `regexp` backtracker present but *minor*:
@@ -357,13 +394,13 @@ go tool pprof -top -nodecount=400 /tmp/thog /root/pprof/pprof.thog.samples.cpu.0
 ```
 
 ```
-     0.23s  0.58% ...   0.54s  1.37%  regexp.(*Regexp).tryBacktrack
-     0.09s  0.23% ...   0.65s  1.65%  regexp.(*Regexp).backtrack
-         0     0% ...    0.48s  1.22%  github.com/trufflesecurity/trufflehog/v3/pkg/decoders.(*EscapedUnicode).FromChunk
+     0.33s  0.84% 64.64%      0.70s  1.78%  regexp.(*Regexp).tryBacktrack
+     0.06s  0.15% 81.29%      0.78s  1.98%  regexp.(*Regexp).backtrack
+         0     0% 83.96%      0.42s  1.07%  github.com/trufflesecurity/trufflehog/v3/pkg/decoders.(*EscapedUnicode).FromChunk
 ```
 
-The `regexp.(*Regexp).backtrack` frame (only `1.65%` cum here) is reached from
-`pkg/decoders.(*EscapedUnicode).FromChunk` (`1.22%` cum), which uses the Go **standard-library** `regexp` package
+The `regexp.(*Regexp).backtrack` frame (only `1.98%` cum here) is reached from
+`pkg/decoders.(*EscapedUnicode).FromChunk` (`1.07%` cum), which uses the Go **standard-library** `regexp` package
 (`"regexp"` imported at [pkg/decoders/escaped_unicode.go:5]) — it is the **EscapedUnicode DECODER**, **not** a detector,
 and the stdlib `regexp` is itself linear-time (same RE2-derived design). The Base64 decoder helper
 `getSubstringsOfCharacterSet` [pkg/decoders/base64.go:83] is likewise a decoder cost. **Do not misattribute these to
@@ -372,22 +409,26 @@ all-keyword payload used here is dominated instead by go-re2 detector execution.
 
 ### 4.4 `--print-avg-detector-time` is insufficient for attribution
 
+TruffleHog's built-in per-detector timing flag writes its header and rows to **stderr** — the header string is emitted
+to `os.Stderr` by `printAverageDetectorTime` [main.go:1021-1028]. Capturing stderr on the crafted fixture:
+
 ```bash
-/tmp/thog filesystem /tmp/redos_val/crafted --no-verification --no-update --print-avg-detector-time
+/tmp/thog filesystem /tmp/redos_val/crafted --no-verification --no-update --print-avg-detector-time 2>&1 1>/dev/null
 ```
 
 ```
+🐷🔑🐷  TruffleHog. Unearth your secrets. 🐷🔑🐷
+
 Average detector time is the measurement of average time spent on each detector when results are returned.
-Parsehub: 82.892µs
 ```
 
-Only a **single** detector row (`Parsehub`, ~83 µs) is printed, and meanwhile `--json` emits **0** result objects and
-the summary reports `0` verified / `0` unverified. The reason is the gating condition
-`if e.printAvgDetectorTime && len(results) > 0 {` [pkg/engine/engine.go:1092]: a detector is only *recorded* when it
-returns results. The hundreds of detectors that actually burned CPU running their regexes but matched nothing are
-**invisible** to this flag, and the one row shown (`Parsehub`, a transient result later filtered from the final output)
-is a trivial 83 µs. This is precisely why **pprof + `go test -bench`** — not `--print-avg-detector-time` — are the
-authoritative attribution methods for Q3.
+**Zero detector rows are printed after the header**, even though hundreds of detectors ran their regexes against the
+keyword-dense payload (the same run reports `"verified_secrets": 0, "unverified_secrets": 0` on stdout). The reason is
+the gating condition `if e.printAvgDetectorTime && len(results) > 0 {` [pkg/engine/engine.go:1092]: a detector's timing
+is only *recorded* when it returns at least one result. Because the crafted file's keywords are fake trigger strings
+that match no real secret pattern, every detector returns zero results and is therefore **invisible** to this flag —
+despite burning the CPU documented in the pprof profile above. This is precisely why **pprof + `go test -bench`** — not
+`--print-avg-detector-time` — are the authoritative attribution methods for Q3.
 
 ### 4.5 Per-detector benchmarks — every pattern is LINEAR
 
@@ -399,52 +440,97 @@ CGO_ENABLED=0 go test -run='^$' -bench=BenchmarkFromData -benchmem -tags=detecto
 ```
 
 ```
-BenchmarkFromData/xsmall-128   1205625      1005 ns/op       240 B/op    7 allocs/op
-BenchmarkFromData/small-128     744872      1839 ns/op       336 B/op    7 allocs/op
-BenchmarkFromData/medium-128    117430      8875 ns/op      1248 B/op    7 allocs/op
-BenchmarkFromData/large-128      14445     75789 ns/op     10464 B/op    7 allocs/op
-BenchmarkFromData/xlarge-128      1340    748992 ns/op    106720 B/op    7 allocs/op
-BenchmarkFromData/xxlarge-128      151   7892199 ns/op   1048801 B/op    7 allocs/op
+goos: linux
+goarch: amd64
+pkg: github.com/trufflesecurity/trufflehog/v3/pkg/detectors/ftp
+cpu: Intel(R) Xeon(R) CPU @ 2.60GHz
+BenchmarkFromData/xsmall-128         	 1527098	       798.3 ns/op	     240 B/op	       7 allocs/op
+BenchmarkFromData/small-128          	  897710	      1304 ns/op	     336 B/op	       7 allocs/op
+BenchmarkFromData/medium-128         	  186290	      6320 ns/op	    1248 B/op	       7 allocs/op
+BenchmarkFromData/large-128          	   19040	     58928 ns/op	   10464 B/op	       7 allocs/op
+BenchmarkFromData/xlarge-128         	    2162	    543685 ns/op	  106720 B/op	       7 allocs/op
+BenchmarkFromData/xxlarge-128        	     204	   5576251 ns/op	 1048801 B/op	       7 allocs/op
+PASS
+ok  	github.com/trufflesecurity/trufflehog/v3/pkg/detectors/ftp	10.005s
 ```
 
-The `ftp` detector scales `75789 → 748992 → 7892199 ns/op` for `10 KB → 100 KB → 1 MB` — i.e. **9.88×** then **10.54×**
-for each 10× input increase (≈**7.3 ns/byte**), with a **constant 7 allocs/op** at *every* size. Constant allocations
-and ≈10× time per 10× input are the textbook signature of a **linear, non-backtracking** engine.
+The `ftp` detector scales `58928 → 543685 → 5576251 ns/op` for `10 KB → 100 KB → 1 MB` — i.e. **9.23×** then **10.26×**
+for each 10× input increase (≈**5.31 ns/byte** at 100 KB), with a **constant 7 allocs/op** at *every* size. Constant
+allocations and ≈10× time per 10× input are the textbook signature of a **linear, non-backtracking** engine.
 
 The same linear pattern holds across other keyword-heavy detectors (verbatim `xlarge`/`xxlarge` rows,
 `go test -run='^$' -bench=BenchmarkFromData -benchmem -tags=detectors ./pkg/detectors/<name>/`):
 
 | Detector | xlarge (100 KB) ns/op | xxlarge (1 MB) ns/op | ratio (≈10× input) | allocs/op |
 |---|---|---|---|---|
-| `ftp` | `748992` | `7892199` | `10.54×` | `7` |
-| `github/v1` | `745046` | `8071693` | `10.83×` | `7` |
-| `github/v2` | `642957` | `7108566` | `11.06×` | `7` |
-| `gitlab/v1` | `195800` | `2000781` | `10.22×` | `7` |
-| `gitlab/v2` | `667703` | `6875434` | `10.30×` | `7` |
-| `slack` | `283845` | `3201851` | `11.28×` | `29` |
-| `githubapp` | `325341` | `3733670` | `11.48×` | `13` |
+| `ftp` | `543685` | `5576251` | `10.26×` | `7` |
+| `github/v1` | `552458` | `5576643` | `10.09×` | `7` |
+| `github/v2` | `536993` | `5732493` | `10.68×` | `7` |
+| `gitlab/v1` | `156156` | `1588899` | `10.18×` | `7` |
+| `gitlab/v2` | `569656` | `5849564` | `10.27×` | `7` |
+| `slack` | `237250` | `2773604` | `11.69×` | `29` |
+| `githubapp` | `273607` | `3045333` | `11.13×` | `13` |
 
-Every detector is linear (ratio ≈ 10–11.5× for 10× input) with a per-detector allocation count that is **constant**
-across sizes. A single detector's 100 KB cost is only ≈`0.2–0.75 ms`; the crafted-file `scan_duration` of ~`269 ms`
+The verbatim `xlarge`/`xxlarge` rows behind the table (each quoted from its own benchmark invocation):
+
+```
+$ CGO_ENABLED=0 go test -run='^$' -bench=BenchmarkFromData -benchmem -tags=detectors ./pkg/detectors/github/v1/
+BenchmarkFromData/xlarge-128         	    2210	    552458 ns/op	  106720 B/op	       7 allocs/op
+BenchmarkFromData/xxlarge-128        	     207	   5576643 ns/op	 1048801 B/op	       7 allocs/op
+ok  	github.com/trufflesecurity/trufflehog/v3/pkg/detectors/github/v1	10.902s
+$ CGO_ENABLED=0 go test -run='^$' -bench=BenchmarkFromData -benchmem -tags=detectors ./pkg/detectors/github/v2/
+BenchmarkFromData/xxlarge-128         	     207	   5732493 ns/op	 1048801 B/op	       7 allocs/op
+BenchmarkFromData/xlarge-128          	    2161	    536993 ns/op	  106720 B/op	       7 allocs/op
+ok  	github.com/trufflesecurity/trufflehog/v3/pkg/detectors/github/v2	10.938s
+$ CGO_ENABLED=0 go test -run='^$' -bench=BenchmarkFromData -benchmem -tags=detectors ./pkg/detectors/gitlab/v1/
+BenchmarkFromData/xlarge-128         	    7730	    156156 ns/op	  106720 B/op	       7 allocs/op
+BenchmarkFromData/xxlarge-128        	     704	   1588899 ns/op	 1048801 B/op	       7 allocs/op
+ok  	github.com/trufflesecurity/trufflehog/v3/pkg/detectors/gitlab/v1	9.927s
+$ CGO_ENABLED=0 go test -run='^$' -bench=BenchmarkFromData -benchmem -tags=detectors ./pkg/detectors/gitlab/v2/
+BenchmarkFromData/xlarge-128         	    2152	    569656 ns/op	  106720 B/op	       7 allocs/op
+BenchmarkFromData/xxlarge-128        	     210	   5849564 ns/op	 1048801 B/op	       7 allocs/op
+ok  	github.com/trufflesecurity/trufflehog/v3/pkg/detectors/gitlab/v2	10.182s
+$ CGO_ENABLED=0 go test -run='^$' -bench=BenchmarkFromData -benchmem -tags=detectors ./pkg/detectors/slack/
+BenchmarkFromData/xxlarge-128         	     429	   2773604 ns/op	 1049538 B/op	      29 allocs/op
+BenchmarkFromData/xlarge-128          	    4732	    237250 ns/op	  107456 B/op	      29 allocs/op
+ok  	github.com/trufflesecurity/trufflehog/v3/pkg/detectors/slack	8.520s
+$ CGO_ENABLED=0 go test -run='^$' -bench=BenchmarkFromData -benchmem -tags=detectors ./pkg/detectors/githubapp/
+BenchmarkFromData/xxlarge-128         	     391	   3045333 ns/op	 1049025 B/op	      13 allocs/op
+BenchmarkFromData/xlarge-128          	    4152	    273607 ns/op	  106944 B/op	      13 allocs/op
+ok  	github.com/trufflesecurity/trufflehog/v3/pkg/detectors/githubapp	8.531s
+```
+
+Every detector is linear (ratio ≈ 10–11.7× for 10× input) with a per-detector allocation count that is **constant**
+across sizes. A single detector's 100 KB cost is only ≈`0.15–0.57 ms`; the crafted-file `scan_duration` of ~`21 ms`
 (Section 5) is the **sum** of that small per-detector cost across the many detectors triggered by the keyword-dense
 payload, times matched spans, times the four decoder passes. **No single detector pattern is the culprit** — the
 "disproportionate" cost is the aggregate.
 
 ---
 
-## 5. Q4 — How much slower vs. an equivalent-size normal file? **Answer: ≈49× slower `scan_duration` at identical size**
+## 5. Q4 — How much slower vs. an equivalent-size normal file? **Answer: ≈4× slower `scan_duration` at identical size**
+
+**Primary answer:** a realistic keyword-dense crafted file produces a **median `3.98×`** (mean `3.92×`) increase in
+`scan_duration` versus a benign file of *identical* `102400`-byte size. (An extreme all-keyword payload can push this to
+≈`49×` as a secondary upper bound — Section 5.5 — but the representative, realistic figure is **≈4×**.)
 
 The methodology mirrors the repository's own performance CI (`.github/workflows/performance.yml`): build the binary
 [.github/workflows/performance.yml:26], scan with `filesystem ... --no-verification --no-update`
-[.github/workflows/performance.yml:37], and average over multiple runs [.github/workflows/performance.yml:34,47]. Two
+[.github/workflows/performance.yml:37], and average over multiple runs [.github/workflows/performance.yml:34,47]. Three
 adjustments were required and are stated transparently:
 
 1. **Metric = TruffleHog's own `scan_duration`, not wall time.** Process wall time is dominated by a fixed
    go-re2/wazero WebAssembly startup cost; `scan_duration` isolates the actual scanning work. (This is also why the
    equal-size comparison is meaningful.)
-2. **`bc` and `/usr/bin/time` are unavailable in this container** (confirmed at runtime), so timing was averaged with
-   Python (`statistics.median` / `mean`) over the parsed `scan_duration` values rather than the workflow's
-   `bc`-based averaging.
+2. **`bc` and `/usr/bin/time` are unavailable in this container** (confirmed at runtime — `which bc` → `bc: not found`,
+   `/usr/bin/time` absent), so timing was averaged with Python (`statistics.median` / `mean`) over the parsed
+   `scan_duration` values rather than the workflow's `bc`-based averaging.
+3. **This is a shared, load-variable box** (1-minute load fluctuated `3.4`–`11` during the session). The two fixtures
+   were therefore scanned **back-to-back and interleaved** within each iteration, and runs were gated to periods of
+   1-minute load `≤ 6`, so both files experience identical load. Absolute `scan_duration` values here are somewhat
+   elevated by that background load (a benign scan floors at ≈`5.3 ms` on this box rather than the ≈`4 ms` typical of an
+   unloaded host), but the **slowdown *ratio* is load-invariant** — it is the same ≈`4×` whether the box is quiet or
+   busy — which is exactly why the ratio (not the absolute ms) is the answer to "how much slower".
 
 ### 5.1 Fixtures — byte-for-byte equivalent size
 
@@ -460,13 +546,18 @@ stat -c '%n %s' /tmp/redos_val/normal/normal.txt /tmp/redos_val/crafted/crafted.
 /tmp/redos_val/crafted/crafted.txt 102400
 ```
 
-- **`normal.txt`** — benign lorem-ipsum prose, deliberately keyword-free.
-- **`crafted.txt`** — packed with the **939 distinct detector trigger keywords** extracted from every
-  `Keywords()` method under `pkg/detectors/**` (e.g. `token`, `secret`, `password`, `api_key`, `aws_access_key_id`,
-  `client_secret`, `access_token`, `refresh_token`, `private_key`, `AKIA`, `AIza`, `ghp_`, `xoxb`, `sk_live`,
-  `glpat-`, `Bearer`, `github`, `gitlab`, `slack`, `stripe`, `okta`, …), cycled to fill the file. This maximizes
-  Aho-Corasick detector fan-out. **The keywords are fake**, so the file completes valid secrets for essentially no
-  detector — it produces zero emitted results while forcing maximum detector execution.
+- **`normal.txt`** — benign lorem-ipsum prose, deliberately keyword-free (verified to emit `0` secrets).
+- **`crafted.txt`** — a **realistic** keyword-dense file packed with **52 distinct, commonly-seen detector trigger
+  keywords**, cycled to fill the file: `token`, `key`, `secret`, `password`, `apikey`, `api_key`, `access_token`,
+  `refresh_token`, `client_secret`, `client_id`, `private_key`, `secret_key`, `auth`, `bearer`, `credentials`,
+  `aws_access_key_id`, `aws_secret_access_key`, `AKIA`, `AIza`, `ghp_`, `xoxb`, `xoxp`, `sk_live`, `glpat-`, `github`,
+  `gitlab`, `slack`, `stripe`, `okta`, `heroku`, `sendgrid`, `mailgun`, `twilio`, `cloudflare`, `digitalocean`, `npm_`,
+  `pat`, `oauth`, `jwt`, `session`, `azure`, `gcp`, `google`, `firebase`, `mongodb`, `postgres`, `mysql`, `redis`,
+  `rabbitmq`, `datadog`, `sentry`, `algolia`. These are a subset of the **958 distinct keywords** extracted from every
+  `Keywords()` method under `pkg/detectors/**` (extraction command and count in Section 6.2). Packing many distinct
+  keywords drives Aho-Corasick detector fan-out. **The keywords are fake**, so the file completes a valid secret for
+  essentially no detector — it produces zero emitted results while still forcing extra detector execution (pure wasted
+  CPU). (Section 5.5 shows how the slowdown scales as the keyword set grows from 16 to all 958.)
 
 ### 5.2 Command (per run)
 
@@ -476,47 +567,140 @@ stat -c '%n %s' /tmp/redos_val/normal/normal.txt /tmp/redos_val/crafted/crafted.
 
 ### 5.3 Verbatim `finished scanning` lines (identical volume, zero results in both)
 
-```
-NORMAL:  finished scanning	{"chunks": 10, "bytes": 130048, "verified_secrets": 0, "unverified_secrets": 0, "scan_duration": "5.580187ms",   "trufflehog_version": "dev", ...}
-CRAFTED: finished scanning	{"chunks": 10, "bytes": 130048, "verified_secrets": 0, "unverified_secrets": 0, "scan_duration": "488.103904ms", "trufflehog_version": "dev", ...}
+```bash
+/tmp/thog filesystem /tmp/redos_val/normal  --no-verification --no-update   # NORMAL
+/tmp/thog filesystem /tmp/redos_val/crafted --no-verification --no-update   # CRAFTED
 ```
 
-Both report `10` chunks and `0` verified / `0` unverified secrets. (Single runs vary; the authoritative figures are the
-20-run statistics below. The `--json` output emits **0** result objects for `crafted.txt`, confirming the extra work is
-pure wasted CPU.)
+```
+NORMAL:  finished scanning	{"chunks": 10, "bytes": 130048, "verified_secrets": 0, "unverified_secrets": 0, "scan_duration": "4.873465ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
+CRAFTED: finished scanning	{"chunks": 10, "bytes": 130048, "verified_secrets": 0, "unverified_secrets": 0, "scan_duration": "20.765829ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
+```
+
+Both report `10` chunks, `130048` bytes, and `0` verified / `0` unverified secrets — identical scan volume, so the only
+difference is the per-byte processing cost. (Single runs vary; the authoritative figures are the 20-run statistics
+below. The `--json` output emits **0** result objects for `crafted.txt`, confirming the extra work is pure wasted CPU.)
 
 ### 5.4 20-run `scan_duration` statistics
 
+A small Python harness scanned the two fixtures **interleaved** (normal then crafted per iteration), gating each
+iteration to 1-minute load `≤ 6`, parsing `scan_duration` from each `--json` run, until 20 valid pairs were collected.
+The exact harness (`/tmp/measure_ab.py`, temporary, removed after capture):
+
+```python
+import subprocess, re, statistics as st, time, sys
+THOG="/tmp/thog"
+NORMAL="/tmp/redos_val/normal"; CRAFTED="/tmp/redos_val/crafted"
+N=int(sys.argv[1]) if len(sys.argv)>1 else 20
+LOADCAP=float(sys.argv[2]) if len(sys.argv)>2 else 6.0
+MAXTRIES=int(sys.argv[3]) if len(sys.argv)>3 else 400
+dur_re=re.compile(r'"scan_duration":"([0-9.]+)ms"')
+def load1(): return float(open('/proc/loadavg').read().split()[0])
+def scan(path):
+    out=subprocess.run([THOG,"filesystem",path,"--no-verification","--no-update","--json"],
+                       capture_output=True,text=True).stderr
+    m=dur_re.findall(out); return float(m[-1]) if m else None
+normal=[]; crafted=[]; tries=0
+while len(normal)<N and tries<MAXTRIES:
+    tries+=1
+    if load1()>LOADCAP:
+        time.sleep(0.5); continue
+    n=scan(NORMAL); c=scan(CRAFTED)
+    if n is None or c is None: continue
+    normal.append(n); crafted.append(c)
+print("collected pairs:",len(normal),"tries:",tries,"loadcap:",LOADCAP)
+print("NORMAL  ms:", [round(x,3) for x in normal])
+print("CRAFTED ms:", [round(x,3) for x in crafted])
+if normal:
+    print("NORMAL  median=%.3f mean=%.3f"%(st.median(normal),st.mean(normal)))
+    print("CRAFTED median=%.3f mean=%.3f"%(st.median(crafted),st.mean(crafted)))
+    print("RATIO median=%.2fx mean=%.2fx"%(st.median(crafted)/st.median(normal), st.mean(crafted)/st.mean(normal)))
 ```
-NORMAL  runs (ms): [5.279, 5.795, 6.15, 4.994, 5.002, 5.495, 7.044, 5.888, 5.929, 5.756,
-                    5.48, 5.382, 4.786, 5.135, 5.448, 5.169, 8.899, 5.591, 6.521, 4.67]
-CRAFTED runs (ms): [297.595, 288.233, 289.919, 264.311, 260.999, 286.239, 204.847, 176.315, 293.354, 268.688,
-                    317.92, 251.176, 165.228, 304.768, 157.747, 267.307, 269.112, 265.053, 289.438, 296.453]
+
+```bash
+python3 /tmp/measure_ab.py 20 6.0 400        # N=20 pairs, loadcap=6.0, up to 400 tries
+```
+
+```
+collected pairs: 20 tries: 106 loadcap: 6.0
+NORMAL  ms: [5.347, 5.476, 5.055, 5.327, 4.438, 5.153, 5.18, 5.645, 5.199, 5.581, 5.219, 5.365, 5.123, 5.131, 5.646, 5.478, 5.103, 6.511, 5.172, 5.635]
+CRAFTED ms: [21.972, 21.047, 21.962, 23.466, 24.46, 22.463, 20.869, 23.974, 20.293, 20.97, 17.1, 19.979, 19.914, 22.114, 21.664, 19.418, 17.12, 17.426, 20.448, 21.484]
+NORMAL  median=5.273 mean=5.339
+CRAFTED median=21.009 mean=20.907
+RATIO median=3.98x mean=3.92x
 ```
 
 | Fixture (102400 B) | median `scan_duration` | mean `scan_duration` | verified / unverified |
 |---|---|---|---|
-| `normal.txt` (benign) | **`5.488 ms`** | `5.721 ms` | 0 / 0 |
-| `crafted.txt` (keyword-packed) | **`268.900 ms`** | `260.735 ms` | 0 / 0 |
-| **Slowdown** | **`49.00×` (median)** | **`45.58×` (mean)** | — |
+| `normal.txt` (benign) | **`5.273 ms`** | `5.339 ms` | 0 / 0 |
+| `crafted.txt` (52-keyword) | **`21.009 ms`** | `20.907 ms` | 0 / 0 |
+| **Slowdown** | **`3.98×` (median)** | **`3.92×` (mean)** | — |
 
-### 5.5 The slowdown scales with keyword diversity
+So at *identical* `102400`-byte size, the realistic crafted file is **≈4× slower** to scan. (The absolute ms are
+elevated by shared-box load, but the ratio is stable across load — verified by re-running at both high and moderate load.)
+
+### 5.5 The slowdown scales with keyword diversity (secondary evidence)
 
 The amplification is a direct function of how many *distinct* detector keywords the file contains (more keywords ⇒ more
-detectors selected by the Aho-Corasick prefilter ⇒ more RE2 executions). Measured on the same 102400-byte size:
+detectors selected by the Aho-Corasick prefilter ⇒ more RE2 executions). Two additional `102400`-byte payloads were
+built from *defined* keyword sets — `kw16.txt` (the first 16 of the 52 curated keywords) and `kwlist.txt` (all `958`
+extracted keywords, Section 6.2) — and scanned **interleaved** with `normal.txt` (`8` pairs each) using the same
+harness as Section 5.4:
 
-- A **modest 16-keyword** payload produced a median slowdown of **≈2.8×**.
-- The **maximal 939-keyword** payload produced a median slowdown of **≈49×**.
+```bash
+# Build defined-size payloads (space-cycled to an exact byte size)
+python3 /tmp/build_fixture.py /tmp/kw16.txt   102400 /tmp/redos_sec/mod16b/f.txt    # 16-keyword,  102400 bytes
+python3 /tmp/build_fixture.py /tmp/kwlist.txt 102400 /tmp/redos_sec/max100b/f.txt   # 958-keyword, 102400 bytes
 
-This is the honest answer to "how much slower *can* you make it": on this box, up to **≈49×** at equal size — a large
-but **bounded, linear** constant factor.
+# Interleaved A/B (normal vs payload), same measure harness as 5.4
+python3 /tmp/measure_pair.py /tmp/redos_val/normal /tmp/redos_sec/mod16b  8 100.0 100    # modest  16-keyword
+python3 /tmp/measure_pair.py /tmp/redos_val/normal /tmp/redos_sec/max100b 8 100.0 100    # maximal 958-keyword
+```
+
+```
+# --- modest 16-keyword ---
+collected pairs: 8 tries: 8 loadcap: 100.0
+A(/tmp/redos_val/normal) ms: [5.464, 5.201, 5.536, 5.198, 5.446, 5.541, 5.283, 5.002]
+B(/tmp/redos_sec/mod16b) ms: [5.809, 5.971, 6.353, 5.606, 6.027, 6.121, 5.912, 6.0]
+A median=5.364 mean=5.334
+B median=5.986 mean=5.975
+RATIO median=1.12x mean=1.12x
+
+# --- maximal 958-keyword ---
+collected pairs: 8 tries: 8 loadcap: 100.0
+A(/tmp/redos_val/normal)  ms: [5.244, 5.267, 5.782, 5.463, 4.888, 5.132, 5.569, 5.635]
+B(/tmp/redos_sec/max100b) ms: [290.015, 274.891, 264.114, 288.396, 292.222, 260.2, 235.711, 235.682]
+A median=5.365 mean=5.373
+B median=269.502 mean=267.654
+RATIO median=50.23x mean=49.82x
+```
+
+(These two secondary runs were collected while the shared box was busier — 1-minute load ≈`14`–`26` — yet the `normal`
+floor still lands at ≈`5.3 ms`, matching Section 5.4 and reconfirming the ratio is load-invariant.)
+
+| Payload (102400 B) | distinct keywords | crafted median | slowdown |
+|---|---|---|---|
+| modest | `16` | `5.986 ms` | **≈`1.12×`** |
+| **realistic (primary)** | **`52`** | **`21.009 ms`** | **≈`3.98×`** |
+| maximal *(secondary upper bound)* | `958` | `269.502 ms` | ≈`50.23×` |
+
+> **Provenance / honesty label for the ≈50× figure.** The `958`-keyword row is a **deliberately artificial, secondary
+> exploratory *upper bound*** — it cycles *every* keyword extracted from *every* detector's `Keywords()` method (the
+> `958`-keyword set enumerated in Section 6.2), which no realistic committed file would contain. It is included only to
+> show the *shape* of the scaling curve. The **representative, primary answer to "how much slower" is ≈`4×`** (the
+> 52-keyword realistic payload, Section 5.4). Even this maximal payload is a **bounded slowdown, not a hang**: it still
+> finishes in ~`0.27 s` at 100 KB (and `674.824744ms` at 512 KB, Section 2.4). RE2 linearity guarantees the curve stays
+> multiplicative-and-bounded, never exponential.
 
 ### 5.6 Honesty note
 
 Both files emit **0 verified / 0 unverified** secrets — the crafted slowdown is *pure wasted CPU*, not detection work.
-And it is a **slowdown, not a hang**: even the crafted 100 KB scan finishes in ~`0.27 s`. Wall-clock time for the two
-scans is nearly identical (dominated by the fixed ~1.7 s go-re2/wazero WebAssembly initialization), which is exactly why
-TruffleHog's reported `scan_duration` — not process wall time — is the correct isolating metric for this comparison.
+And it is a **slowdown, not a hang**: the realistic crafted 100 KB scan finishes in ~`21 ms` (and even the artificial
+all-958-keyword upper bound finishes in ~`0.27 s`). Process wall-clock time for the two scans is nearly identical
+(dominated by the fixed ~1.7 s go-re2/wazero WebAssembly initialization), which is exactly why TruffleHog's reported
+`scan_duration` — not process wall time — is the correct isolating metric for this comparison. The **≈`4×` slowdown
+*ratio* is load-invariant**; the absolute millisecond values are elevated by this shared box's background load and would
+be lower (and the ratio essentially unchanged) on an unloaded host.
 
 ---
 
@@ -524,33 +708,70 @@ TruffleHog's reported `scan_duration` — not process wall time — is the corre
 
 This section consolidates the verbatim commands and outputs already shown, plus the profiling infrastructure.
 
-### 6.1 Build & environment
+### 6.1 Build & environment (verbatim)
 
 ```bash
-CGO_ENABLED=0 go build -o /tmp/thog .          # rc=0; 194309034 bytes (~194 MB); warm-cache rebuild ≈9.7s
-/tmp/thog --version                             # trufflehog dev
-go version                                      # go version go1.24.2 linux/amd64
-grep -c '^processor' /proc/cpuinfo              # 128
-nproc                                           # 4  (container CPU quota; runtime.NumCPU()=128, GOMAXPROCS=128)
+$ time CGO_ENABLED=0 go build -o /tmp/thog .        # warm build cache
+real	0m2.156s
+user	0m4.425s
+sys	0m3.642s
+$ stat -c '%s' /tmp/thog
+194309034
+$ /tmp/thog --version
+trufflehog dev
+$ go version
+go version go1.24.2 linux/amd64
+$ grep -c '^processor' /proc/cpuinfo ; nproc ; nproc --all
+128
+4
+128
+$ command -v bc ; echo "bc exit=$?"                 # bc unavailable
+bc exit=1
+$ test -x /usr/bin/time || echo "/usr/bin/time absent"
+/usr/bin/time absent
+$ uname -r ; grep -m1 'model name' /proc/cpuinfo
+6.6.122+
+model name	: Intel(R) Xeon(R) CPU @ 2.60GHz
 ```
+
+`runtime.NumCPU()` and `GOMAXPROCS` both report `128` (host logical CPUs), while the container CPU quota limits `nproc`
+to `4` — consistent with the profile's `~388%` total-samples figure (≈4-core effective parallelism). Because `bc` and
+`/usr/bin/time` are absent, timing used Python `statistics` over TruffleHog's JSON `scan_duration` (Section 5.4).
 
 ### 6.2 Timing evidence (Q4) — see Section 5.4
 
-- Benign median `5.488 ms` vs crafted median `268.900 ms` at identical `102400` bytes → **`49.00×`** median slowdown.
+- Benign median `5.273 ms` vs crafted median `21.009 ms` at identical `102400` bytes → **`3.98×`** median slowdown
+  (mean `3.92×`) with the realistic 52-keyword payload.
 - Verbatim `finished scanning` lines and the full 20-run arrays are quoted in Sections 5.3–5.4.
+- **Keyword extraction (grounds the `52`-of-`958` framing).** A small Python script walks every `*.go` file under
+  `pkg/detectors/**` (excluding `_test.go`), captures each `func (…) Keywords() []string { … }` method body, extracts
+  both `"double-quoted"` and `` `backtick` `` string literals, lowercases and de-duplicates them:
+
+```bash
+python3 /tmp/extract_keywords.py    # deterministic; verified identical across 3 runs
+```
+
+```
+distinct detector keywords extracted = 958
+```
+
+  The realistic crafted fixture uses `52` commonly-seen keywords from this set (Section 5.1); the artificial secondary
+  upper-bound payload cycles all `958` (Section 5.5). The keyword list is dumped to `/tmp/kwlist.txt` for the
+  fixture builder.
 
 ### 6.3 CPU-profiling evidence (Q3) — see Section 4.2–4.3
 
-- `runtime._ExternalCode` `37.59%` flat (go-re2/wazero RE2 execution); cumulative chain
-  `verificationOverlapWorker → go-re2 FindAllStringSubmatch (23.99%) → wazero → runtime._ExternalCode`.
-- `aho-corasick.(*Trie).Walk` `2.13%` cum (keyword prefilter fan-out).
+- `runtime._ExternalCode` `40.67%` flat (go-re2/wazero RE2 execution); cumulative chain
+  `verificationOverlapWorker (42.07%) → go-re2 FindAllStringSubmatch (21.58%) → wazero callWithStack (19.29%) →
+  runtime._ExternalCode`.
+- `aho-corasick.(*Trie).Walk` `1.32%` flat / `1.70%` cum (keyword prefilter fan-out).
 
 ### 6.4 Timeout / gating evidence (Q1, Q3)
 
-- `--detector-timeout=1ms` still completes at `303.14515ms`; watchdog `"a detector ignored the context timeout"`
+- `--detector-timeout=1ms` still completes at `20.172629ms`; watchdog `"a detector ignored the context timeout"`
   count = `0`.
-- `--print-avg-detector-time` prints only the header + `Parsehub: 82.892µs` because of the
-  `len(results) > 0` gate [pkg/engine/engine.go:1092].
+- `--print-avg-detector-time` prints only the header line (on stderr) with **0 detector rows** on the crafted fixture,
+  because the `len(results) > 0` gate [pkg/engine/engine.go:1092] records only detectors that return results.
 
 ### 6.5 Profiling infrastructure (source-grounded)
 
@@ -603,26 +824,30 @@ Every sub-question is answered explicitly, with the section and verbatim evidenc
 
 - [x] **Q1 — hang/time-out feasibility → Section 2. Answer: NO.** The per-detector timeout is *advisory*
   [pkg/engine/engine.go:1066-1069] (default `10s` [pkg/detectors/http.go:18]), yet `--detector-timeout=1ms` still
-  completes (`303.14515ms`, watchdog count = 0) and a 512 KB file stays bounded (`52` chunks, `875.599331ms`). RE2
+  completes (`20.172629ms`, watchdog count = 0) and a 512 KB file stays bounded (`52` chunks, `71.012223ms`). RE2
   linearity + chunk-bounded input [pkg/sources/chunker.go:14,16] preclude a detector-path hang.
 - [x] **Q2 — vulnerable to computational-complexity attacks → Sections 1 & 3. Answer: no exponential; bounded
   amplification.** All 867 detectors use RE2/go-re2 v1.9.0 [go.mod:100]; `0` use `dlclark/regexp2` [go.mod:187].
-  Per-detector benchmarks are linear (≈10–11.5× per 10× input, constant allocs/op).
+  Per-detector benchmarks are linear (≈10–11.7× per 10× input, constant allocs/op).
 - [x] **Q3 — which detector pattern(s) → Section 4. Answer: none individually; aggregate amplification.** pprof `top`
-  (`runtime._ExternalCode` `37.59%` flat = go-re2/wazero; cum chain via `go-re2 FindAllStringSubmatch` `23.99%`),
+  (`runtime._ExternalCode` `40.67%` flat = go-re2/wazero; cum chain via `go-re2 FindAllStringSubmatch` `21.58%`),
   per-detector `bench` linearity, and the `--print-avg-detector-time` gating on `len(results) > 0`
   [pkg/engine/engine.go:1092].
-- [x] **Q4 — how much slower vs. equivalent size → Section 5. Answer: ≈49×.** Median `268.900 ms` (crafted) vs
-  `5.488 ms` (benign) at identical `102400` bytes → `49.00×` median (`45.58×` mean); scales from ≈2.8× (modest payload)
-  to ≈49× (maximal payload).
+- [x] **Q4 — how much slower vs. equivalent size → Section 5. Answer: ≈4×.** Median `21.009 ms` (crafted) vs
+  `5.273 ms` (benign) at identical `102400` bytes → `3.98×` median (`3.92×` mean) with a realistic 52-keyword payload;
+  scales from ≈`1.12×` (16-keyword) up to ≈`50×` for an artificial all-958-keyword secondary upper bound (still bounded,
+  ~`0.27 s`). The ≈4× ratio is load-invariant.
 - [x] **Q5 — timing + CPU-profiling evidence → Section 6 (and Sections 2, 4, 5).** All verbatim commands and outputs
   provided: `scan_duration` runs, pprof `top` (flat & cum), per-detector `ns/op`, `--detector-timeout=1ms` result,
   `--print-avg-detector-time` output, and the `--profile` server wiring [main.go:53,426-434].
 
-**Working-tree note.** The repository working tree is unchanged except for this single document. All temporary artifacts
-— the binary `/tmp/thog`, fixtures `/tmp/redos_val/*` (including the ~301 MB profiling corpus), the keyword-extraction
-and timing scripts, and the captured `cpu.prof` — live **outside** the repository tree and were removed after capture.
-`git status --porcelain` shows only `blitzy/documentation/trufflehog_e42153d44a5e.md`.
+**Working-tree note.** The only change this investigation makes to the repository is this single new documentation file.
+All temporary artifacts — the binary `/tmp/thog`, the fixtures `/tmp/redos_val/*` and `/tmp/redos_sec/*` (including the
+~101 MB profiling corpus), the extraction/build/timing scripts (`/tmp/*.py`), and the captured pprof profile
+(`/root/pprof/*.pb.gz`) — live **outside** the repository tree and are removed during finalization. Once the document is
+committed, `git status --porcelain` reports a clean tree (empty output), and the change relative to the pre-investigation
+baseline is exactly one path — `git diff --stat <baseline>` shows only
+`blitzy/documentation/trufflehog_e42153d44a5e.md`.
 
 ---
 
@@ -639,7 +864,7 @@ flowchart TD
     G --> H[mergeMatches + extractMatches: one span per keyword cluster]
     H --> I[Per-span RE2 regex re-execution under 10s advisory timeout]
     I --> J[CPU cost = detectors x spans x decoder passes]
-    J --> K[Observed: up to ~49x scan_duration vs equivalent-size benign file]
+    J --> K[Observed: ~4x scan_duration vs equivalent-size benign file - realistic 52-keyword payload; up to ~50x for an artificial all-958-keyword upper bound]
 %% RE2 guarantees linear time per match; amplification is multiplicative, not exponential
 ```
 
@@ -650,14 +875,16 @@ flowchart TD
 All measurement artifacts are temporary, live **outside** the repository tree, and were deleted after capture; only this
 markdown file is committed.
 
-- **Build:** `CGO_ENABLED=0 go build -o /tmp/thog .` (Go 1.24.2, rc=0, ~194 MB binary, version `trufflehog dev`;
-  warm-cache rebuild ≈9.7 s).
+- **Build:** `CGO_ENABLED=0 go build -o /tmp/thog .` (Go 1.24.2, rc=0, `194309034`-byte binary, version
+  `trufflehog dev`; warm-cache rebuild `real 0m2.156s`).
 - **CPUs:** 128 logical (`runtime.NumCPU()` = 128, `GOMAXPROCS` = 128); container CPU quota caps actual throughput to
   ≈4 cores (visible as `~388%` total samples in the profile). Slowdown *ratios* are unaffected because both scans run
   under the same quota.
 - **Fixtures:** `/tmp/redos_val/normal/normal.txt` and `/tmp/redos_val/crafted/crafted.txt`, both exactly `102400`
-  bytes; the crafted file cycles the 939 distinct detector keywords extracted from `pkg/detectors/**/Keywords()`.
-- **Profiling corpus:** `/tmp/redos_val/big/` (600 × 512 KB crafted files ≈ 301 MB), scanned with `--profile`.
+  bytes; the crafted file cycles **52** commonly-seen detector keywords (a subset of the `958` distinct keywords
+  extracted from `pkg/detectors/**/Keywords()` — Section 6.2). The artificial all-`958`-keyword payload
+  (`/tmp/redos_sec/max100b`, `max512b`) is used only for the secondary upper-bound measurement.
+- **Profiling corpus:** `/tmp/redos_val/big/` (200 × 512 KB crafted files ≈ 101 MB), scanned with `--profile`.
 - **Per-detector benchmarks:** `CGO_ENABLED=0 go test -run='^$' -bench=BenchmarkFromData -benchmem -tags=detectors ./pkg/detectors/<name>/`.
 - **Caveats confirmed at runtime:** `/usr/bin/time` and `bc` are unavailable in this container, so wall-clock timing used
   Python `time`/`statistics` over TruffleHog's JSON `scan_duration`.
