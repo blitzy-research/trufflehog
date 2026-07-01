@@ -46,6 +46,18 @@ meaningful — it is a build artifact.)
 isolated. All temporary artifacts are deleted at the end (see *Cleanup &
 Verification*); the source repository is left unmodified.
 
+**Safety: every credential shown is a crafted, non-live test value.** All AWS
+access-key IDs, AWS secret keys, and Postman (`PMAK-…`) tokens in this document
+were **fabricated** solely to exercise TruffleHog's *format* gates (prefix,
+length, entropy) — none is a real, active, or provisioned credential, and none
+grants access to any account. For that reason nearly every scan is run with
+`--no-verification` (part of COMMON, below), so no candidate is ever sent to a
+provider API. The **only** exception is the Q4 verification-overlap demonstration,
+which *intentionally* leaves verification enabled (it omits `--no-verification`)
+because the behavior being explained — the overlap safety guard — exists on the
+verification path; even there the tokens are crafted and, being non-live, simply
+fail verification.
+
 **Common flags.** Unless a run explicitly needs the default output set, scans use
 this flag set, referred to below as **COMMON**:
 
@@ -138,7 +150,40 @@ built at `:159` via `ahocorasick.NewTrieBuilder().AddStrings(keywords).Build()`)
 and the engine only dispatches a chunk to detectors whose keywords match
 (`pkg/engine/engine.go:795` `matchingDetectors := e.AhoCorasickCore.FindDetectorMatches(decoded.Chunk.Data)`).
 
-**(b) Exact regex matching.** If the prefilter passes, two regexes must match.
+**Normalization before the regexes.** Once the prefilter dispatches the chunk to
+the AWS detector, the very first thing `FromData` does — *before* `idPat`/`SecretPat`
+are applied — is URL-decode the chunk text, so a credential whose base64 `+` / `/`
+/ `=` characters were percent-encoded (for example because it was copied out of a
+URL or a URL-encoded config value) is still normalized into the exact bytes the
+regexes expect:
+
+```go
+// pkg/detectors/aws/access_keys/accesskey.go:108
+dataStr = aws.UrlEncodedReplacer.Replace(dataStr)
+```
+
+`UrlEncodedReplacer` is a `strings.Replacer` (`pkg/detectors/aws/utils.go:35`) that
+rewrites `%2B`/`%2b` → `+`, `%2F`/`%2f` → `/`, and `%3d`/`%3D` → `=`:
+
+```go
+// pkg/detectors/aws/utils.go:35
+var UrlEncodedReplacer = strings.NewReplacer(
+	"%2B", "+",
+	"%2b", "+",
+	"%2F", "/",
+	"%2f", "/",
+	"%3d", "=",
+	"%3D", "=",
+)
+```
+
+This is one concrete way "the same credential" can be **reported differently** or
+**missed** between files: a percent-encoded secret is normalized into a match here,
+while any other transform the replacer does not cover (see Q2's "no decoder"
+boundary) is left untouched and never reaches the regexes.
+
+**(b) Exact regex matching.** If the prefilter passes, two regexes must match
+(against the URL-normalized `dataStr` above).
 The access-key ID must match `idPat`:
 
 ```go
@@ -219,14 +264,14 @@ Line: 2
 …and the metrics line reports one finding:
 
 ```
-finished scanning	{"chunks": 1, "bytes": 116, "verified_secrets": 0, "unverified_secrets": 1, ...}
+2026-07-01T23:06:24Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 116, "verified_secrets": 0, "unverified_secrets": 1, "scan_duration": "5.008048ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
 ```
 
 **MISSED** — same command against the `BKIA…` file. There is **no `Found` line at
 all**, and the metrics report zero findings:
 
 ```
-finished scanning	{"chunks": 1, "bytes": 116, "verified_secrets": 0, "unverified_secrets": 0, ...}
+2026-07-01T23:06:26Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 116, "verified_secrets": 0, "unverified_secrets": 0, "scan_duration": "4.610619ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
 ```
 
 **Why.** The ID begins with `B`, so none of the keywords `AKIA`/`ABIA`/`ACCA`
@@ -259,18 +304,26 @@ func StringShannonEntropy(input string) float64 {
 ```
 
 Running the detected file **three times** yields byte-identical results — only the
-volatile `scan_duration` differs:
+volatile timestamp and `scan_duration` differ (every `Raw result`,
+`unverified_secrets` count, and `verification_caching` block is identical):
 
 ```bash
-for i in 1 2 3; do /tmp/trufflehog filesystem /tmp/th_probe/q1_detected.txt \
+for i in 1 2 3; do echo "--- run $i ---"; /tmp/trufflehog filesystem /tmp/th_probe/q1_detected.txt \
   --no-verification --no-update --no-color \
-  --results=verified,unverified,unknown,filtered_unverified; done
+  --results=verified,unverified,unknown,filtered_unverified 2>&1 \
+  | grep -E "Raw result|finished scanning"; done
 ```
 
 ```
-run 1: Raw result: AKIAZ7Q3RB5XW2YT9NKD | "unverified_secrets": 1 | "scan_duration": "4.016036ms"
-run 2: Raw result: AKIAZ7Q3RB5XW2YT9NKD | "unverified_secrets": 1 | "scan_duration": "4.795982ms"
-run 3: Raw result: AKIAZ7Q3RB5XW2YT9NKD | "unverified_secrets": 1 | "scan_duration": "4.617247ms"
+--- run 1 ---
+Raw result: AKIAZ7Q3RB5XW2YT9NKD
+2026-07-01T23:06:53Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 116, "verified_secrets": 0, "unverified_secrets": 1, "scan_duration": "5.646301ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
+--- run 2 ---
+Raw result: AKIAZ7Q3RB5XW2YT9NKD
+2026-07-01T23:06:55Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 116, "verified_secrets": 0, "unverified_secrets": 1, "scan_duration": "5.677163ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
+--- run 3 ---
+Raw result: AKIAZ7Q3RB5XW2YT9NKD
+2026-07-01T23:06:56Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 116, "verified_secrets": 0, "unverified_secrets": 1, "scan_duration": "5.036823ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
 ```
 
 That is exactly the "same file always produces the same result" behavior observed:
@@ -358,33 +411,52 @@ Each probe encodes the **same** AWS key from Q1. Every one surfaces the identica
 
 ```
 $ /tmp/trufflehog filesystem /tmp/th_probe/q2_plain_reference.txt --no-verification --no-update --no-color --results=verified,unverified,unknown,filtered_unverified
+Found unverified result 🐷🔑❓
 Detector Type: AWS
 Decoder Type: PLAIN
 Raw result: AKIAZ7Q3RB5XW2YT9NKD
-...
-finished scanning	{... "unverified_secrets": 1, ...}
+Resource_type: Access key
+File: /tmp/th_probe/q2_plain_reference.txt
+Line: 2
+
+2026-07-01T23:07:04Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 116, "verified_secrets": 0, "unverified_secrets": 1, "scan_duration": "5.404617ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
 ```
 
 **BASE64** (`q2_base64.txt` — the whole credentials blob base64-encoded):
 
 ```
 $ /tmp/trufflehog filesystem /tmp/th_probe/q2_base64.txt --no-verification --no-update --no-color --results=verified,unverified,unknown,filtered_unverified
+Found unverified result 🐷🔑❓
 Detector Type: AWS
 Decoder Type: BASE64
 Raw result: AKIAZ7Q3RB5XW2YT9NKD
-...
-finished scanning	{... "unverified_secrets": 1, ...}
+Resource_type: Access key
+File: /tmp/th_probe/q2_base64.txt
+Line: 2
+
+2026-07-01T23:07:06Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 117, "verified_secrets": 0, "unverified_secrets": 1, "scan_duration": "5.066281ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
 ```
+
+> **Reproducibility note.** `q2_base64.txt` is the base64 of the plaintext blob
+> encoded **without line wrapping** (Python's `base64.b64encode`, equivalent to
+> `base64 -w0`). Default GNU `base64` wraps at 76 columns; the inserted newline
+> (`0x0A`) would split the encoding across lines and prevent the Base64 decoder
+> from recovering the key — so the single-line, no-wrap form is what produced the
+> `Decoder Type: BASE64` result above.
 
 **UTF16** (`q2_utf16.txt` — see the layout nuance below):
 
 ```
 $ /tmp/trufflehog filesystem /tmp/th_probe/q2_utf16.txt --no-verification --no-update --no-color --results=verified,unverified,unknown,filtered_unverified
+Found unverified result 🐷🔑❓
 Detector Type: AWS
 Decoder Type: UTF16
 Raw result: AKIAZ7Q3RB5XW2YT9NKD
-...
-finished scanning	{... "unverified_secrets": 1, ...}
+Resource_type: Access key
+File: /tmp/th_probe/q2_utf16.txt
+Line: 1
+
+2026-07-01T23:07:07Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 105, "verified_secrets": 0, "unverified_secrets": 1, "scan_duration": "5.635018ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
 ```
 
 **ESCAPED_UNICODE** (`q2_escaped_unicode.txt` — the ID and secret written as
@@ -392,11 +464,15 @@ finished scanning	{... "unverified_secrets": 1, ...}
 
 ```
 $ /tmp/trufflehog filesystem /tmp/th_probe/q2_escaped_unicode.txt --no-verification --no-update --no-color --results=verified,unverified,unknown,filtered_unverified
+Found unverified result 🐷🔑❓
 Detector Type: AWS
 Decoder Type: ESCAPED_UNICODE
 Raw result: AKIAZ7Q3RB5XW2YT9NKD
-...
-finished scanning	{... "unverified_secrets": 1, ...}
+Resource_type: Access key
+File: /tmp/th_probe/q2_escaped_unicode.txt
+Line: 1
+
+2026-07-01T23:07:12Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 406, "verified_secrets": 0, "unverified_secrets": 1, "scan_duration": "5.375624ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
 ```
 
 **Conclusion:** base64, UTF-16, and `\u`-escaped encodings do **not** protect the
@@ -422,7 +498,7 @@ INI file encoded as UTF-16LE was therefore **missed**:
 
 ```
 $ /tmp/trufflehog filesystem /tmp/th_probe/q2_utf16_multiline.txt --no-verification --no-update --no-color --results=verified,unverified,unknown,filtered_unverified
-finished scanning	{... "unverified_secrets": 0, ...}
+2026-07-01T23:07:09Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 113, "verified_secrets": 0, "unverified_secrets": 0, "scan_duration": "5.150725ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
 ```
 
 After newline-stripping, the access-key ID ran directly into the next token
@@ -439,7 +515,7 @@ order mark (`0xFF 0xFE`) to the exact content that succeeded above causes a
 
 ```
 $ /tmp/trufflehog filesystem /tmp/th_probe/q2_utf16_bom.txt --no-verification --no-update --no-color --results=verified,unverified,unknown,filtered_unverified
-finished scanning	{... "unverified_secrets": 0, ...}
+2026-07-01T23:07:11Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 432, "verified_secrets": 0, "unverified_secrets": 0, "scan_duration": "4.288721ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
 ```
 
 The reason is ordering plus a shared buffer. `UTF8` runs **first**
@@ -567,7 +643,7 @@ findings**:
 
 ```
 $ /tmp/trufflehog filesystem /tmp/th_probe/q3_example.txt --no-verification --no-update --no-color
-finished scanning	{... "unverified_secrets": 0, ...}
+2026-07-01T23:08:09Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 116, "verified_secrets": 0, "unverified_secrets": 0, "scan_duration": "5.044584ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
 ```
 
 The lowercased ID `akiaiosfodnn7example` **contains** `"example"`, which is in
@@ -580,9 +656,14 @@ removes it.
 ```
 $ /tmp/trufflehog filesystem /tmp/th_probe/q3_example.txt --no-verification --no-update --no-color --results=verified,unverified,unknown,filtered_unverified
 Found unverified result 🐷🔑❓
+Detector Type: AWS
+Decoder Type: PLAIN
 Raw result: AKIAIOSFODNN7EXAMPLE
-...
-finished scanning	{... "unverified_secrets": 1, ...}
+Resource_type: Access key
+File: /tmp/th_probe/q3_example.txt
+Line: 2
+
+2026-07-01T23:08:11Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 116, "verified_secrets": 0, "unverified_secrets": 1, "scan_duration": "4.873012ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
 ```
 
 The reason this works is a specific side effect: requesting `filtered_unverified`
@@ -612,7 +693,7 @@ With the **DEFAULT** result set it is **filtered**:
 
 ```
 $ /tmp/trufflehog filesystem /tmp/th_probe/q3_wordlist.txt --no-verification --no-update --no-color
-finished scanning	{... "unverified_secrets": 0, ...}
+2026-07-01T23:08:13Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 116, "verified_secrets": 0, "unverified_secrets": 0, "scan_duration": "4.066672ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
 ```
 
 and with **COMMON** (`filtered_unverified`) it reappears — again proving it passed
@@ -621,9 +702,14 @@ every detection gate:
 ```
 $ /tmp/trufflehog filesystem /tmp/th_probe/q3_wordlist.txt --no-verification --no-update --no-color --results=verified,unverified,unknown,filtered_unverified
 Found unverified result 🐷🔑❓
+Detector Type: AWS
+Decoder Type: PLAIN
 Raw result: AKIACONFIG1234567890
-...
-finished scanning	{... "unverified_secrets": 1, ...}
+Resource_type: Access key
+File: /tmp/th_probe/q3_wordlist.txt
+Line: 2
+
+2026-07-01T23:08:15Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 116, "verified_secrets": 0, "unverified_secrets": 1, "scan_duration": "4.770598ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
 ```
 
 Here the removal comes from the embedded wordlist path
@@ -646,13 +732,54 @@ This key is the fully-valid, high-entropy Q1 key. Yet even with **COMMON**
 
 ```
 $ /tmp/trufflehog filesystem /tmp/th_probe/q3_ignore.txt --no-verification --no-update --no-color --results=verified,unverified,unknown,filtered_unverified
-finished scanning	{... "unverified_secrets": 0, ...}
+2026-07-01T23:08:16Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 156, "verified_secrets": 0, "unverified_secrets": 0, "scan_duration": "5.433875ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
 ```
 
 `trufflehog:ignore` suppresses the secret on its line. Note the contrast with
 Demonstrations 1 and 2: `filtered_unverified` brings back false-positive-filtered
 results, but it does **not** bring back a `trufflehog:ignore`-suppressed result —
 these are different mechanisms.
+
+**Where this lives in source.** The ignore tag is a single constant:
+
+```go
+// pkg/engine/engine.go:547
+const ignoreTag = "trufflehog:ignore"
+```
+
+When the engine computes a result's line number in `FragmentLineOffset`, it checks
+whether the text on that same line contains `ignoreTag`, and if so returns
+`true` in its second return value (meaning "ignore this result"):
+
+```go
+// pkg/engine/engine.go:1262
+// If the line contains the ignore tag, we should ignore the result.
+endLine := bytes.Index(after, []byte("\n"))
+if endLine == -1 {
+	endLine = len(after)
+}
+// pkg/engine/engine.go:1267
+if bytes.Contains(after[:endLine], []byte(ignoreTag)) {
+	return lineNumber, true
+}
+```
+
+That `true` becomes `ignoreLinePresent` back in the detection path, which triggers
+an **early return** that drops the result **before it is ever reported** — which is
+why `filtered_unverified` cannot bring it back (the result never enters the result
+set in the first place):
+
+```go
+// pkg/engine/engine.go:1173
+if ignoreLinePresent {
+	return
+}
+```
+
+This is a genuinely different mechanism from false-positive filtering: false
+positives are produced and then removed (and `retainFalsePositives` can keep them),
+whereas a `trufflehog:ignore` result is discarded at the source before filtering
+runs at all.
 
 ### The always-on AWS entropy gate is *not* the same as the opt-in filter
 
@@ -722,6 +849,27 @@ if len(matchingDetectors) > 1 && !e.verificationOverlap {
 	...
 }
 ```
+
+The guard reads the engine's internal `verificationOverlap` field
+(`pkg/engine/engine.go:180`), which is populated from the public config field:
+
+```go
+// pkg/engine/engine.go:139
+// VerificationOverlap determines whether the scanner will attempt to verify candidate secrets
+// that have been detected by multiple detectors.
+// By default, it is set to true.
+VerificationOverlap bool
+```
+
+Reported exactly as observed: although that comment says *"By default, it is set to
+true,"* the CLI wires this field **directly from the `--allow-verification-overlap`
+flag** (`main.go:528` `VerificationOverlap:      *allowVerificationOverlap`), and
+that flag is a plain `Bool()` that defaults to `false` (`main.go:65`). So when the
+CLI is run **without** the flag, `e.verificationOverlap` is `false`,
+`!e.verificationOverlap` is `true`, and the overlap guard **fires by default** —
+which is exactly the Q4-A behavior observed below. Passing
+`--allow-verification-overlap` sets the field to `true` and disables the guard
+(Q4-B).
 
 Inside the overlap path, results from different detectors are compared with a
 Levenshtein similarity check:
@@ -799,6 +947,7 @@ Decoder Type: PLAIN
 Raw result: PMAK-qnwfsLyRSyfCwfpHaQP1UzDhrgpWvHjbYzjpRCMshjt417zWcrzyHUArs7r
 File: /tmp/th_probe/q4_secret.txt
 Line: 1
+
 Found unverified result 🐷🔑❓
 Detector Type: CustomRegex
 Decoder Type: PLAIN
@@ -808,14 +957,23 @@ File: /tmp/th_probe/q4_secret.txt
 Line: 1
 ```
 
-**Both** findings are reported — the guard suppresses verification, not the
-finding:
+**Both** findings are reported (`"unverified_secrets": 2`) — the guard
+suppresses *verification*, not the *finding*. The metrics line from this run:
 
 ```
-finished scanning	{... "unverified_secrets": 2, ... "VerificationTimeSpentMS":0}
+2026-07-01T23:08:39Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 83, "verified_secrets": 0, "unverified_secrets": 2, "scan_duration": "5.459454ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":1,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
 ```
 
-`VerificationTimeSpentMS:0` confirms no verification was performed.
+The stable, reproducible evidence that the overlap guard fired is the
+`Verification issue:` warning line itself (grepped below), not the
+`VerificationTimeSpentMS` value. That timer is **volatile** in the no-override
+case: across five repeats of this exact command it was observed as
+`0, 157, 0, 0, 138` — a low, non-deterministic value rather than a fixed `0`, so
+it must **not** be relied on as proof. (The exact cause of the small non-zero
+readings is not established here from the source; only the observed volatility is
+reported.) A more stable signal in the metrics is `verification_caching` `"Misses"`,
+which was `1` here with the guard active versus `2` with the override (one
+fewer verification attempt because the overlapping result is not verified).
 
 **Q4-B — with `--allow-verification-overlap`.** Adding the override (and leaving
 verification enabled) removes the warning:
@@ -826,27 +984,70 @@ $ /tmp/trufflehog filesystem /tmp/th_probe/q4_secret.txt \
     --allow-verification-overlap \
     --no-update --no-color \
     --results=verified,unverified,unknown,filtered_unverified
+
+Found unverified result 🐷🔑❓
+Detector Type: CustomRegex
+Decoder Type: PLAIN
+Raw result: PMAK-qnwfsLyRSyfCwfpHaQP1UzDhrgpWvHjbYzjpRCMshjt417zWcrzyHUArs7r
+Name: acme-internal-token
+File: /tmp/th_probe/q4_secret.txt
+Line: 1
+
+Found unverified result 🐷🔑❓
+Detector Type: Postman
+Decoder Type: PLAIN
+Raw result: PMAK-qnwfsLyRSyfCwfpHaQP1UzDhrgpWvHjbYzjpRCMshjt417zWcrzyHUArs7r
+File: /tmp/th_probe/q4_secret.txt
+Line: 1
+
+2026-07-01T23:08:41Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 83, "verified_secrets": 0, "unverified_secrets": 2, "scan_duration": "154.379292ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":2,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":150}}
 ```
 
-The clearest evidence is a `grep` of the two captured outputs for the warning
-line:
+With the override there is **no `Verification issue:` line**, and **both**
+findings are still printed. (Detector order between the two `Found` blocks is
+not guaranteed — here the CustomRegex result printed first and Postman second,
+the reverse of the no-override run above; only the presence/absence of the
+warning and the two findings is meaningful.)
+
+The clearest reproducible evidence is a `grep` of the two captured outputs for
+the warning line — present without the flag, absent with it:
 
 ```bash
-grep -c 'For your safety, verification has been disabled' q4_A.out   # -> 1
-grep -c 'For your safety, verification has been disabled' q4_B.out   # -> 0
+$ grep -c 'For your safety, verification has been disabled' q4_A.out
+$ grep -c 'For your safety, verification has been disabled' q4_B.out
 ```
 
-Both findings are still printed (`"unverified_secrets": 2`), and the
-verification-time counter goes from zero to non-zero, showing verification was
-actually attempted once the guard was lifted:
-
 ```
-A (no override):        "VerificationTimeSpentMS":0
-B (--allow-...-overlap): "VerificationTimeSpentMS":191
+1
+0
 ```
 
-(The exact value in B is volatile — it was `191` here — but the point is it is
-**non-zero**, whereas A is always `0`.)
+and both runs report two findings either way:
+
+```bash
+$ grep -c 'Found unverified result' q4_A.out
+$ grep -c 'Found unverified result' q4_B.out
+```
+
+```
+2
+2
+```
+
+The two metrics lines as captured (the `VerificationTimeSpentMS` and
+`scan_duration` values are volatile — see below):
+
+```
+A (no override):          2026-07-01T23:08:39Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 83, "verified_secrets": 0, "unverified_secrets": 2, "scan_duration": "5.459454ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":1,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
+B (--allow-...-overlap):  2026-07-01T23:08:41Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 83, "verified_secrets": 0, "unverified_secrets": 2, "scan_duration": "154.379292ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":2,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":150}}
+```
+
+The `VerificationTimeSpentMS` counter is **not** a reliable proof of "no
+verification": in the no-override case it is volatile (`0, 157, 0, 0, 138`
+across five runs) rather than a fixed `0`. What *is* stable is that the
+override run performs strictly more verification work — `verification_caching`
+`"Misses"` was `2` with the override versus `1` without it (the overlapping
+result is verified only once the guard is lifted).
 
 The override flag is defined at `main.go:65`:
 
@@ -860,7 +1061,7 @@ The overlap error is surfaced differently depending on the output printer:
 
 - **plain** — yellow `Verification issue:` line (`pkg/output/plain.go:57`), shown above.
 - **json** (`--json`) — a `VerificationError` field, emitted `omitempty` (`pkg/output/json.go:45`, populated at `:25`/`:67`).
-- **legacy JSON** (`--json-legacy`) — has **no** `VerificationError` field at all; the overlap error text is not present in this format.
+- **legacy JSON** (`--json-legacy`) — the `LegacyJSONOutput` struct (`pkg/output/legacy_json.go:229-238`) defines only `Branch`/`Commit`/`CommitHash`/`Date`/`Diff`/`Path`/`PrintDiff`/`Reason`/`StringsFound` and has **no** `VerificationError` field at all (a search of the whole file for `VerificationError` returns zero matches), so the overlap error text cannot appear in this format.
 - **github-actions** (`--github-actions`) — renders `verifiedStatus` (`pkg/output/github_actions.go:47`) and a message (`:68`/`:70`), but not the overlap error text.
 
 ### Why verification is disabled (rationale)
@@ -887,9 +1088,15 @@ verification.
 
 There are three concrete gates with sharp boundaries. Each probe below isolates
 **exactly one variable** so the observed difference is attributable to one gate.
-All Q5 probes use **COMMON** (which includes `filtered_unverified`, disabling the
-*global* false-positive and entropy filters), so only the **always-on AWS-internal
-gates** are in play.
+All Q5 probes use **COMMON**. Two properties of COMMON matter here, and they are
+**independent** mechanisms (not the same switch): (1) COMMON **omits**
+`--filter-entropy`, so the *global* entropy filter `FilterResultsWithEntropy`
+**never runs** — it is gated on `e.filterEntropy != 0` (`engine.go:1145-1146`); and
+(2) COMMON's `filtered_unverified` sets `retainFalsePositives`
+(`engine.go:317-318`), which skips the *false-positive* filter
+`FilterKnownFalsePositives` (`engine.go:1141`). Neither of those touches the AWS
+detector's own entropy check — so every Q5 miss below is produced by the
+**always-on AWS-internal gates**, not by any global/opt-in filter.
 
 ### Boundary 1 — the exact 40-character secret length (`SecretPat`)
 
@@ -904,14 +1111,19 @@ Two files differ only in the secret's length: 40 vs. 39 characters, same ID.
 ```
 $ /tmp/trufflehog filesystem /tmp/th_probe/q5_len40.txt --no-verification --no-update --no-color --results=verified,unverified,unknown,filtered_unverified
 Found unverified result 🐷🔑❓
+Detector Type: AWS
+Decoder Type: PLAIN
 Raw result: AKIAZ7Q3RB5XW2YT9NKD
-...
-finished scanning	{... "unverified_secrets": 1, ...}
+Resource_type: Access key
+File: /tmp/th_probe/q5_len40.txt
+Line: 2
+
+2026-07-01T23:10:13Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 116, "verified_secrets": 0, "unverified_secrets": 1, "scan_duration": "5.489386ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
 ```
 
 ```
 $ /tmp/trufflehog filesystem /tmp/th_probe/q5_len39.txt --no-verification --no-update --no-color --results=verified,unverified,unknown,filtered_unverified
-finished scanning	{... "unverified_secrets": 0, ...}
+2026-07-01T23:10:14Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 115, "verified_secrets": 0, "unverified_secrets": 0, "scan_duration": "6.232091ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
 ```
 
 The 39-character secret has **high** Shannon entropy (`5.1316`), so entropy is not
@@ -933,15 +1145,20 @@ ID, same length) sit on either side of the floor:
 
 ```
 $ /tmp/trufflehog filesystem /tmp/th_probe/q5_entropy_below.txt --no-verification --no-update --no-color --results=verified,unverified,unknown,filtered_unverified
-finished scanning	{... "unverified_secrets": 0, ...}
+2026-07-01T23:10:16Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 116, "verified_secrets": 0, "unverified_secrets": 0, "scan_duration": "4.775912ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
 ```
 
 ```
 $ /tmp/trufflehog filesystem /tmp/th_probe/q5_entropy_above.txt --no-verification --no-update --no-color --results=verified,unverified,unknown,filtered_unverified
 Found unverified result 🐷🔑❓
+Detector Type: AWS
+Decoder Type: PLAIN
 Raw result: AKIAZ7Q3RB5XW2YT9NKD
-...
-finished scanning	{... "unverified_secrets": 1, ...}
+Resource_type: Access key
+File: /tmp/th_probe/q5_entropy_above.txt
+Line: 2
+
+2026-07-01T23:10:18Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 116, "verified_secrets": 0, "unverified_secrets": 1, "scan_duration": "4.476476ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
 ```
 
 A difference of `0.0812` in entropy — `4.1964` vs. `4.2776`, straddling `4.25` —
@@ -959,7 +1176,7 @@ whose only defect is that the ID prefix is not `AKIA`/`ABIA`/`ACCA`:
 
 ```
 $ /tmp/trufflehog filesystem /tmp/th_probe/q1_missed_nokeyword.txt --no-verification --no-update --no-color --results=verified,unverified,unknown,filtered_unverified
-finished scanning	{... "unverified_secrets": 0, ...}
+2026-07-01T23:06:26Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 116, "verified_secrets": 0, "unverified_secrets": 0, "scan_duration": "4.610619ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
 ```
 
 No keyword → the AWS detector never runs → no regex or entropy check ever happens.
@@ -967,10 +1184,24 @@ This is the hardest boundary: it precedes every other gate.
 
 ### The key insight: always-on internal gate vs. opt-in global filter
 
-The entropy-below miss above is significant precisely because **COMMON includes
-`filtered_unverified`, which disables the global `FilterResultsWithEntropy`**
-(that global filter only runs when `--filter-entropy` is set — `engine.go:1145`).
-The secret was still missed. That proves the AWS entropy check is **unconditional
+The entropy-below miss above is significant precisely because the **global**
+entropy filter was **never running in the first place**. COMMON does not pass
+`--filter-entropy`, so `e.filterEntropy` is `0` and the guard `if e.filterEntropy != 0`
+is false — `FilterResultsWithEntropy` is skipped entirely:
+
+```go
+// pkg/engine/engine.go:1145
+if e.filterEntropy != 0 {
+	results = detectors.FilterResultsWithEntropy(ctx, results, e.filterEntropy, e.retainFalsePositives)
+}
+```
+
+(To be exact: it is the **absence of `--filter-entropy`** that keeps the global
+entropy filter off, **not** `filtered_unverified`. COMMON's `filtered_unverified`
+only sets `retainFalsePositives` (`engine.go:317-318`), which skips
+`FilterKnownFalsePositives` — the *false-positive* filter — and has no effect on
+the entropy filter.) The secret was still missed even with the global entropy
+filter switched off entirely. That proves the AWS entropy check is **unconditional
 inside `FromData`** (`accesskey.go:132`) — a *different* mechanism from the opt-in
 `--filter-entropy` global filter (`main.go:67`:
 `"Filter unverified results with Shannon entropy. Start with 3.0."`). This is the
@@ -1042,13 +1273,72 @@ result, retained for inspection (and, as shown in Q3, requesting it sets
 
 ## Coverage Pass
 
-Each named item from the five questions, confirmed present and answered:
+Each named item from the five questions, confirmed present and answered (with the
+governing source `file:line`). Every ✔ below corresponds to prose, a captured
+output block, or a cited literal actually contained in this document.
 
-- **Q1:** keyword prefilter ✔, `idPat` ✔, `SecretPat` ✔, `RequiredIdEntropy` `3.0` ✔, `RequiredSecretEntropy` `4.25` ✔, determinism explanation ✔, detected + missed output ✔
-- **Q2:** decoder chain order ✔, each of `PLAIN`/`BASE64`/`UTF16`/`ESCAPED_UNICODE` demonstrated ✔, "no decoder = slips through" ✔, `--max-decode-depth` addressed (absent at this revision; single-pass decoding) ✔, honest UTF-16 newline & BOM nuances ✔
-- **Q3:** `DefaultFalsePositives` (all 7 values) ✔, four wordlists (`fp_badlist.txt`, `fp_words.txt`, `fp_programmingbooks.txt`, `fp_uuids.txt`) ✔, `IsKnownFalsePositive` ✔, `FilterResultsWithEntropy` ✔, `trufflehog:ignore` ✔, AWS always-on entropy gate ✔, filtered vs. shown output ✔
-- **Q4:** exact `errOverlap` string (no space after `disabled.`) ✔, `likelyDuplicate` / Levenshtein threshold `0.9` ✔, yellow `Verification issue:` render ✔, `--allow-verification-overlap` override ✔, finding still reported ✔
-- **Q5:** `3.0` & `4.25` floors ✔, exact-40 length gate ✔, keyword hard gate ✔, at-boundary 39-vs-40 and entropy-below-vs-at output ✔, internal-vs-global entropy distinction ✔
+**Q1 — deterministic detected vs. missed AWS credentials:**
+
+- Aho-Corasick keyword prefilter requiring `AKIA`/`ABIA`/`ACCA` ✔ (`accesskey.go:70`, `ahocorasickcore.go:127`, `engine.go:795`)
+- `idPat` regex ✔ (`accesskey.go:65`)
+- `SecretPat` exact 40-char regex ✔ (`common.go:10`)
+- `RequiredIdEntropy = 3.0` ✔ (`common.go:6`)
+- `RequiredSecretEntropy = 4.25` ✔ (`common.go:7`)
+- Entropy enforcement lines ✔ (`accesskey.go:122`, `accesskey.go:132`)
+- **URL-decode normalization before the regexes** ✔ (`accesskey.go:108` `dataStr = aws.UrlEncodedReplacer.Replace(dataStr)`; replacer `utils.go:35`)
+- Determinism proof (3 identical runs) ✔
+- Detected + missed output, verbatim ✔
+
+**Q2 — encoding is not protection / decoder chain:**
+
+- Decoder chain order `[UTF8, Base64, UTF16, EscapedUnicode]` + UTF8-first comment ✔ (`decoders.go:8-14`)
+- `PLAIN` output, verbatim ✔
+- `BASE64` output, verbatim (+ no-wrap generation note) ✔
+- `UTF16` output, verbatim ✔
+- `ESCAPED_UNICODE` output, verbatim ✔
+- Unsupported / "no decoder = slips through" ✔
+- `--max-decode-depth` addressed (absent at this revision; single-pass decoding) ✔
+- Honest UTF-16 newline & BOM nuances (observed misses) ✔
+
+**Q3 — format-valid fixtures never flagged:**
+
+- `DefaultFalsePositives` — all 7 values ✔ (`falsepositives.go:17-18`)
+- Four embedded wordlists `fp_badlist.txt` / `fp_words.txt` / `fp_programmingbooks.txt` / `fp_uuids.txt` ✔ (`falsepositives.go:35/37/39/41`)
+- `IsKnownFalsePositive` ✔ (`falsepositives.go:85`)
+- `FilterKnownFalsePositives` default-on ✔ (`engine.go:1141`)
+- `FilterResultsWithEntropy` opt-in + `"Filtered out result with low entropy"` log line ✔ (`falsepositives.go:154/163`)
+- **`trufflehog:ignore` inline suppression, grounded in source** ✔ (`engine.go:547` `ignoreTag`, `engine.go:1262-1268` line detection, `engine.go:1173-1174` early return)
+- AWS always-on entropy gates distinct from global filter ✔
+- Filtered under DEFAULT vs. shown under `filtered_unverified`, verbatim ✔
+
+**Q4 — verification disabled for safety:**
+
+- Exact `errOverlap` string incl. the missing space after `disabled.` ✔ (`engine.go:39-42`)
+- ">1 detector matched the same result" trigger ✔
+- `likelyDuplicate` / Levenshtein `similarityThreshold = 0.9` ✔ (`engine.go:887`)
+- `verificationOverlapWorker` / `SetVerificationError` ✔ (`detectors.go:126`)
+- **`VerificationOverlap` config field** ✔ (`engine.go:139-142`; internal field `engine.go:180`; CLI wiring `main.go:65`/`main.go:528`)
+- Yellow `Verification issue:` render ✔ (`plain.go:57`)
+- `--allow-verification-overlap` override ✔
+- Warning **present without** the flag / **absent with** it — verbatim `grep -c` output (`1` / `0`) ✔
+- **Both findings still reported** either way — verbatim `grep -c` output (`2` / `2`) + full Q4-B output block ✔
+- Output-format honesty: JSON `VerificationError` field (`json.go`), **legacy JSON has no such field** (`legacy_json.go:229-238`, zero `VerificationError` matches), GitHub Actions (`github_actions.go`) ✔
+- External safety rationale, framed as external ✔
+
+**Q5 — thresholds and boundary behavior:**
+
+- `3.0` ID floor ✔ (`common.go:6`)
+- `4.25` secret floor ✔ (`common.go:7`)
+- Exact 40-character secret gate ✔ (`common.go:10`)
+- Keyword hard gate ✔ (`ahocorasickcore.go:127`)
+- At-boundary 39-vs-40 output, verbatim ✔
+- Entropy below (`4.1964`) vs. at/above (`4.2776`) the `4.25` floor, verbatim ✔
+- **Internal-vs-global entropy distinction, corrected** ✔ — the global `FilterResultsWithEntropy` is inactive because `--filter-entropy` is **omitted** (`e.filterEntropy == 0`, `engine.go:1145-1146`), **not** because of `filtered_unverified` (which only sets `retainFalsePositives`, `engine.go:317-318`); the AWS-internal entropy gate (`accesskey.go:132`) is always-on
+
+**Cross-cutting:** every AWS/Postman token shown is a crafted, non-live test value
+(see *Methodology → Safety*); every behavioral claim is paired with one verbatim
+captured output line and one exact source literal; no output block uses ellipses
+or placeholders.
 
 ---
 
