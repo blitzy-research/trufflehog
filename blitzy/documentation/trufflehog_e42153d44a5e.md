@@ -47,7 +47,7 @@ printf 'token: ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8\n' > /tmp/th_scan_demo3/
 ./trufflehog filesystem /tmp/th_scan_demo3 --no-verification --results=verified,unverified,unknown --log-level=5
 ```
 
-**Why these flags.** `--no-verification` provides the "safe dry-run" property described above (documented at `README.md:431` — `--no-verification     Don't verify the results.`). `--log-level=2` is the repository's own debug convention: the `Makefile` `dogfood` (`:14-15`) and `run-debug` (`:51-52`) targets both invoke the tool with `--log-level=2`, and `CONTRIBUTING.md:33` defines level `2` as "logs that are useful for debugging". `--log-level=5` is "ultimate verbosity" (`CONTRIBUTING.md:36`) and is used only in Run B to reveal the deeper `V(3)`/`V(4)/`V(5)` lines. The `log-level` flag itself is declared at `main.go:50` ("Logging verbosity on a scale of 0 (info) to 5 (trace).").
+**Why these flags.** `--no-verification` provides the "safe dry-run" property described above (documented at `README.md:431` — `--no-verification     Don't verify the results.`). `--log-level=2` is the repository's own debug convention: the `Makefile` `dogfood` (`:14-15`) and `run-debug` (`:51-52`) targets both invoke the tool with `--log-level=2`, and `CONTRIBUTING.md:33` defines level `2` as "logs that are useful for debugging". `--log-level=5` is "ultimate verbosity" (`CONTRIBUTING.md:36`) and is used only in Run B to reveal the deeper `V(3)`/`V(4)`/`V(5)` lines. The `log-level` flag itself is declared at `main.go:50` ("Logging verbosity on a scale of 0 (info) to 5 (trace).").
 
 > The tokens above are throwaway test values: `AKIAIOSFODNN7EXAMPLE` is AWS's *public documentation* example key, and the `ghp_…` string is syntactically valid but **fake / non-live**. No real credential appears in this document or the repository.
 
@@ -102,12 +102,27 @@ STDERR — ordered level-5 trace (verbatim key lines; the 128 identical `finishe
 2026-07-01T05:15:14Z	info-3	trufflehog	chunking unit	{"source_manager_worker_id": "aecqL", "unit_kind": "unit", "unit": "/tmp/th_scan_demo3/secrets.yaml"}
 2026-07-01T05:15:14Z	info-3	trufflehog	scanning file	{"source_manager_worker_id": "aecqL", "unit_kind": "unit", "unit": "/tmp/th_scan_demo3/secrets.yaml", "path": "/tmp/th_scan_demo3/secrets.yaml"}
 2026-07-01T05:15:14Z	info-5	trufflehog	dataErrChan closed, all chunks processed	{"source_manager_worker_id": "aecqL", "unit_kind": "unit", "unit": "/tmp/th_scan_demo3/secrets.yaml", "path": "/tmp/th_scan_demo3/secrets.yaml", "mime": "text/plain; charset=utf-8", "timeout": 60}
-2026-07-01T05:15:14Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "Jfkz8"}      # emitted EXACTLY 128×, one per scanner worker
+2026-07-01T05:15:14Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "Jfkz8"}
 2026-07-01T05:15:14Z	info-4	trufflehog	link is empty, skipping update	{"detector_worker_id": "5bkSP", "detector": {"type":"Github","version":2}, "timeout": 10}
 2026-07-01T05:15:14Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 48, "verified_secrets": 0, "unverified_secrets": 1, "scan_duration": "7.321475ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
 ```
 
-The fake GitHub token is extracted but, because `--no-verification` disables live checks, it is reported as an **unverified** finding → `"unverified_secrets": 1`. The `finished scanning chunks` line was emitted **exactly 128 times** (`grep -c 'finished scanning chunks'` = `128`) — one per scanner worker — directly confirming the scanner-pool size. A grep of Run B's stderr for `verifying`/`http request`/`dialing`/`api.github` returned **0**, empirically confirming the dry-run made no outbound verification calls.
+The fake GitHub token is extracted but, because `--no-verification` disables live checks, it is reported as an **unverified** finding → `"unverified_secrets": 1`.
+
+Two properties of this safe dry run are confirmed by re-grepping Run B's captured standard error (Run B was re-run with its stderr redirected to a file — `./trufflehog filesystem /tmp/th_scan_demo3 --no-verification --results=verified,unverified,unknown --log-level=5 2> runB.stderr`):
+
+```console
+$ grep -c 'finished scanning chunks' runB.stderr
+128
+$ grep -Eic 'verifying|http request|dialing|api.github' runB.stderr
+0
+$ grep -c 'No concurrency specified' runB.stderr
+0
+```
+
+- **`finished scanning chunks` was emitted exactly 128 times** — one per scanner worker. The line is logged at the tail of each scanner worker's loop (`pkg/engine/engine.go:840`), so the count `128` directly confirms the 128-worker scanner pool sized in section (b).
+- **Zero outbound-verification markers** (`verifying` / `http request` / `dialing` / `api.github`) appear, empirically confirming the dry run made no live verification calls. This matches the source: `--no-verification` sets `Verify` to `false` (`main.go:520`), and the engine's `shouldVerifyChunk` returns `false` whenever `!e.verify` (`pkg/engine/engine.go:843-850`) — detectors extract candidates but never verify them.
+- **The engine's concurrency-fallback log is absent** (`No concurrency specified` count `0`); section (b) explains why the CLI path never triggers that fallback.
 
 ---
 
@@ -169,7 +184,7 @@ Two banners are then emitted (both visible in Run A):
 
 **6. Optional YAML config file.** If `--config` is supplied, it is loaded via `pkg/config/config.go:18` `func Read(filename string)` → `pkg/config/config.go:27` `func NewYAML(input []byte)`, contributing `conf.Detectors` into the `append(...)` at `main.go:519`. Neither run used `--config`, so only the defaults were composed.
 
-**Grounded confirmation.** Every stderr line in Run A carries the `info-2` prefix (or `info-0` for the two `V(0)` lines), which is the runtime signature of `--log-level=2`. The verbosity mapping, the logger, and the config assembly are therefore observable directly in the output rather than inferred.
+**Grounded confirmation.** Every **logger-produced** stderr line in Run A carries the `info-2` prefix (or `info-0` for the two `V(0)` lines), which is the runtime signature of `--log-level=2`. (The emoji banner is the sole exception: it is written directly to stderr at `main.go:498`, not through the logger, so it carries no timestamp and no `info-N` prefix — see §(a).4.) The verbosity mapping, the logger, and the config assembly are therefore observable directly in the output rather than inferred.
 
 
 ---
@@ -195,7 +210,7 @@ info-4	trufflehog	engine initialized
 
 **1. Defaults — `setDefaults` (`engine.go:336`).** This is where the worker-pool sizing constants originate:
 
-- `engine.go:337-340` — if concurrency is unset, `e.concurrency = runtime.NumCPU()`. On this host that is **128** (see §0.1). The accompanying line `No concurrency specified, defaulting to max {"cpu": 128}` is emitted here.
+- `engine.go:337-341` — an engine-level **fallback**: *only if* `e.concurrency == 0` does the engine set `e.concurrency = runtime.NumCPU()` and log `No concurrency specified, defaulting to max` (the log call is at `engine.go:339`). **In the CLI path this branch is not taken.** The `--concurrency` flag already defaults to `runtime.NumCPU()` — `main.go:58` (`cli.Flag("concurrency", ...).Default(strconv.Itoa(runtime.NumCPU())).Int()`) — and that non-zero value is copied into `engine.Config.Concurrency` at `main.go:514`. So `e.concurrency` is already **128** (see §0.1) when `setDefaults` runs, the `if e.concurrency == 0` guard is false, and the `No concurrency specified…` line is **not** emitted. This is confirmed at runtime: `grep -c 'No concurrency specified'` returns `0` for both documented runs (see the evidence block in §0.3). The fallback exists only for programmatic callers of `NewEngine` that leave `Concurrency` at its zero value.
 - `engine.go:343-345` — `e.detectorWorkerMultiplier = 8`; the in-code comment (`engine.go:344`) explains it is "bound by net i/o so it's higher than other workers."
 - `engine.go:348-349` — `e.notificationWorkerMultiplier = 1`.
 - `engine.go:352-353` — `e.verificationOverlapWorkerMultiplier = 1`.
@@ -375,6 +390,7 @@ Run A used `--log-level=2`, so only `info-0` and `info-2` lines appear. Run B us
 | `scanning file {"path": "…secrets.yaml"}` | `info-3` | `filesystem.go:179` | (d) |
 | `dataErrChan closed, all chunks processed {"mime": "text/plain; charset=utf-8"}` | `info-5` | `handlers.go:413` | (d) |
 | `finished scanning chunks` (128×) | `info-4` | `engine.go:840` | (b)/(d) |
+| `link is empty, skipping update {"detector":{"type":"Github",…}}` | `info-4` | `engine.go:1334` | (d) |
 | `Found unverified result 🐷🔑❓` | *(STDOUT)* | `plain.go:55` (verified variant `:52`) | (d) |
 | `finished scanning {"chunks":1,"unverified_secrets":1,…}` | `info-0` | `main.go:566` (fields `:567-573`) | (d) |
 
