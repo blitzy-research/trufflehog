@@ -281,7 +281,7 @@ info-4	trufflehog	setting up aho-corasick core
 info-4	trufflehog	set up aho-corasick core
 ```
 
-**Reasoning (why an automaton).** Running every detector's regexes against every chunk would be prohibitively expensive. Instead the automaton is built once from the *keywords* of the full detector set (`Keywords()`), so at scan time a single cheap multi-string pass over a chunk finds which keywords are present and routes the chunk only to the detectors whose keywords appeared. This is the runtime meaning of the "setting up … / set up …" pair: the routing structure is being compiled *before* any data flows. This corresponds to the maintainer-described "Chunk to Detector Matching (Aho-Corasick)" stage in [`docs/process_flow.md`](../../docs/process_flow.md) (heading at `docs/process_flow.md:74`).
+**Reasoning (why an automaton).** Running every detector's regexes against every chunk would be prohibitively expensive. Instead the automaton is built once from the *keywords* of the full detector set (`Keywords()`), so at scan time a single cheap multi-string pass over a chunk finds which keywords are present and routes the chunk only to the detectors whose keywords appeared. This is the runtime meaning of the "setting up … / set up …" pair: the routing structure is being compiled *before* any data flows. This corresponds to the maintainer-described "Chunk to Detector Matching" stage in [`docs/process_flow.md`](../../docs/process_flow.md) (heading at `docs/process_flow.md:74`), whose "Keyword Matching" node is annotated *(Aho-Corsick)* at `docs/process_flow.md:81` — i.e. exactly this Aho-Corasick keyword prefilter.
 
 
 ---
@@ -351,7 +351,7 @@ Line: 1
 info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 48, "verified_secrets": 0, "unverified_secrets": 1, "scan_duration": "7.321475ms", "trufflehog_version": "dev", ...}
 ```
 
-**Reasoning (why channels + pools).** Decoupling the stages with buffered channels lets each stage run at its own pace: the single source goroutine can enumerate/chunk while 128 scanners prefilter and 1024 detectors do the (normally I/O-bound) matching, all without lock-step coordination. This is the runtime realization of the maintainer overview's four stages — *Source Decomposition → Chunk-to-Detector Matching → Secret Detection → Result Notification* ([`docs/process_flow.md`](../../docs/process_flow.md), headings at `:28/:74/:88/:126`) — and of the per-worker-type threading model in [`docs/concurrency.md`](../../docs/concurrency.md) (`## Concurrency`, `:3`).
+**Reasoning (why channels + pools).** Decoupling the stages with buffered channels lets each stage run at its own pace: the single source goroutine can enumerate/chunk while 128 scanners prefilter and 1024 detectors do the (normally I/O-bound) matching, all without lock-step coordination. This is the runtime realization of the maintainer overview's four stages — *Source Decomposition → Chunk to Detector Matching → Secret Detection → Result Notification* ([`docs/process_flow.md`](../../docs/process_flow.md), headings at `:28/:74/:88/:126`) — and of the per-worker-type threading model in [`docs/concurrency.md`](../../docs/concurrency.md) (`## Concurrency`, `:3`).
 
 ### Verbosity → prefix map (why Run A and Run B differ)
 
