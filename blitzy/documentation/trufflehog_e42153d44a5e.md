@@ -31,6 +31,8 @@ This conclusion is reported as the **true, measured result even though it contra
 
 **Bounded residual risk (honest caveat):** keyword‑dense content does cause a real, roughly **linear** slowdown by maximizing detector fan‑out. It is a throughput/cost concern, not a denial‑of‑service, and it is mitigable operationally (`--detector-timeout`, `--concurrency`; and, for the separate archive vector, `--archive-timeout` / `--archive-max-size` / `--archive-max-depth`).
 
+**Separate from pattern matching (disclosed in §9):** this ReDoS verdict is about the regex engine only. A complete security review must also account for known advisories in TruffleHog's dependencies; §9 discloses **eight published `go-git v5.13.2` advisories** (one **HIGH**, `CVE-2026-45022`) that affect the **Git-source scan path** — an adjacent, supply-chain concern that is **distinct from** regex complexity and does not change the R1–R5 verdict, disclosed with mitigation guidance.
+
 ---
 
 ## 2. Mechanism — why the observed behavior occurs
@@ -564,11 +566,92 @@ The question is specifically about **pattern‑matching** complexity. Two other 
 - **Archive / decompression bombs** — handled by the archive handler's depth/size/timeout limits (`--archive-timeout` `main.go:80`, `--archive-max-size` `main.go:78`, `--archive-max-depth` `main.go:79`), not by the regex engine.
 - **Pathological git‑history traversal** — a source‑enumeration cost, unrelated to regex complexity.
 
-Neither is a pattern‑matching ReDoS, and neither changes the verdict for the question asked.
+Neither is a pattern‑matching ReDoS, and neither changes the verdict for the question asked. A third adjacent class — **known published advisories in the `go-git` dependency** (`go.mod:50`, `v5.13.2`) — is a supply-chain/object-parsing risk rather than a regex one; it is disclosed and contextualized separately in **§9**.
 
 ---
 
-## 9. Coverage check (every requirement and named item addressed)
+## 9. Dependency advisory disclosure (adjacent, non-pattern-matching risk)
+
+**Why this section exists.** The R1–R5 verdict above concerns *pattern matching* and is unchanged: TruffleHog's detection engine is linear-time RE2 (`go-re2`) and is **not** ReDoS-exploitable. This section separately discloses known, published **security advisories in a TruffleHog dependency** — `github.com/go-git/go-git/v5 v5.13.2` (`go.mod:50`) — because (a) a complete security assessment must research and disclose known dependency advisories, and (b) these advisories are *adjacent* to the user's own threat model ("a malicious actor commits a specially crafted file to a repository we're scanning"): several are triggered by **crafted Git objects/repositories**, i.e. the same attacker-controlled-repository surface — although they are a supply-chain / object-parsing class of bug that is **distinct from** regex computational complexity. Consistent with this assessment's read-only scope, this is **disclosure and guidance only, not remediation**: no TruffleHog source and no dependency version is modified.
+
+**Pinned version (evidence).** `go.mod:50` → `github.com/go-git/go-git/v5 v5.13.2`. This version predates every fixed release listed below, so all of the advisories apply to it by semver.
+
+**Advisory research (first-hand, verbatim).** A live query of the OSV database for `go-git/v5@v5.13.2` returned **11 records = 8 distinct advisories** (three `GO-*` IDs are aliases of the GHSA entries): **1 HIGH, 5 MODERATE, 2 LOW**.
+
+```
+$ curl -s https://api.osv.dev/v1/query -d '{"package":{"name":"github.com/go-git/go-git/v5","ecosystem":"Go"},"version":"v5.13.2"}'
+github.com/go-git/go-git/v5 v5.13.2  OSV_records=11  distinct_advisories=8  (HIGH=1 MODERATE=5 LOW=2)
+  GHSA-389r-gv7p-r3rp  CVE-2026-45022                 HIGH      fixed 5.19.0  improper parsing of specially crafted objects -> inconsistent interpretation vs upstream Git
+  GHSA-37cx-329c-33x3  CVE-2026-25934 / GO-2026-4473  MODERATE  fixed 5.16.5  improper verification of data integrity values for .idx and .pack files
+  GHSA-3xc5-wrhm-f963  CVE-2026-41506                 MODERATE  fixed 5.18.0  credential leak via cross-host redirect in smart HTTP transport
+  GHSA-crhj-59gh-8x96  CVE-2026-45571                 MODERATE  fixed 5.19.1  crafted repositories may modify main and submodule .git directories
+  GHSA-jhf3-xxhw-2wpp  CVE-2026-34165 / GO-2026-4910  MODERATE  fixed 5.17.1  maliciously crafted idx file can cause asymmetric memory consumption
+  GHSA-w5pp-99ch-qj29  (no CVE assigned)              MODERATE  fixed 5.19.1  malformed Git object data may cause panics or resource exhaustion
+  GHSA-gm2x-2g9h-ccm8  CVE-2026-33762 / GO-2026-4909  LOW       fixed 5.17.1  missing validation decoding Index v4 files leads to panic
+  GHSA-m7cr-m3pv-hgrp  CVE-2026-45570                 LOW       fixed 5.19.1  improper single-quote escaping in go-git SSH transport
+```
+
+The single **HIGH** advisory, verbatim from OSV:
+
+```
+id=GHSA-389r-gv7p-r3rp aliases=CVE-2026-45022 severity=HIGH
+summary=go-git's improper parsing of specially crafted objects may lead to inconsistent interpretation compared to upstream Git
+```
+
+Structured disclosure of all eight (severity from OSV `database_specific.severity`; "Fixed in" is the earliest 5.x release that resolves each; "Class" is my categorization to separate these from regex/ReDoS):
+
+| Advisory (GHSA) | CVE / Go ID | Severity | Fixed in (5.x) | Class | Summary |
+|---|---|---|---|---|---|
+| `GHSA-389r-gv7p-r3rp` | `CVE-2026-45022` | **HIGH** | `v5.19.0` | Object parsing | Improper parsing of specially crafted objects → inconsistent interpretation vs. upstream Git |
+| `GHSA-37cx-329c-33x3` | `CVE-2026-25934` / `GO-2026-4473` | MODERATE | `v5.16.5` | Data integrity | Improper verification of data-integrity values for `.idx` and `.pack` files |
+| `GHSA-3xc5-wrhm-f963` | `CVE-2026-41506` | MODERATE | `v5.18.0` | Transport (cred leak) | Credential leak via cross-host redirect in smart HTTP transport |
+| `GHSA-crhj-59gh-8x96` | `CVE-2026-45571` | MODERATE | `v5.19.1` | Filesystem / path | Crafted repositories may modify main and submodule `.git` directories |
+| `GHSA-jhf3-xxhw-2wpp` | `CVE-2026-34165` / `GO-2026-4910` | MODERATE | `v5.17.1` | Resource (memory) | Maliciously crafted `idx` file → asymmetric memory consumption |
+| `GHSA-w5pp-99ch-qj29` | *(no CVE assigned)* | MODERATE | `v5.19.1` | Resource / panic | Malformed Git object data may cause panics or resource exhaustion |
+| `GHSA-gm2x-2g9h-ccm8` | `CVE-2026-33762` / `GO-2026-4909` | LOW | `v5.17.1` | Panic (DoS) | Missing validation decoding Index v4 files → panic |
+| `GHSA-m7cr-m3pv-hgrp` | `CVE-2026-45570` | LOW | `v5.19.1` | Transport | Improper single-quote escaping in go-git SSH transport |
+
+**Reachability (first-hand `govulncheck`).** Go's official vulnerability scanner, run read-only against the module (so `go.mod`/`go.sum` are never rewritten), confirms these are not merely "present in `go.mod`" but are **reachable from TruffleHog's Git-scanning code**:
+
+```
+$ GOFLAGS=-mod=readonly govulncheck ./...
+Vulnerability #16: GO-2026-4910
+    Maliciously crafted idx file can cause asymmetric memory consumption in
+    github.com/go-git/go-git
+  More info: https://pkg.go.dev/vuln/GO-2026-4910
+  Module: github.com/go-git/go-git/v5
+    Found in: github.com/go-git/go-git/v5@v5.13.2
+    Fixed in: github.com/go-git/go-git/v5@v5.17.1
+    Example traces found:
+      #1: pkg/output/legacy_json.go:200:40: output.GenerateDiff calls object.File.Contents, which eventually calls binary.ReadHash
+      #2: pkg/sources/git/git.go:1074:39: git.TryAdditionalBaseRefs calls git.Repository.ResolveRevision, which eventually calls binary.ReadUint32
+...
+Your code is affected by 49 vulnerabilities from 8 modules and the Go standard library.
+```
+
+`govulncheck`'s symbol-reachability analysis (which uses the Go vulnerability database) flags **three** of the go-git advisories as actually *called* — `GO-2026-4910`, `GO-2026-4909`, and `GO-2026-4473` — through Git-source entry points such as `pkg/sources/git/git.go:355` (`RepoFromPath` → `PlainOpenWithOptions`), `pkg/sources/git/git.go:1074` (`ResolveRevision`), and `pkg/sources/git/git.go:1216` (`Remotes`). **Coverage nuance (stated precisely):** OSV — a module-version database — enumerates all **8** advisories including the HIGH `CVE-2026-45022`; `govulncheck` only assesses the subset that currently has `GO-*` *symbol* entries in the Go vuln DB, so the HIGH advisory's absence from the `govulncheck` call-graph reflects **Go-DB entry timing, not non-applicability** — by semver `v5.13.2 < 5.19.0`, so it applies. (The broader `govulncheck` run reports 49 total findings across 8 modules + the standard library; the non-go-git ones are transitive/stdlib and outside this pattern-matching assessment, noted only for completeness.)
+
+**Applicability to TruffleHog.** `go-git` sits on the **Git-source scan path**, not the filesystem-regex path measured in R1–R5:
+
+- `pkg/sources/git/git.go:19` → `"github.com/go-git/go-git/v5"` (direct import of the vulnerable module).
+- Exposed via the `git` subcommand: `main.go:93` → `gitScan = cli.Command("git", "Find credentials in git repositories.")`.
+- Also imported by `pkg/sources/github/*` and `pkg/sources/gitlab/gitlab.go` (14 importers under `pkg/`).
+
+So these advisories are relevant whenever TruffleHog **clones/opens/parses a repository** — a code path distinct from the `filesystem` regex scanning that the ReDoS analysis (R1–R5) exercised.
+
+**How this differs from the ReDoS question (do not conflate).** These are `go-git` object-parsing, data-integrity, and transport defects — a supply-chain / dependency class. They are **not** regex-engine behavior: the detection engine is `go-re2`/RE2 (§2.1) and remains linear-time and non-exploitable (R1–R5). Two of them do involve attacker-crafted repository content — `GHSA-389r-gv7p-r3rp`/`CVE-2026-45022` ("improper parsing of specially crafted objects") and `GHSA-w5pp-99ch-qj29` ("malformed Git object data may cause panics or resource exhaustion") — which is precisely why they warrant disclosure alongside the crafted-file threat model; but the mechanism is **Git object parsing**, not catastrophic backtracking, so they do not alter the R1–R5 verdict.
+
+**Mitigation guidance.**
+
+- **Preferred (out of scope for this read-only assessment):** upgrade the dependency — `github.com/go-git/go-git/v5` **≥ `v5.19.1`** clears all 8 advisories in the 5.x line (the HIGH `CVE-2026-45022` is fixed in **`v5.19.0`**; the latest 5.x fixes land in **`v5.19.1`**). Per the user directive ("Don't modify the TruffleHog source") this assessment does **not** edit `go.mod`; the upgrade is recorded as a recommendation for the maintainers/adopter, not applied here.
+- **Interim operational isolation (within the adopter's control):** run repository scans in **sandboxed, ephemeral CI runners** with CPU/memory/wall-time limits and least privilege, and treat every scanned repository as **untrusted input** (these advisories are triggered by crafted `.idx`/`.pack`/object/Index-v4 data and crafted remotes, not by benign content).
+- **Ongoing hygiene:** run `govulncheck ./...` (and equivalent dependency scanning) in CI so newly published advisories against pinned dependencies are surfaced continuously — it exits non-zero when reachable vulnerabilities are found.
+
+None of the above changes the R1–R5 verdict; they address an **adjacent, separately-bounded** dependency risk, consistent with the scope note in §8.4.
+
+---
+
+## 10. Coverage check (every requirement and named item addressed)
 
 - **R1** (hang/timeout): §3 — completes; 27.99 s (26 MiB) / 56.83 s (52 MiB); peak ~171 MB.
 - **R2** (complexity class): §4 — `go-re2` linear (10M chars/53.7 ms) vs. `regexp2` exponential (timeout at 26 chars); 50 KB bait 14.94823 ms.
@@ -576,6 +659,7 @@ Neither is a pattern‑matching ReDoS, and neither changes the verdict for the q
 - **R4** (magnitude vs. equal size): §6 — ~108.9× internal / ~14.8× wall, bounded, completes.
 - **R5** (timing + CPU profile): §7 — `runtime._ExternalCode` 35.43 %/42.19 %; `backtrack` = Go bounded one‑pass backtracker; memory bounded.
 - **Named mechanisms/items:** `go-re2` (§2.1), `wazero` (§2.2), `regexp2` (§5.3), RE2 (§2.1/§4), Aho‑Corasick pre‑filter (§2.3), `defaultOffsetRadius=512` (§2.4), `EntireChunkSpanCalculator` (§2.4), `mergeMatches` (§2.4), `ChunkSize`/`PeekSize`/`TotalChunkSize` (§2.5), `PrefixRegex` `{0,40}?` (§2.9), `DefaultResponseTimeout=10s` (§2.7), `detectionTimeout` (§2.7), `FindDetectorMatches` (§2.3), `context.WithTimeout`+`AfterFunc` (§2.7), `--profile`/`:18066` (§7), `net/http/pprof` (§7), `SetBlockProfileRate` (§7), `--detector-timeout` (§8.3), `--concurrency` (§8.3), `--archive-timeout` (§8.3/§8.4), `--archive-max-size`/`--archive-max-depth` (§8.3/§8.4), `filesystem` subcommand (`main.go:143-144`, §3/§8.1), sample detectors `aha` / `aws access_keys` / `jdbc` (§2.8), `runtime._ExternalCode` (§7), `regexp.(*Regexp).backtrack` (§7), `FindAllStringSubmatch` (§2.8/§7), `VmHWM` (§3/§7).
+- **Dependency advisory disclosure:** §9 — `go-git v5.13.2` (`go.mod:50`) has **8** published OSV advisories (**1 HIGH** `CVE-2026-45022`, 5 MODERATE, 2 LOW); reachable on the Git-source path per first-hand `govulncheck` (GO-2026-4910/4909/4473); adjacent supply-chain risk, distinct from regex/ReDoS; mitigation = upgrade `go-git` ≥ `v5.19.1` (out-of-scope here) or operational isolation.
 
 **Final verdict:** TruffleHog's regex‑based pattern matching is **not** vulnerable to computational‑complexity / catastrophic‑backtracking ReDoS. A committed file cannot hang or time out the scanner via pattern matching; the realistic worst case is a **bounded, completing** slowdown driven linearly by keyword density, mitigable with standard operational controls.
 
