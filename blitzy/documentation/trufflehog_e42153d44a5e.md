@@ -213,15 +213,15 @@ flowchart TD
       --> B["main() [main.go:L330]<br/>log.New(...) [L336]<br/>overseer skipped for dev [L360-L361]"]
     B --> C["run() [main.go:L381]<br/>version banner V(2) [L410]<br/>temp cleanup goroutine [L387]<br/>config.Read (optional) [L463]"]
     C --> D["runSingleScan() [main.go:L635]<br/>NewManager [L686] · NewEngine [L688]<br/>Start [L692] · ScanFileSystem [L786]"]
-    D --> E["NewEngine [engine.go:L226]<br/>setDefaults [L336]:<br/>DefaultDecoders [L358] · DefaultDetectors [L363]"]
-    E -->|"info-4 default engine options set [L373]"| F["initialize [engine.go:L489]<br/>512 LRU [L491] · channels [L515-L519]"]
+    D --> E["NewEngine [pkg/engine/engine.go:L226]<br/>setDefaults [L336]:<br/>DefaultDecoders [L358] · DefaultDetectors [L363]"]
+    E -->|"info-4 default engine options set [L373]"| F["initialize [pkg/engine/engine.go:L489]<br/>512 LRU [L491] · channels [L515-L519]"]
     F -->|"info-4 engine initialized [L521]"| G["setting up aho-corasick core [L529]<br/>NewAhoCorasickCore [L530]"]
-    G -->|"info-4 set up aho-corasick core [L531]"| H["Start [engine.go:L621] → startWorkers [L646]"]
+    G -->|"info-4 set up aho-corasick core [L531]"| H["Start [pkg/engine/engine.go:L621] → startWorkers [L646]"]
     H -->|"info-2 starting scanner workers count=128 [L663]"| I["scanner pool"]
     H -->|"info-2 starting detector workers count=1024 [L678]"| J["detector pool (8× base)"]
     H -->|"info-2 starting verificationOverlap workers count=128 [L693]"| K["overlap pool"]
     H -->|"info-2 starting notifier workers count=128 [L708]"| L["notifier pool"]
-    I --> M["SourceManager [source_manager.go]<br/>running [L363] → enumerating [L531]<br/>→ chunking [L557] → scanning file [filesystem.go:L179]"]
+    I --> M["SourceManager [pkg/sources/source_manager.go]<br/>running [L363] → enumerating [L531]<br/>→ chunking [L557] → scanning file [pkg/sources/filesystem/filesystem.go:L179]"]
     M -->|"info-0 finished scanning chunks=1 bytes=56 [main.go:L566]"| N["scan complete (exit 0)"]
 ```
 
@@ -584,15 +584,15 @@ The per‑chunk routing decision lives in `scannerWorker`
 which detectors match, then branches on the match count:
 
 ```go
-matchingDetectors := e.AhoCorasickCore.FindDetectorMatches(decoded.Chunk.Data)  // engine.go:L795
-if len(matchingDetectors) > 1 && !e.verificationOverlap {                        // engine.go:L796
+matchingDetectors := e.AhoCorasickCore.FindDetectorMatches(decoded.Chunk.Data)  // pkg/engine/engine.go:L795
+if len(matchingDetectors) > 1 && !e.verificationOverlap {                        // pkg/engine/engine.go:L796
     wgVerificationOverlap.Add(1)
-    e.verificationOverlapChunksChan <- verificationOverlapChunk{ ... }           // engine.go:L798-L803  → OVERLAP path
+    e.verificationOverlapChunksChan <- verificationOverlapChunk{ ... }           // pkg/engine/engine.go:L798-L803  → OVERLAP path
     continue
 }
-for _, detector := range matchingDetectors {                                     // engine.go:L807
+for _, detector := range matchingDetectors {                                     // pkg/engine/engine.go:L807
     ...
-    e.detectableChunksChan <- detectableChunk{ ... }                             // engine.go:L810      → DIRECT path
+    e.detectableChunksChan <- detectableChunk{ ... }                             // pkg/engine/engine.go:L810      → DIRECT path
 }
 ```
 
@@ -601,10 +601,10 @@ otherwise ⇒ detector directly.** The exact channel wiring, hop by hop:
 
 | Hop | Producer → Consumer | Channel | Source `file:line` | `docs/concurrency.md` |
 |-----|---------------------|---------|--------------------|-----------------------|
-| Direct | scanner → detector | `e.detectableChunksChan` | send `engine.go:L810` (loop `L807`); recv `engine.go:L1037` | `L29` |
-| Overlap (in) | scanner → verificationOverlap | `e.verificationOverlapChunksChan` | send `engine.go:L798-L803`; recv `engine.go:L924` (`verificationOverlapWorker`) | `L31` |
-| Overlap (out) | verificationOverlap → detector | `e.detectableChunksChan` | send `engine.go:L1014` (loop `L1011-L1019`); recv `engine.go:L1037` | `L34` |
-| Results | detector → notifier | `e.results` / `e.ResultsChan()` | write `engine.go:L1186`; `ResultsChan()` `engine.go:L748-L750`; recv `engine.go:L1190` (`notifierWorker` `L1189`) | `L37` |
+| Direct | scanner → detector | `e.detectableChunksChan` | send `pkg/engine/engine.go:L810` (loop `L807`); recv `pkg/engine/engine.go:L1037` | `L29` |
+| Overlap (in) | scanner → verificationOverlap | `e.verificationOverlapChunksChan` | send `pkg/engine/engine.go:L798-L803`; recv `pkg/engine/engine.go:L924` (`verificationOverlapWorker`) | `L31` |
+| Overlap (out) | verificationOverlap → detector | `e.detectableChunksChan` | send `pkg/engine/engine.go:L1014` (loop `L1011-L1019`); recv `pkg/engine/engine.go:L1037` | `L34` |
+| Results | detector → notifier | `e.results` / `e.ResultsChan()` | write `pkg/engine/engine.go:L1186`; `ResultsChan()` `pkg/engine/engine.go:L748-L750`; recv `pkg/engine/engine.go:L1190` (`notifierWorker` `L1189`) | `L37` |
 
 **Rationale (and the honest scope of this run's evidence).** When several detectors
 claim the same chunk (`len(matchingDetectors) > 1`), the scanner routes to
@@ -733,6 +733,47 @@ $ grep -c 'error cleaning temp artifacts' /tmp/th_capture.log
 ```
 This is why the 145‑line total (§1.8) carries **no** temp‑artifact noise.
 
+**Binary-basename caveat for the `145` count (reported exactly).** Before it scans
+`/tmp` for deletions, `CleanTempArtifacts` first looks for a *running* TruffleHog
+process, matching each process against `execName` — the **basename** of the running
+executable (`execName := filepath.Base(executablePath)` at
+`pkg/cleantemp/cleantemp.go:L52`, where `executablePath` comes from `os.Executable()`
+at `pkg/cleantemp/cleantemp.go:L48`; the comparison is `proc.Executable() == execName`
+at `pkg/cleantemp/cleantemp.go:L61`). If **no** running process matches, it logs a
+single `V(5)` line and returns early (`pkg/cleantemp/cleantemp.go:L66-L68`):
+```go
+ctx.Logger().V(5).Info("No trufflehog processes were found")
+```
+With the **exact documented binary `/tmp/trufflehog_bin`** (basename `trufflehog_bin`,
+14 chars — within Linux's 15‑character process‑name limit) the running process *is*
+matched, so this line is **not** emitted and the clean‑`/tmp` capture is **145** lines
+— confirmed here with its producing command:
+```bash
+$ grep -c 'No trufflehog processes were found' /tmp/th_capture.log
+0
+```
+A **longer/alternate binary basename**, however, can fail the match: Linux exposes a
+process's name truncated to 15 characters, so a basename like `trufflehog_bin_p15b`
+(19 chars) never equals its own truncated form, and **both** the startup
+(`main.go:L386-L388`) and deferred (`main.go:L694-L697`) `CleanTempArtifacts` calls log
+the `V(5)` line. Rebuilding under such a name and re‑running the *same* safe scan was
+observed to produce **147** lines (`= 145 + 2`) — reported exactly, with the producing
+commands:
+```bash
+$ CGO_ENABLED=0 go build -o /tmp/trufflehog_bin_p15b .
+$ /tmp/trufflehog_bin_p15b filesystem /tmp/th_probe_alt --log-level=5 --no-verification --no-update > /tmp/th_run_alt.log 2>&1
+$ wc -l < /tmp/th_run_alt.log
+147
+$ grep -c 'No trufflehog processes were found' /tmp/th_run_alt.log
+2
+```
+**Rationale.** The `145`‑line total quoted throughout this document is the value for
+the **exact documented command** (binary basename `trufflehog_bin`, 14 chars) on a
+clean `/tmp`; generalized to a different binary basename, these `V(5)`
+process‑detection lines are the run‑specific variance — so, like the random worker IDs
+and `scan_duration`, the exact line count should be read from your own logs rather than
+assumed.
+
 **Rationale and honest caveat (reported exactly).** When `/tmp` *does* contain
 leftover `trufflehog-*` files (e.g. after a prior run was killed before its own
 cleanup), each is deleted and logged at `V(4)`, so the total line count rises by one
@@ -778,14 +819,14 @@ Every named item, confirmed with where it is addressed:
 - [x] **`DefaultDecoders`** chain **UTF8 → Base64 → UTF16 → EscapedUnicode**
   (`pkg/decoders/decoders.go:L8`, `L11-L14`) — §4.2.
 - [x] **Aho‑Corasick** `NewAhoCorasickCore` (`pkg/engine/ahocorasick/ahocorasickcore.go:L141`;
-  bracketed by `engine.go:L529`/`L531`, call at `L530`) — §4.3.
+  bracketed by `pkg/engine/engine.go:L529`/`L531`, call at `L530`) — §4.3.
 - [x] **512‑entry LRU dedupe cache** (`pkg/engine/engine.go:L491`) — §3.2.
 - [x] **buffered channels** (`pkg/engine/engine.go:L515-L519`, sized off
   `defaultChannelBuffer` `L627`) — §5.2.
 - [x] **four worker pools** (scanner/detector/verificationOverlap/notifier at
-  `engine.go:L663`/`L678`/`L693`/`L708`) with observed counts **128/1024/128/128**
+  `pkg/engine/engine.go:L663`/`L678`/`L693`/`L708`) with observed counts **128/1024/128/128**
   and host `runtime.NumCPU()`=**128** (`nproc`=4) — §5.1.
-- [x] **source → unit → chunk** (`source_manager.go` `run` `L336`, `running source`
+- [x] **source → unit → chunk** (`pkg/sources/source_manager.go` `run` `L336`, `running source`
   `L363`, `enumerating source` `L531`, `chunking unit` `L557`) — §5.3.
 - [x] **`info-N` token meaning** (`pkg/log/log.go:L123`) + **V‑level convention**
   (`CONTRIBUTING.md:L30-L37`) — §1.6.
@@ -816,11 +857,14 @@ mkdir -p /tmp/th_probe
 printf 'hello world\nthis is a plain text sample with no secrets\n' > /tmp/th_probe/sample.txt
 /tmp/trufflehog_bin filesystem /tmp/th_probe --log-level=5 --no-verification --no-update > /tmp/th_capture.log 2>&1
 ```
-On a **clean `/tmp`** (no leftover `trufflehog-*` files) the capture is a
+On a **clean `/tmp`** (no leftover `trufflehog-*` files), running the **exact documented binary name
+`/tmp/trufflehog_bin`** (basename `trufflehog_bin`, 14 chars), the capture is a
 deterministic **145 lines** (§1.8; `wc -l < /tmp/th_capture.log` → `145`). Worker
 counts scale with `runtime.NumCPU()`; `bytes`, `scan_duration`, the `Deleted orphaned
 temp artifact` count (**0** here), and the random 5‑char worker IDs are run‑specific
-— **read them from your own logs**.
+— **read them from your own logs**. A **longer binary basename** adds two `V(5)`
+`No trufflehog processes were found` cleanup lines (**147** total; see §5.5), so the
+exact line count, too, should be read from your own logs.
 
 **Safety.** The target is secret‑free and local; `--no-verification` performs no
 external verification and no network egress; the `dev` build + `--no-update`
