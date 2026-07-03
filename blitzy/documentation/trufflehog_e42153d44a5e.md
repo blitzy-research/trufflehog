@@ -129,19 +129,36 @@ So `V(4)` **is** documented — as "extremely verbose logs or logs containing se
 
 ### Evidence: the init/pipeline lines are **absent at level 2** and **present at level 5**
 
-I ran `grep -c` over the captured logs from run #1 of each level. Cause → effect made concrete:
+I captured each run to a log under `/tmp` (redirecting stderr, `2> l<level>_run<N>.log`) and ran `grep -c` over run #1 of each level. **The exact commands and their raw output, verbatim:**
 
-```
-pattern                         level 2   level 5
-------------------------------  -------   -------
-default engine options set         0         1
-engine initialized                 0         1
-aho-corasick                       0         2      (two lines: "setting up" + "set up")
-chunking unit                      0         1
-scanning file                      0         1
+```console
+$ grep -c 'default engine options set' l2_run1.log l5_run1.log
+l2_run1.log:0
+l5_run1.log:1
+$ grep -c 'engine initialized' l2_run1.log l5_run1.log
+l2_run1.log:0
+l5_run1.log:1
+$ grep -c 'aho-corasick' l2_run1.log l5_run1.log
+l2_run1.log:0
+l5_run1.log:2
+$ grep -c 'chunking unit' l2_run1.log l5_run1.log
+l2_run1.log:0
+l5_run1.log:1
+$ grep -c 'scanning file' l2_run1.log l5_run1.log
+l2_run1.log:0
+l5_run1.log:1
 ```
 
-The whole level‑2 run is only **10 lines** of output; the level‑5 run is **145 lines**. The extra 135 lines are exactly the `V(3)`/`V(4)`/`V(5)` traffic that the negation mechanism gates out at level 2. This is the proof that (b) and (c) are answerable **only** from the trace run.
+Every initialization/pipeline pattern is `0` at level 2 and non-zero at level 5 (the `aho-corasick` pattern matches **2** lines — `setting up` + `set up`). The total output size confirms the same, verbatim:
+
+```console
+$ wc -l l2_run1.log l5_run1.log
+   10 l2_run1.log
+  145 l5_run1.log
+  155 total
+```
+
+The whole level-2 run is only **10 lines** of output; the level-5 run is **145 lines**. The extra **135 lines** are exactly the `V(3)`/`V(4)`/`V(5)` traffic that the negation mechanism gates out at level 2. This is the proof that (b) and (c) are answerable **only** from the trace run.
 
 ---
 
@@ -152,13 +169,13 @@ The observed emission **order** at `--log-level=5` narrates the startup causally
 
 ### (a) Configuration handling
 
-**Claim.** In the default run (no `--config`), the engine populates its own option defaults and selects the full default detector set, then logs that it is done. **Observed at `--log-level=5`:**
+**Claim.** In the default run (no `--config`), the CLI hands the engine the full default detector set and the engine then applies its remaining option defaults, logging when that is done. **Observed at `--log-level=5`:**
 
 ```
-2026-07-02T23:21:45Z	info-4	trufflehog	default engine options set
+2026-07-03T00:07:39Z	info-4	trufflehog	default engine options set
 ```
 
-**How/why (cause → effect).** This line is emitted at the end of `setDefaults` [pkg/engine/engine.go:373]. Inside `setDefaults`, because no detectors were supplied on the CLI, the guard `if len(e.detectors) == 0` is true and the engine assigns the **entire default detector set** — `e.detectors = defaults.DefaultDetectors()` [pkg/engine/engine.go:363], which is equivalent to the `--include-detectors="all"` default. The same function fixes the worker multipliers that later determine the pool sizes in (d): detector `8` [pkg/engine/engine.go:345], notification `1` [pkg/engine/engine.go:349], verificationOverlap `1` [pkg/engine/engine.go:353].
+**How/why (cause → effect).** The observed line is emitted at the very end of `setDefaults` [pkg/engine/engine.go:373]; it marks that the engine's option defaults have been applied. **What supplies the detectors is the CLI, not the `setDefaults` fallback** — a source-grounded point, since no single runtime line prints the detector set. `main.go` builds the engine config with `Detectors: append(defaults.DefaultDetectors(), conf.Detectors...)` [main.go:519], under the explicit in-code comment that the engine must always be configured with the list of default detectors and that the user filters are *only subtractive* [main.go:515-518]. `NewEngine` copies that slice straight into the engine — `detectors: cfg.Detectors` [pkg/engine/engine.go:232] (in the struct literal at [pkg/engine/engine.go:229-233]). Consequently, when `setDefaults` runs [pkg/engine/engine.go:336] `e.detectors` is **already non-empty**, so the fallback guard `if len(e.detectors) == 0` [pkg/engine/engine.go:362] is **false** and `e.detectors = defaults.DefaultDetectors()` [pkg/engine/engine.go:363] **does not execute in the normal CLI run** — that branch is a safety net for an engine built *without* detectors (an incomplete / non-CLI configuration). The default detector set is therefore the CLI-supplied "all" set (`--include-detectors` defaults to `"all"` [main.go:81], `--exclude-detectors` empty [main.go:82]), which the engine then filters **subtractively** during construction (`buildDetectorSets` [pkg/engine/engine.go:254-255] → `filterDetectors` [pkg/engine/engine.go:472]). The same `setDefaults` also fixes the worker multipliers that later determine the pool sizes in (d): detector `8` [pkg/engine/engine.go:345], notification `1` [pkg/engine/engine.go:349], verificationOverlap `1` [pkg/engine/engine.go:353].
 
 **A default that did *not* fire (reported because it is unexpected‑adjacent).** `setDefaults` also contains a `if e.concurrency == 0 { … "No concurrency specified, defaulting to max" … }` branch [pkg/engine/engine.go:337-341]. That log was **absent from all my runs** (it is not in the 145‑line level‑5 output) because the CLI already presets concurrency to `runtime.NumCPU()` via the flag default `.Default(strconv.Itoa(runtime.NumCPU()))` [main.go:58]; `e.concurrency` is therefore non‑zero and the branch is skipped. The base‑concurrency origin to cite is thus **main.go:58**, not the engine default.
 
@@ -169,7 +186,7 @@ The observed emission **order** at `--log-level=5` narrates the startup causally
 **Claim.** After options are set, the engine constructs its internal state — a bounded dedup cache and its inter‑stage channels — and logs that it is initialized. **Observed at `--log-level=5`:**
 
 ```
-2026-07-02T23:21:45Z	info-4	trufflehog	engine initialized
+2026-07-03T00:07:39Z	info-4	trufflehog	engine initialized
 ```
 
 **How/why (cause → effect).** The engine is created by `NewEngine` [pkg/engine/engine.go:226], wired from the CLI at `engine.NewEngine(ctx, &cfg)` [main.go:688]. `NewEngine` calls `initialize` [pkg/engine/engine.go:489], which:
@@ -185,8 +202,8 @@ Because this line logs at `V(4)`, it is one of the two subsystems invisible at `
 **Claim.** With detectors chosen (a) and the engine initialized (b), the engine builds the **Aho‑Corasick keyword prefilter** that maps chunk keywords to candidate detectors, bracketed by two log lines. **Observed at `--log-level=5`:**
 
 ```
-2026-07-02T23:21:45Z	info-4	trufflehog	setting up aho-corasick core
-2026-07-02T23:21:45Z	info-4	trufflehog	set up aho-corasick core
+2026-07-03T00:07:39Z	info-4	trufflehog	setting up aho-corasick core
+2026-07-03T00:07:39Z	info-4	trufflehog	set up aho-corasick core
 ```
 
 **How/why (cause → effect).** The two lines bracket the construction call: `setting up aho-corasick core` [pkg/engine/engine.go:529] → `e.AhoCorasickCore = ahocorasick.NewAhoCorasickCore(e.detectors, ahoCOptions...)` [pkg/engine/engine.go:530] → `set up aho-corasick core` [pkg/engine/engine.go:531]. Inside `NewAhoCorasickCore` [pkg/engine/ahocorasick/ahocorasickcore.go:141] the engine builds a **keyword → detector index**: it creates `keywordsToDetectors := make(map[string][]DetectorKey)` [pkg/engine/ahocorasick/ahocorasickcore.go:142], iterates every detector, and for each of the detector's `Keywords()` lower‑cases the keyword and appends the detector's key to the map [pkg/engine/ahocorasick/ahocorasickcore.go:145-151], finally building the trie prefilter from those keywords [pkg/engine/ahocorasick/ahocorasickcore.go:159]. The detector set fed in is exactly the default set from (a) — `DefaultDetectors()` [pkg/engine/defaults/defaults.go:1704]. Each detector satisfies the `Detector` interface [pkg/detectors/detectors.go:19], contributing `Keywords() []string` [pkg/detectors/detectors.go:24] for this prefilter and `FromData(ctx, verify, data)` [pkg/detectors/detectors.go:21] for later detection. At scan time the prefilter is queried by `FindDetectorMatches` [pkg/engine/ahocorasick/ahocorasickcore.go:241] to pick candidate detectors per chunk.
@@ -199,10 +216,10 @@ TruffleHog's runtime is a **four‑worker‑class concurrent pipeline** wired to
 **Claim 1 — four worker pools start, with host‑derived counts.** **Observed at `--log-level=2` (and 5); identical and stable across all four runs:**
 
 ```
-2026-07-02T23:21:42Z	info-2	trufflehog	starting scanner workers	{"count": 128}
-2026-07-02T23:21:42Z	info-2	trufflehog	starting detector workers	{"count": 1024}
-2026-07-02T23:21:42Z	info-2	trufflehog	starting verificationOverlap workers	{"count": 128}
-2026-07-02T23:21:42Z	info-2	trufflehog	starting notifier workers	{"count": 128}
+2026-07-03T00:07:39Z	info-2	trufflehog	starting scanner workers	{"count": 128}
+2026-07-03T00:07:39Z	info-2	trufflehog	starting detector workers	{"count": 1024}
+2026-07-03T00:07:39Z	info-2	trufflehog	starting verificationOverlap workers	{"count": 128}
+2026-07-03T00:07:39Z	info-2	trufflehog	starting notifier workers	{"count": 128}
 ```
 
 **How/why (cause → effect).** `startWorkers` [pkg/engine/engine.go:646] launches the four pools, each logging its size at `V(2)`:
@@ -217,26 +234,34 @@ So the derivation is **1× / 8× / 1× / 1×** of `e.concurrency`, and `e.concur
 **Claim 2 — the source is driven through enumerate → chunk.** **Observed** (`running source` and `enumerating source` at level 2+; `chunking unit` and `scanning file` only at level 5):
 
 ```
-2026-07-02T23:21:45Z	info-0	trufflehog	running source	{"source_manager_worker_id": "ObQqM", "with_units": true}
-2026-07-02T23:21:45Z	info-2	trufflehog	enumerating source	{"source_manager_worker_id": "ObQqM"}
-2026-07-02T23:21:45Z	info-3	trufflehog	chunking unit	{"source_manager_worker_id": "ObQqM", "unit_kind": "unit", "unit": "/tmp/th_min/sample.txt"}
-2026-07-02T23:21:45Z	info-3	trufflehog	scanning file	{"source_manager_worker_id": "ObQqM", "unit_kind": "unit", "unit": "/tmp/th_min/sample.txt", "path": "/tmp/th_min/sample.txt"}
+2026-07-03T00:07:39Z	info-0	trufflehog	running source	{"source_manager_worker_id": "I27x0", "with_units": true}
+2026-07-03T00:07:39Z	info-2	trufflehog	enumerating source	{"source_manager_worker_id": "I27x0"}
+2026-07-03T00:07:39Z	info-3	trufflehog	chunking unit	{"source_manager_worker_id": "I27x0", "unit_kind": "unit", "unit": "/tmp/th_min/sample.txt"}
+2026-07-03T00:07:39Z	info-3	trufflehog	scanning file	{"source_manager_worker_id": "I27x0", "unit_kind": "unit", "unit": "/tmp/th_min/sample.txt", "path": "/tmp/th_min/sample.txt"}
 ```
 
 **How/why (cause → effect).** The Source Manager runs the source with units (the filesystem source supports them) and logs `running source` with `"with_units": true` at `V(0)` [pkg/sources/source_manager.go:363]. It then logs `enumerating source` at `V(2)` [pkg/sources/source_manager.go:531] and, per unit, `chunking unit` at `V(3)` [pkg/sources/source_manager.go:557] — `V(3)`, so it is **absent at level 2** and present at level 5, consistent with §3. The `scanning file` line is emitted by the **filesystem source itself** at `V(3)` [pkg/sources/filesystem/filesystem.go:179]. The filesystem `Source` implements `sources.SourceUnitEnumChunker` [pkg/sources/filesystem/filesystem.go:43]; its `Enumerate` [pkg/sources/filesystem/filesystem.go:202] discovers the directory's files and its `ChunkUnit` [pkg/sources/filesystem/filesystem.go:242] / `Chunks` [pkg/sources/filesystem/filesystem.go:85] produce the file‑content chunks. This matches `docs/process_flow.md`'s `FilesystemSource → FilesystemUnit(Directory) → FilesystemChunk(file contents)`. The scan is entered from the CLI at `eng.ScanFileSystem(ctx, cfg)` [main.go:786].
 
-**Claim 3 — chunks and results flow over named channels.** The engine exposes the two ends of the pipeline: `ChunksChan()` returns the source manager's chunk stream [pkg/engine/engine.go:744] and `ResultsChan()` returns `e.results` [pkg/engine/engine.go:748]. Per `docs/concurrency.md`, scanner workers read from `ChunksChan()`, forward to `detectableChunksChan` / `verificationOverlapChunksChan`, and detector workers publish `detectors.ResultWithMetadata` to `ResultsChan()` (`e.results`) for the notifier workers — the exact channels allocated in `initialize` (b) [pkg/engine/engine.go:515-519].
+**Claim 3 — chunks and results flow over named channels (`inferred from source/docs` — not a runtime-observed line).** *No log line in any of my four runs prints the channel names,* so this claim is grounded in reading the source and the in-repo docs, not in observed output, and is labelled accordingly. The engine exposes the two ends of the pipeline: `ChunksChan()` returns the source manager's chunk stream [pkg/engine/engine.go:744] and `ResultsChan()` returns `e.results` [pkg/engine/engine.go:748]. Per `docs/concurrency.md`, scanner workers read from `ChunksChan()`, forward to `detectableChunksChan` / `verificationOverlapChunksChan`, and detector workers publish `detectors.ResultWithMetadata` to `ResultsChan()` (`e.results`) for the notifier workers — the exact channels allocated in `initialize` (b) [pkg/engine/engine.go:515-519]. The *effects* of this wiring are what I observed (worker counts in Claim 1, source enumeration in Claim 2, the per-worker `finished scanning chunks` in Claim 4); only the channel **names** themselves are source-derived.
 
-**Claim 4 — the scanner‑worker count is corroborated by a second, independent signal.** **Observed at `--log-level=5`, one line per scanner worker:**
-
-```
-2026-07-02T23:21:45Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "9GMKu"}
-```
-
-`grep -c 'finished scanning chunks'` returned **128** on *both* level‑5 runs — exactly the scanner‑pool `count` of 128 from Claim 1. This is a neat, independent cross‑check that the 1× scanner pool is host‑derived from `runtime.NumCPU()` = 128. A trace‑only `V(5)` line also marks the end of chunk production for the unit:
+**Claim 4 — the scanner-worker count is corroborated by a second, independent signal.** **Observed at `--log-level=5`, one line per scanner worker** — emitted by `ctx.Logger().V(4).Info("finished scanning chunks")` [pkg/engine/engine.go:840]:
 
 ```
-2026-07-02T23:21:45Z	info-5	trufflehog	dataErrChan closed, all chunks processed	{"source_manager_worker_id": "ObQqM", "unit_kind": "unit", "unit": "/tmp/th_min/sample.txt", "path": "/tmp/th_min/sample.txt", "mime": "text/plain; charset=utf-8", "timeout": 60}
+2026-07-03T00:07:39Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "PfrwW"}
+```
+
+Because that line is emitted once per scanner worker, its count equals the scanner-pool size. **Verbatim:**
+
+```console
+$ grep -c 'finished scanning chunks' l5_run1.log l5_run2.log
+l5_run1.log:128
+l5_run2.log:128
+```
+
+**128** on *both* level-5 runs — exactly the scanner-pool `count` of 128 from Claim 1: an independent cross-check that the 1× scanner pool is host-derived from `runtime.NumCPU()` = 128. A trace-only `V(5)` line also marks the end of chunk production for the unit — emitted by `ctx.Logger().V(5).Info("dataErrChan closed, all chunks processed")` at [pkg/handlers/handlers.go:413] (an *additional* emitting source surfaced by the run, beyond the reference anchors enumerated in the plan; it belongs to the input-handling layer that feeds the filesystem chunk stream):
+
+```
+2026-07-03T00:07:39Z	info-5	trufflehog	dataErrChan closed, all chunks processed	{"source_manager_worker_id": "I27x0", "unit_kind": "unit", "unit": "/tmp/th_min/sample.txt", "path": "/tmp/th_min/sample.txt", "mime": "text/plain; charset=utf-8", "timeout": 60}
 ```
 
 ---
@@ -246,7 +271,7 @@ So the derivation is **1× / 8× / 1× / 1×** of `e.concurrency`, and `e.concur
 The run ends with a single summary line. **Observed verbatim (level‑5, run #1):**
 
 ```
-2026-07-02T23:21:45Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 12, "verified_secrets": 0, "unverified_secrets": 0, "scan_duration": "4.187473ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
+2026-07-03T00:07:39Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 12, "verified_secrets": 0, "unverified_secrets": 0, "scan_duration": "3.486305ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
 ```
 
 Emitted by `logger.Info("finished scanning", …)` [main.go:566], whose fields are `chunks` [main.go:567], `bytes` [main.go:568], `verified_secrets` [main.go:569], `unverified_secrets` [main.go:570], `scan_duration` [main.go:571], `trufflehog_version` = `version.BuildVersion` [main.go:572], and `verification_caching` [main.go:573]. For this 12‑byte input the observed scale was **`chunks` = 1, `bytes` = 12** on all four runs, `verified_secrets`/`unverified_secrets` = 0 (nothing to find, and `--no-verification` anyway), and `trufflehog_version` = `dev` (matching the `--version` output in §2).
@@ -258,7 +283,7 @@ Emitted by `logger.Info("finished scanning", …)` [main.go:566], whose fields a
 Before the worker lines, at level 2+, TruffleHog prints a version log line and its ASCII banner. **Observed verbatim:**
 
 ```
-2026-07-02T23:21:42Z	info-2	trufflehog	trufflehog dev
+2026-07-03T00:07:39Z	info-2	trufflehog	trufflehog dev
 🐷🔑🐷  TruffleHog. Unearth your secrets. 🐷🔑🐷
 ```
 
@@ -279,13 +304,23 @@ The `info-2 … trufflehog dev` line is `logger.V(2).Info(fmt.Sprintf("truffleho
 
 - **(i) `dev` version — non‑canonical.** As in §7, `dev` is the default dev‑build value [pkg/version/version.go:3]; release builds override it via ldflags [.goreleaser.yml:18-19] (`inferred`).
 - **(ii) Worker counts — host‑derived.** 128 / 1024 / 128 / 128 are derived from `runtime.NumCPU()` [main.go:58], **not** a fixed constant. On this host the shell `nproc` reports **4** (a cgroup CPU quota), yet TruffleHog started **128** scanner workers — because Go's `runtime.NumCPU()` reads the host's CPU count, not the cgroup quota. A direct throwaway probe (a one‑file `go run` outside the repo, offered only as **corroboration**, non‑canonical) printed `runtime.NumCPU()=128 GOMAXPROCS=128`, matching the observed scanner count. **Report exactly what is observed:** on a host where `runtime.NumCPU()` differs, these counts will differ.
-- **(iii) `scan_duration` — a range; counts — stable.** Across the four runs `scan_duration` was `3.259478ms` and `3.600499ms` (level 2) and `4.187473ms` and `4.477848ms` (level 5) — an observed **range of ≈ 3.26 – 4.48 ms** for the 12‑byte / 1‑chunk input (the level‑5/trace runs are slightly slower due to the extra logging). Worker counts, `chunks` (1) and `bytes` (12) were **identical across all four runs**; distinct random worker‑ids per run (`X8kg5`, `Dw26G`, `ObQqM`, `0AvuD`) confirm these were four genuinely separate runs.
+- **(iii) `scan_duration` — a range; counts — stable.** The four `finished scanning` summary lines are the auditable source of the timing; **verbatim** (the `scan_duration` field extracted from each run's captured log, in run order — two level-2 runs then two level-5 runs):
+
+```console
+$ grep -hP 'finished scanning\t' l2_run1.log l2_run2.log l5_run1.log l5_run2.log | grep -oP '"scan_duration": "[^"]*"'
+"scan_duration": "4.160324ms"
+"scan_duration": "4.212889ms"
+"scan_duration": "3.486305ms"
+"scan_duration": "4.26542ms"
+```
+
+That is an observed **range of ≈ 3.49 – 4.27 ms** for the 12-byte / 1-chunk input. The durations vary run-to-run within that tight band with **no consistent ordering by verbosity level** — here the fastest run (`3.486305ms`) was in fact a `--log-level=5` run — reported exactly as observed. Worker counts, `chunks` (1) and `bytes` (12) were **identical across all four runs**; the distinct random `source_manager_worker_id` per run (`jrqGQ`, `ZPkng`, `I27x0`, `ypYmV`) confirms these were four genuinely separate runs.
 
 ---
 
 ## 9. Coverage pass
 
-- **(a) Configuration handling** — ✅ evidence `default engine options set` [pkg/engine/engine.go:373]; default detectors = "all" via `DefaultDetectors()` [pkg/engine/engine.go:363]; multipliers 8/1/1 [pkg/engine/engine.go:345,349,353]; the non‑firing "No concurrency specified" branch explained [pkg/engine/engine.go:337-341] with base concurrency at [main.go:58]; **`--config` YAML path labelled `inferred`** [pkg/config/config.go:18-30].
+- **(a) Configuration handling** — ✅ evidence `default engine options set` [pkg/engine/engine.go:373]; the full default detector set is **supplied by the CLI** via `append(defaults.DefaultDetectors(), conf.Detectors...)` [main.go:519] and copied into the engine at [pkg/engine/engine.go:232], so the `if len(e.detectors)==0` fallback [pkg/engine/engine.go:361-363] does **not** fire in the CLI run; include/exclude filters apply subtractively [pkg/engine/engine.go:254-255,472] with `--include-detectors` default `"all"` [main.go:81]; multipliers 8/1/1 [pkg/engine/engine.go:345,349,353]; the non-firing "No concurrency specified" branch explained [pkg/engine/engine.go:337-341] with base concurrency at [main.go:58]; **`--config` YAML path labelled `inferred`** [pkg/config/config.go:18-30].
 - **(b) Scanning‑engine initialization** — ✅ evidence `engine initialized` [pkg/engine/engine.go:521]; `NewEngine` [pkg/engine/engine.go:226] wired at [main.go:688]; **LRU dedup cache** (`cacheSize = 512`) [pkg/engine/engine.go:491-493] and channel allocation [pkg/engine/engine.go:515-519] inside `initialize` [pkg/engine/engine.go:489].
 - **(c) Detector preparation** — ✅ evidence `setting up aho-corasick core` / `set up aho-corasick core` [pkg/engine/engine.go:529-531]; **keyword → detector index** built by `NewAhoCorasickCore` [pkg/engine/ahocorasick/ahocorasickcore.go:141-151] from `DefaultDetectors()` [pkg/engine/defaults/defaults.go:1704]; each detector's `Keywords()` [pkg/detectors/detectors.go:24] and `FromData` [pkg/detectors/detectors.go:21]; queried by `FindDetectorMatches` [pkg/engine/ahocorasick/ahocorasickcore.go:241].
 - **(d) Component communication** — ✅ evidence the four `starting … workers` lines [pkg/engine/engine.go:663,678,693,708] with the **1×/8×/1×/1×** derivation; the pipeline lines `running source`/`enumerating source`/`chunking unit`/`scanning file` [pkg/sources/source_manager.go:363,531,557; pkg/sources/filesystem/filesystem.go:179]; the `ChunksChan()`/`ResultsChan()` channels [pkg/engine/engine.go:744,748]; the per‑worker `finished scanning chunks` cross‑check (= 128). The **four worker classes**, the **channels**, `ScanFileSystem` [main.go:786], and the filesystem `Enumerate`/`ChunkUnit`/`Chunks` [pkg/sources/filesystem/filesystem.go:202,242,85] are all addressed.
