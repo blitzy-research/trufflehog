@@ -38,7 +38,7 @@ The question decomposes into five deliverables, answered explicitly and by name 
 
 All evidence in this report was produced by the canonical build and the tool's own instrumentation, on this checkout.
 
-- **Runtime (observed):** `go version go1.24.3 linux/amd64`. The module declares `go 1.23.1` [go.mod:L3] with `toolchain go1.24.2` [go.mod:L5]; module path `github.com/trufflesecurity/trufflehog/v3` [go.mod:L1]. Local Go 1.24.3 ≥ the declared toolchain, so no toolchain download occurs. *(The provenance target of Go 1.24.2 and the actual installed 1.24.3 both satisfy the module; I report the version I actually ran.)*
+- **Runtime (observed):** `go version go1.24.2 linux/amd64`. The module declares `go 1.23.1` [go.mod:L3] with `toolchain go1.24.2` [go.mod:L5]; module path `github.com/trufflesecurity/trufflehog/v3` [go.mod:L1]. The installed Go 1.24.2 matches the declared toolchain exactly, so no toolchain download occurs.
 - **Host (observed):** 4 logical CPUs (`nproc` = 4). This matters for A5: absolute timings and profile percentages are machine‑dependent and reflect a 4‑core box.
 - **Canonical build:**
 
@@ -49,7 +49,7 @@ All evidence in this report was produced by the canonical build and the tool's o
   Because `CGO_ENABLED=0`, `go-re2` runs in its **default WebAssembly/wazero mode** (pure Go, no cgo) — confirmed by the absence of any `re2_cgo` reference under `pkg/` and by the `wazero` frames in the CPU profile (A5). Observed binary size:
 
   ```
-  194322006   # bytes, stat -c '%s' /tmp/trufflehog
+  194308234   # bytes, stat -c '%s' /tmp/trufflehog
   ```
 
 - **Version string — LABEL: BUILD‑DEPENDENT.** A plain `go build` (no release ldflags) yields the placeholder version:
@@ -568,7 +568,7 @@ go tool pprof -top cpu.pprof ; go tool pprof -top fg.pprof
 
 ### Notes on provenance and reproducibility
 
-Wall‑clock timings vary run‑to‑run and across hardware; the absolute values above were observed on a 4‑core Linux host with Go 1.24.3 and are reported verbatim, with each magnitude confirmed stable across ≥2 runs and ratios recomputed from those verbatim values. The verdicts (A1 NO/bounded; A2 NO/RE2‑linear; A3 fan‑out; A4 bounded‑linear; A5 linear‑RE2 CPU signature) are structural and do not depend on the specific hardware. The `trufflehog dev` version is a build‑dependent placeholder from a plain `go build`; the Python `re` figures are a non‑canonical contrast, not TruffleHog's engine.
+Wall‑clock timings vary run‑to‑run and across hardware; the absolute values above were observed on a 4‑core Linux host with Go 1.24.2 and are reported verbatim, with each magnitude confirmed stable across ≥2 runs and ratios recomputed from those verbatim values. The verdicts (A1 NO/bounded; A2 NO/RE2‑linear; A3 fan‑out; A4 bounded‑linear; A5 linear‑RE2 CPU signature) are structural and do not depend on the specific hardware. The `trufflehog dev` version is a build‑dependent placeholder from a plain `go build`; the Python `re` figures are a non‑canonical contrast, not TruffleHog's engine.
 
 ---
 
