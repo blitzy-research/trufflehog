@@ -168,7 +168,7 @@ cmd = kingpin.MustParse(cli.Parse(os.Args[1:]))
 **Observed signal (configuration is live).** The very first log line proves the parsed configuration and version are in hand — the version banner, emitted at verbosity 2 by `logger.V(2).Info(fmt.Sprintf("trufflehog %s", version.BuildVersion))` (`main.go:410`):
 
 ```text
-2026-07-06T22:30:36Z	info-2	trufflehog	trufflehog dev
+2026-07-06T23:13:39Z	info-2	trufflehog	trufflehog dev
 ```
 
 Immediately after, `main.go` writes the ASCII banner **to stderr** (not through the structured logger, so it appears even in non‑JSON mode) via `fmt.Fprintf(os.Stderr, "🐷🔑🐷  TruffleHog. Unearth your secrets. 🐷🔑🐷\n\n")` (`main.go:498`):
@@ -197,7 +197,21 @@ func Read(filename string) (*Config, error) {
     return NewYAML(input)   // pkg/config/config.go:23
 }
 // pkg/config/config.go:27
-func NewYAML(input []byte) (*Config, error) { /* parses custom detectors */ }
+func NewYAML(input []byte) (*Config, error) {
+    var messages custom_detectorspb.CustomDetectors
+    if err := protoyaml.UnmarshalStrict(input, &messages); err != nil { // pkg/config/config.go:30
+        return nil, err
+    }
+    var d []detectors.Detector
+    for _, detectorConfig := range messages.Detectors {
+        detector, err := custom_detectors.NewWebhookCustomRegex(detectorConfig) // pkg/config/config.go:36
+        if err != nil {
+            return nil, err
+        }
+        d = append(d, detector)
+    }
+    return &Config{Detectors: d}, nil // pkg/config/config.go:42
+}
 ```
 
 **In the basic dry‑run `--config` is absent**, so `conf` remains empty and only defaults apply. *(This is the observed default path: no `config.Read` work is reflected in the run output because the flag was never set.)*
@@ -234,7 +248,7 @@ func DefaultDecoders() []Decoder {
 
 The ordering matters: the comment at `pkg/decoders/decoders.go:10` states **"UTF8 must be first for duplicate detection."**
 
-**Causal reasoning.** Configuration in a basic run is essentially *"parse flags → apply defaults."* The dry‑run's safety is a direct, provable consequence of one configuration value: `Verify=false` (`main.go:520`) — corroborated at the end of the scan by the all‑zero `verification_caching` block and `verified_secrets: 0` in the observed summary (Section 5.4 and Appendix).
+**Causal reasoning.** Configuration in a basic run is essentially *"parse flags → apply defaults."* The dry‑run's safety is a direct, provable consequence of one configuration value: `Verify=false` (`main.go:520`) — corroborated at the end of the scan by the all‑zero `verification_caching` block and `verified_secrets: 0` in the observed summary (Section 5.4 and Section 7).
 
 ---
 
@@ -251,7 +265,24 @@ eng, err := engine.NewEngine(ctx, &cfg)
 
 ```go
 // pkg/engine/engine.go:226
-func NewEngine(ctx context.Context, cfg *Config) (*Engine, error) { /* copies cfg; calls e.setDefaults(ctx) */ }
+func NewEngine(ctx context.Context, cfg *Config) (*Engine, error) {
+    engine := &Engine{
+        concurrency: cfg.Concurrency, // pkg/engine/engine.go:230
+        decoders:    cfg.Decoders,
+        detectors:   cfg.Detectors,
+        verify:      cfg.Verify, // pkg/engine/engine.go:235
+        // …the remaining cfg fields are copied here (pkg/engine/engine.go:229-247)…
+    }
+    if engine.sourceManager == nil {
+        return nil, fmt.Errorf("source manager is required")
+    }
+    engine.setDefaults(ctx) // pkg/engine/engine.go:252
+    // …build and apply the include/exclude detector filters (pkg/engine/engine.go:255-321)…
+    if err := engine.initialize(ctx); err != nil { // pkg/engine/engine.go:323
+        return nil, err
+    }
+    return engine, nil // pkg/engine/engine.go:327
+}
 ```
 
 `setDefaults` fills in the tuning knobs that later determine the worker‑pool sizes, then announces completion:
@@ -271,7 +302,7 @@ func (e *Engine) setDefaults(ctx context.Context) {
 **Observed signal** (only visible at `--log-level ≥ 4`, hence it appears in the `--log-level=5` capture, not the level‑2 one):
 
 ```text
-2026-07-06T22:32:28Z	info-4	trufflehog	default engine options set
+2026-07-06T23:13:43Z	info-4	trufflehog	default engine options set
 ```
 
 These three multipliers are the arithmetic behind Section 5's worker counts: `detectorWorkerMultiplier = 8` (→ 128 × 8 = 1024 detector workers), and the two `= 1` multipliers (→ 128 each for verificationOverlap and notifier).
@@ -297,14 +328,14 @@ func (e *Engine) initialize(ctx context.Context) error {
 **Observed signal:**
 
 ```text
-2026-07-06T22:32:28Z	info-4	trufflehog	engine initialized
+2026-07-06T23:13:43Z	info-4	trufflehog	engine initialized
 ```
 
 The LRU is a **512‑entry** dedup cache — `const cacheSize = 512` (`pkg/engine/engine.go:491`) instantiated by `lru.New[string, detectorspb.DecoderType](cacheSize)` (`pkg/engine/engine.go:493`) and stored as `e.dedupeCache` (`pkg/engine/engine.go:520`), backed by `github.com/hashicorp/golang-lru/v2 v2.0.7`. It maps a `string` key to a `detectorspb.DecoderType` **value**, which shows its purpose: **deduplicate chunks by decoder type** so the same bytes are not re‑scanned under multiple decoders.
 
 The **three buffered channels** created here (`pkg/engine/engine.go:515,517,519`) are the wiring that decouples the worker pools (see Section 5.3). Their capacities are computed from `defaultChannelBuffer` (`pkg/engine/engine.go:627`, `= runtime.NumCPU()`) times per‑channel multipliers.
 
-**Causal reasoning.** The Aho‑Corasick setup of Section 4 is the *final step of `initialize` itself* (`engine.go:529–531`, immediately before its `return nil` at `engine.go:538`) — which is why the `engine initialized` and `setting up aho-corasick core` lines appear back‑to‑back in the capture. So by the time `NewEngine` returns, the engine is fully wired (cache + channels + prefilter); only later does `eng.Start(ctx)` spin up the worker pools.
+**Causal reasoning.** The Aho‑Corasick setup of Section 4 is the *final step of `initialize` itself* (`engine.go:529–531`, immediately before its `return nil` at `engine.go:533`) — which is why the `engine initialized` and `setting up aho-corasick core` lines appear back‑to‑back in the capture. So by the time `NewEngine` returns, the engine is fully wired (cache + channels + prefilter); only later does `eng.Start(ctx)` spin up the worker pools.
 
 ---
 
@@ -326,8 +357,8 @@ ctx.Logger().V(4).Info("set up aho-corasick core")
 **Observed signals (both at verbosity 4):**
 
 ```text
-2026-07-06T22:32:28Z	info-4	trufflehog	setting up aho-corasick core
-2026-07-06T22:32:28Z	info-4	trufflehog	set up aho-corasick core
+2026-07-06T23:13:43Z	info-4	trufflehog	setting up aho-corasick core
+2026-07-06T23:13:43Z	info-4	trufflehog	set up aho-corasick core
 ```
 
 ### 4.2 What `NewAhoCorasickCore` actually does
@@ -393,9 +424,18 @@ eng.Start(ctx)
 
 ```go
 // pkg/engine/engine.go:621
-func (e *Engine) Start(ctx context.Context) { /* …calls e.startWorkers(ctx)… */ }
+func (e *Engine) Start(ctx context.Context) {
+    e.metrics = runtimeMetrics{Metrics: Metrics{scanStartTime: time.Now()}}
+    e.sanityChecks(ctx) // pkg/engine/engine.go:623
+    e.startWorkers(ctx) // pkg/engine/engine.go:624
+}
 // pkg/engine/engine.go:646
-func (e *Engine) startWorkers(ctx context.Context) { /* starts the 4 pools in order */ }
+func (e *Engine) startWorkers(ctx context.Context) {
+    e.startScannerWorkers(ctx)             // pkg/engine/engine.go:648
+    e.startDetectorWorkers(ctx)            // pkg/engine/engine.go:651
+    e.startVerificationOverlapWorkers(ctx) // pkg/engine/engine.go:655
+    e.startNotifierWorkers(ctx)            // pkg/engine/engine.go:659
+}
 ```
 
 ### 5.2 The four pools and their observed counts
@@ -409,7 +449,7 @@ Each pool logs its size at verbosity 2 as it starts. **These are my captured `--
 ctx.Logger().V(2).Info("starting scanner workers", "count", e.concurrency)
 ```
 ```text
-2026-07-06T22:30:36Z	info-2	trufflehog	starting scanner workers	{"count": 128}
+2026-07-06T23:13:39Z	info-2	trufflehog	starting scanner workers	{"count": 128}
 ```
 
 **Detector pool** — size = `e.concurrency * e.detectorWorkerMultiplier` = 128 × 8 = 1024:
@@ -421,7 +461,7 @@ numWorkers := e.concurrency * e.detectorWorkerMultiplier
 ctx.Logger().V(2).Info("starting detector workers", "count", numWorkers)
 ```
 ```text
-2026-07-06T22:30:36Z	info-2	trufflehog	starting detector workers	{"count": 1024}
+2026-07-06T23:13:39Z	info-2	trufflehog	starting detector workers	{"count": 1024}
 ```
 
 **VerificationOverlap pool** — size = `e.concurrency * e.verificationOverlapWorkerMultiplier` = 128 × 1 = 128:
@@ -433,7 +473,7 @@ numWorkers := e.concurrency * e.verificationOverlapWorkerMultiplier
 ctx.Logger().V(2).Info("starting verificationOverlap workers", "count", numWorkers)
 ```
 ```text
-2026-07-06T22:30:36Z	info-2	trufflehog	starting verificationOverlap workers	{"count": 128}
+2026-07-06T23:13:39Z	info-2	trufflehog	starting verificationOverlap workers	{"count": 128}
 ```
 
 **Notifier pool** — size = `e.notificationWorkerMultiplier * e.concurrency` = 1 × 128 = 128:
@@ -445,7 +485,7 @@ numWorkers := e.notificationWorkerMultiplier * e.concurrency
 ctx.Logger().V(2).Info("starting notifier workers", "count", numWorkers)
 ```
 ```text
-2026-07-06T22:30:36Z	info-2	trufflehog	starting notifier workers	{"count": 128}
+2026-07-06T23:13:39Z	info-2	trufflehog	starting notifier workers	{"count": 128}
 ```
 
 Every worker goroutine is tagged with a random 5‑character id (via `common.RandomID(5)`); those ids are visible as `scanner_worker_id`, `detector_worker_id`, and `source_manager_worker_id` in the logs.
@@ -483,16 +523,16 @@ ctx.Logger().V(2).Info("enumerating source")
 **Observed signals** (`running source` at info‑0, so it appears even at `--log-level=2`; `enumerating source` at info‑2):
 
 ```text
-2026-07-06T22:30:36Z	info-0	trufflehog	running source	{"source_manager_worker_id": "yUYEq", "with_units": true}
-2026-07-06T22:30:36Z	info-2	trufflehog	enumerating source	{"source_manager_worker_id": "yUYEq"}
+2026-07-06T23:13:39Z	info-0	trufflehog	running source	{"source_manager_worker_id": "E2BDe", "with_units": true}
+2026-07-06T23:13:39Z	info-2	trufflehog	enumerating source	{"source_manager_worker_id": "E2BDe"}
 ```
 
 At `--log-level=5` the finer‑grained feeding steps become visible — the unit is chunked, the file is scanned, and then the **terminator / boundary state** fires when the data channel closes:
 
 ```text
-2026-07-06T22:32:28Z	info-3	trufflehog	chunking unit	{"source_manager_worker_id": "oEnwo", "unit_kind": "unit", "unit": "/tmp/th_scan/creds.txt"}
-2026-07-06T22:32:28Z	info-3	trufflehog	scanning file	{"source_manager_worker_id": "oEnwo", "unit_kind": "unit", "unit": "/tmp/th_scan/creds.txt", "path": "/tmp/th_scan/creds.txt"}
-2026-07-06T22:32:28Z	info-5	trufflehog	dataErrChan closed, all chunks processed	{"source_manager_worker_id": "oEnwo", "unit_kind": "unit", "unit": "/tmp/th_scan/creds.txt", "path": "/tmp/th_scan/creds.txt", "mime": "text/plain; charset=utf-8", "timeout": 60}
+2026-07-06T23:13:43Z	info-3	trufflehog	chunking unit	{"source_manager_worker_id": "69lqK", "unit_kind": "unit", "unit": "/tmp/th_scan/creds.txt"}
+2026-07-06T23:13:43Z	info-3	trufflehog	scanning file	{"source_manager_worker_id": "69lqK", "unit_kind": "unit", "unit": "/tmp/th_scan/creds.txt", "path": "/tmp/th_scan/creds.txt"}
+2026-07-06T23:13:43Z	info-5	trufflehog	dataErrChan closed, all chunks processed	{"source_manager_worker_id": "69lqK", "unit_kind": "unit", "unit": "/tmp/th_scan/creds.txt", "path": "/tmp/th_scan/creds.txt", "mime": "text/plain; charset=utf-8", "timeout": 60}
 ```
 
 ### 5.5 Before/after boundary: per‑worker completion vs. the single terminal summary
@@ -502,16 +542,16 @@ This before/after distinction is important and was explicitly exercised:
 - **Per‑scanner‑worker completion** — each scanner worker logs `finished scanning chunks` at verbosity 4 as it drains, from `ctx.Logger().V(4).Info("finished scanning chunks")` (`pkg/engine/engine.go:840`). In my `--log-level=5` capture this line appeared **exactly 128 times — one per scanner worker — each with a distinct 5‑character `scanner_worker_id`** (verified: 128 unique ids). At `--log-level=2` this line does **not** appear at all (it is a `V(4)` message, below the level‑2 threshold — an observed boundary of the logging level itself).
 
 ```text
-2026-07-06T22:32:28Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "jEAkb"}
-2026-07-06T22:32:28Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "MFbty"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "r8im0"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "MRb4R"}
    ... (repeats 128× total, each a distinct 5-char id from common.RandomID(5)) ...
-2026-07-06T22:32:28Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "WtbsJ"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "AuKp3"}
 ```
 
 - **Single terminal summary** — after all pools finish, exactly **one** `finished scanning` summary is printed at info‑0:
 
 ```text
-2026-07-06T22:30:36Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 106, "verified_secrets": 0, "unverified_secrets": 0, "scan_duration": "4.495259ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
+2026-07-06T23:13:39Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 106, "verified_secrets": 0, "unverified_secrets": 0, "scan_duration": "5.362495ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
 ```
 
 **Observed concurrency evidence (interleaving).** In the `--log-level=5` capture the 128 `finished scanning chunks` lines actually span 130 output lines, because the two `trufflehog.aws` detector lines (below) interleave *between* chunk‑completion lines. That interleaving is direct, observed proof that the scanner and detector pools run concurrently; their relative ordering varies run‑to‑run while the counts stay fixed.
@@ -542,7 +582,7 @@ context.SetDefaultLogger(logger)
 func New(service string, configs ...logConfig) (logr.Logger, func() error) { … }
 ```
 
-Its encoder is a **console encoder by default** (`zapcore.NewConsoleEncoder(defaultEncoderConfig())`, `pkg/log/log.go:107`) or a **JSON encoder** when `--json` is set (`zapcore.NewJSONEncoder(defaultEncoderConfig())`, `pkg/log/log.go:97`); timestamps are RFC3339 via `conf.EncodeTime = zapcore.TimeEncoderOfLayout(time.RFC3339)` (`pkg/log/log.go:117`). This is exactly the shape observed: tab‑separated columns `TIMESTAMP  info-N  service  message  {json fields}`, with an RFC3339 timestamp such as `2026-07-06T22:30:36Z`.
+Its encoder is a **console encoder by default** (`zapcore.NewConsoleEncoder(defaultEncoderConfig())`, `pkg/log/log.go:107`) or a **JSON encoder** when `--json` is set (`zapcore.NewJSONEncoder(defaultEncoderConfig())`, `pkg/log/log.go:97`); timestamps are RFC3339 via `conf.EncodeTime = zapcore.TimeEncoderOfLayout(time.RFC3339)` (`pkg/log/log.go:117`). This is exactly the shape observed: tab‑separated columns `TIMESTAMP  info-N  service  message  {json fields}`, with an RFC3339 timestamp such as `2026-07-06T23:13:39Z`.
 
 The `service` name passed here is `"trufflehog"`, which is why every line's third column reads `trufflehog`; child loggers append a suffix, e.g. the AWS detector logs under `trufflehog.aws` (observed in Section 6.3).
 
@@ -570,45 +610,17 @@ This table is itself an observed result: at `--log-level=2` the engine‑init an
 The `filesystem` command path executes inside `run(state overseer.State)` (`main.go:381`), which runs under the overseer process supervisor (`github.com/jpillora/overseer`, replaced by `github.com/trufflesecurity/overseer v1.2.8` per `go.mod`) that also powers self‑update/restart. The child‑logger behavior is observable in the AWS detector lines captured at `--log-level=5`:
 
 ```text
-2026-07-06T22:32:28Z	info-3	trufflehog.aws	Failed to decode account number	{"detector_worker_id": "bFGDO", "detector": {"type":"AWS"}, "timeout": 10, "err": "can't get account number from AKIAJ/ASIAJ or AKIAI/ASIAI keys"}
-2026-07-06T22:32:28Z	info-4	trufflehog	Skipping result: false positive	{"detector_worker_id": "bFGDO", "detector": {"type":"AWS"}, "timeout": 10, "result": "AKIAIOSFODNN7EXAMPLE", "reason": "contains term: example"}
+2026-07-06T23:13:43Z	info-3	trufflehog.aws	Failed to decode account number	{"detector_worker_id": "mDQPq", "detector": {"type":"AWS"}, "timeout": 10, "err": "can't get account number from AKIAJ/ASIAJ or AKIAI/ASIAI keys"}
+2026-07-06T23:13:43Z	info-4	trufflehog	Skipping result: false positive	{"detector_worker_id": "mDQPq", "detector": {"type":"AWS"}, "timeout": 10, "result": "AKIAIOSFODNN7EXAMPLE", "reason": "contains term: example"}
 ```
 
 **Causal reasoning.** Leveled logging *is* the observability surface for startup. Because each subsystem announces itself at a specific `V(n)`, choosing `--log-level=5` turns the internal `main → engine → aho‑corasick → workers → source` sequence into an externally visible, timestamped trace — which is exactly what this investigation depends on.
 
 ---
 
-## Section 7 — Key insights & edge findings
+## Section 7 — Complete unedited output appendix
 
-### 7.1 Dry‑run safety proof (a boundary case)
-
-The seeded AWS key produces **both** `verified_secrets: 0` **and** `unverified_secrets: 0`. That is not merely because verification was disabled — it is because the AWS detector **filters the fake key out as a false positive before it ever becomes a result**. Observed at `--log-level=5`, from the `trufflehog.aws` child logger:
-
-```text
-2026-07-06T22:32:28Z	info-3	trufflehog.aws	Failed to decode account number	{"detector_worker_id": "bFGDO", "detector": {"type":"AWS"}, "timeout": 10, "err": "can't get account number from AKIAJ/ASIAJ or AKIAI/ASIAI keys"}
-2026-07-06T22:32:28Z	info-4	trufflehog	Skipping result: false positive	{"detector_worker_id": "bFGDO", "detector": {"type":"AWS"}, "timeout": 10, "result": "AKIAIOSFODNN7EXAMPLE", "reason": "contains term: example"}
-```
-
-Combined with `Verify: !*noVerification` → **false** (`main.go:520`) and the all‑zero `verification_caching` block in the summary (`{"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}`), this proves the dry‑run emitted **no** live‑API verification traffic.
-
-### 7.2 Transitional / terminator states
-
-- `dataErrChan closed, all chunks processed` (info‑5, carrying `"mime": "text/plain; charset=utf-8", "timeout": 60`) marks the **end of chunk feeding** for the unit.
-- The **128 per‑worker** `finished scanning chunks` lines (info‑4) precede the **single terminal** `finished scanning` summary (info‑0). Reporting this before/after distinction — many per‑worker completions vs. one aggregate summary — was an explicit goal of the investigation.
-
-### 7.3 The version is `dev`
-
-The canonical default build reports `trufflehog dev`. This is *not* a release number and was deliberately **not** stamped to look like one — it is the honest default‑build value (`pkg/version/version.go:3`).
-
-### 7.4 What I inferred vs. observed
-
-For transparency, the only claims **inferred from reading source** (rather than observed at runtime) are: (a) the per‑chunk `prefilter.Match` path in `FindDetectorMatches` (`ahocorasickcore.go:242`, Section 4.3), and (b) the numeric channel buffer capacities 6400 / 3200 / 6400 (derived from the constants at `engine.go:503,507,508,627`, Section 5.3). Everything else in Sections 2–6 sits next to a log line I captured.
-
----
-
-## Section 8 — Complete unedited output appendix
-
-### 8.1 `--log-level=2` — complete, unedited
+### 7.1 `--log-level=2` — complete, unedited
 
 **Command:**
 
@@ -616,24 +628,24 @@ For transparency, the only claims **inferred from reading source** (rather than 
 $ /tmp/trufflehog filesystem /tmp/th_scan --no-verification --log-level=2
 ```
 
-**Output (captured 2026-07-06T22:30:36Z; the columns are literal tab‑separated: `TIMESTAMP<TAB>info-N<TAB>service<TAB>message<TAB>{fields}`):**
+**Output (captured 2026-07-06T23:13:39Z; the columns are literal tab‑separated: `TIMESTAMP<TAB>info-N<TAB>service<TAB>message<TAB>{fields}`):**
 
 ```text
-2026-07-06T22:30:36Z	info-2	trufflehog	trufflehog dev
+2026-07-06T23:13:39Z	info-2	trufflehog	trufflehog dev
 🐷🔑🐷  TruffleHog. Unearth your secrets. 🐷🔑🐷
 
-2026-07-06T22:30:36Z	info-2	trufflehog	starting scanner workers	{"count": 128}
-2026-07-06T22:30:36Z	info-2	trufflehog	starting detector workers	{"count": 1024}
-2026-07-06T22:30:36Z	info-2	trufflehog	starting verificationOverlap workers	{"count": 128}
-2026-07-06T22:30:36Z	info-2	trufflehog	starting notifier workers	{"count": 128}
-2026-07-06T22:30:36Z	info-0	trufflehog	running source	{"source_manager_worker_id": "yUYEq", "with_units": true}
-2026-07-06T22:30:36Z	info-2	trufflehog	enumerating source	{"source_manager_worker_id": "yUYEq"}
-2026-07-06T22:30:36Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 106, "verified_secrets": 0, "unverified_secrets": 0, "scan_duration": "4.495259ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
+2026-07-06T23:13:39Z	info-2	trufflehog	starting scanner workers	{"count": 128}
+2026-07-06T23:13:39Z	info-2	trufflehog	starting detector workers	{"count": 1024}
+2026-07-06T23:13:39Z	info-2	trufflehog	starting verificationOverlap workers	{"count": 128}
+2026-07-06T23:13:39Z	info-2	trufflehog	starting notifier workers	{"count": 128}
+2026-07-06T23:13:39Z	info-0	trufflehog	running source	{"source_manager_worker_id": "E2BDe", "with_units": true}
+2026-07-06T23:13:39Z	info-2	trufflehog	enumerating source	{"source_manager_worker_id": "E2BDe"}
+2026-07-06T23:13:39Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 106, "verified_secrets": 0, "unverified_secrets": 0, "scan_duration": "5.362495ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
 ```
 
 At this level the engine‑initialization (`info-4`), chunking (`info-3`), and per‑worker (`info-4`) lines are intentionally suppressed — they are above the level‑2 threshold (Section 6.2).
 
-### 8.2 `--log-level=5` — full initialization detail (faithful excerpt)
+### 7.2 `--log-level=5` — complete, unedited output
 
 **Command:**
 
@@ -641,37 +653,189 @@ At this level the engine‑initialization (`info-4`), chunking (`info-3`), and p
 $ /tmp/trufflehog filesystem /tmp/th_scan --no-verification --log-level=5
 ```
 
-**Output (captured 2026-07-06T22:32:28Z).** The file is 147 lines; the only collapse below is the block of `finished scanning chunks` lines, which repeats **exactly 128×** (verified: 128 distinct `scanner_worker_id`s). Everything else is reproduced verbatim in its observed order, including the two `trufflehog.aws` lines that **interleave** into the chunk‑completion block:
+**Output (captured 2026-07-06T23:13:43Z).** This is the **complete, unedited** output — **all 147 lines in their observed order, nothing collapsed or elided**. It includes every one of the **128** `finished scanning chunks` lines (each carrying a distinct 5-character `scanner_worker_id` from `common.RandomID(5)`), plus the two `trufflehog.aws` detector lines that **interleave** among the chunk-completion lines:
 
 ```text
-2026-07-06T22:32:28Z	info-2	trufflehog	trufflehog dev
+2026-07-06T23:13:43Z	info-2	trufflehog	trufflehog dev
 🐷🔑🐷  TruffleHog. Unearth your secrets. 🐷🔑🐷
 
-2026-07-06T22:32:28Z	info-4	trufflehog	default engine options set
-2026-07-06T22:32:28Z	info-4	trufflehog	engine initialized
-2026-07-06T22:32:28Z	info-4	trufflehog	setting up aho-corasick core
-2026-07-06T22:32:28Z	info-4	trufflehog	set up aho-corasick core
-2026-07-06T22:32:28Z	info-2	trufflehog	starting scanner workers	{"count": 128}
-2026-07-06T22:32:28Z	info-2	trufflehog	starting detector workers	{"count": 1024}
-2026-07-06T22:32:28Z	info-2	trufflehog	starting verificationOverlap workers	{"count": 128}
-2026-07-06T22:32:28Z	info-2	trufflehog	starting notifier workers	{"count": 128}
-2026-07-06T22:32:28Z	info-0	trufflehog	running source	{"source_manager_worker_id": "oEnwo", "with_units": true}
-2026-07-06T22:32:28Z	info-2	trufflehog	enumerating source	{"source_manager_worker_id": "oEnwo"}
-2026-07-06T22:32:28Z	info-3	trufflehog	chunking unit	{"source_manager_worker_id": "oEnwo", "unit_kind": "unit", "unit": "/tmp/th_scan/creds.txt"}
-2026-07-06T22:32:28Z	info-3	trufflehog	scanning file	{"source_manager_worker_id": "oEnwo", "unit_kind": "unit", "unit": "/tmp/th_scan/creds.txt", "path": "/tmp/th_scan/creds.txt"}
-2026-07-06T22:32:28Z	info-5	trufflehog	dataErrChan closed, all chunks processed	{"source_manager_worker_id": "oEnwo", "unit_kind": "unit", "unit": "/tmp/th_scan/creds.txt", "path": "/tmp/th_scan/creds.txt", "mime": "text/plain; charset=utf-8", "timeout": 60}
-2026-07-06T22:32:28Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "jEAkb"}
-2026-07-06T22:32:28Z	info-3	trufflehog.aws	Failed to decode account number	{"detector_worker_id": "bFGDO", "detector": {"type":"AWS"}, "timeout": 10, "err": "can't get account number from AKIAJ/ASIAJ or AKIAI/ASIAI keys"}
-2026-07-06T22:32:28Z	info-4	trufflehog	Skipping result: false positive	{"detector_worker_id": "bFGDO", "detector": {"type":"AWS"}, "timeout": 10, "result": "AKIAIOSFODNN7EXAMPLE", "reason": "contains term: example"}
-2026-07-06T22:32:28Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "MFbty"}
-   … ("finished scanning chunks" repeats 128× in total — one per scanner worker, each a distinct 5-char scanner_worker_id from common.RandomID(5). The two trufflehog.aws lines above interleave among the block because the scanner and detector pools run concurrently; their relative ordering varies run-to-run, the 128 count does not.) …
-2026-07-06T22:32:28Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "WtbsJ"}
-2026-07-06T22:32:28Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 106, "verified_secrets": 0, "unverified_secrets": 0, "scan_duration": "4.70634ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
+2026-07-06T23:13:43Z	info-4	trufflehog	default engine options set
+2026-07-06T23:13:43Z	info-4	trufflehog	engine initialized
+2026-07-06T23:13:43Z	info-4	trufflehog	setting up aho-corasick core
+2026-07-06T23:13:43Z	info-4	trufflehog	set up aho-corasick core
+2026-07-06T23:13:43Z	info-2	trufflehog	starting scanner workers	{"count": 128}
+2026-07-06T23:13:43Z	info-2	trufflehog	starting detector workers	{"count": 1024}
+2026-07-06T23:13:43Z	info-2	trufflehog	starting verificationOverlap workers	{"count": 128}
+2026-07-06T23:13:43Z	info-2	trufflehog	starting notifier workers	{"count": 128}
+2026-07-06T23:13:43Z	info-0	trufflehog	running source	{"source_manager_worker_id": "69lqK", "with_units": true}
+2026-07-06T23:13:43Z	info-2	trufflehog	enumerating source	{"source_manager_worker_id": "69lqK"}
+2026-07-06T23:13:43Z	info-3	trufflehog	chunking unit	{"source_manager_worker_id": "69lqK", "unit_kind": "unit", "unit": "/tmp/th_scan/creds.txt"}
+2026-07-06T23:13:43Z	info-3	trufflehog	scanning file	{"source_manager_worker_id": "69lqK", "unit_kind": "unit", "unit": "/tmp/th_scan/creds.txt", "path": "/tmp/th_scan/creds.txt"}
+2026-07-06T23:13:43Z	info-5	trufflehog	dataErrChan closed, all chunks processed	{"source_manager_worker_id": "69lqK", "unit_kind": "unit", "unit": "/tmp/th_scan/creds.txt", "path": "/tmp/th_scan/creds.txt", "mime": "text/plain; charset=utf-8", "timeout": 60}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "r8im0"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "MRb4R"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "fadMX"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "XyzW7"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "PGF71"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "6KuFv"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "CVVrL"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "9M6oy"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "7ywnb"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "woPyy"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "YWlKw"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "SqLpQ"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "VQ9Tx"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "iV3H0"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "xaGB4"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "1FmCV"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "pc3xK"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "5LQBk"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "xJ8US"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "ZsGHX"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "J8W2V"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "0m8Kg"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "HaQ5e"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "SQI5E"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "8wFZD"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "MsFWv"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "CagJ6"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "tghbJ"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "ZEYkw"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "3P2nl"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "LLgy0"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "8GIcM"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "wKQzy"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "xRGaA"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "tvSXS"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "QM5sF"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "gqsHu"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "f5lEh"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "QCpVF"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "NpDJg"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "82WQB"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "b0bIm"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "Pdd3m"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "WUAAX"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "I71Sp"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "ZQPy8"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "Ijwvz"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "73udn"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "mcqca"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "SbrA1"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "Mjk1U"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "vpwn5"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "eOVYg"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "tNt3Z"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "056x3"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "aXDnh"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "Yyy8U"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "4yDo3"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "EiAXW"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "AgxUG"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "zPrSl"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "CYUAA"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "FEbAR"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "XWbs6"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "e50rL"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "HYhwO"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "JXoL3"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "e18NH"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "dHBNf"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "pTQQN"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "JCM2S"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "MBrwR"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "Zs68X"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "yvGpB"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "IFKq4"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "Hv6qC"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "4VDFX"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "BTAU0"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "IvWEA"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "zWpsi"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "EvADB"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "GcUnp"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "fwLw5"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "intL4"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "ZCgP9"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "NTKYS"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "EBsmt"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "uQ3Iv"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "cZ2hJ"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "RRlW4"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "kak68"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "EPSJ4"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "zrEUJ"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "HCoQf"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "B2kHz"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "cMsV3"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "pDAwU"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "x8BLF"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "ZoTHT"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "OpKwj"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "vBqoi"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "CAPO5"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "eJO6v"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "thmYg"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "wTUJK"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "oYkHK"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "tMDJq"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "bRsP7"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "Ts3Ra"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "QkXxc"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "n9hNG"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "CvI9A"}
+2026-07-06T23:13:43Z	info-3	trufflehog.aws	Failed to decode account number	{"detector_worker_id": "mDQPq", "detector": {"type":"AWS"}, "timeout": 10, "err": "can't get account number from AKIAJ/ASIAJ or AKIAI/ASIAI keys"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "eRDxH"}
+2026-07-06T23:13:43Z	info-4	trufflehog	Skipping result: false positive	{"detector_worker_id": "mDQPq", "detector": {"type":"AWS"}, "timeout": 10, "result": "AKIAIOSFODNN7EXAMPLE", "reason": "contains term: example"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "w4ua5"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "eXewB"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "S2OoQ"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "0xX2f"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "XqqNf"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "2p45I"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "ULPFP"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "x0hFY"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "eT7s8"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "Z4w5L"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "H3o1P"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "bAXqJ"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "gmlE9"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "9NKki"}
+2026-07-06T23:13:43Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "AuKp3"}
+2026-07-06T23:13:43Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 106, "verified_secrets": 0, "unverified_secrets": 0, "scan_duration": "6.06214ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
 ```
 
 ---
 
-## Section 9 — Coverage matrix (every named item, answered)
+## Appendix A — Key insights & edge findings
+
+### A.1 Dry‑run safety proof (a boundary case)
+
+The seeded AWS key produces **both** `verified_secrets: 0` **and** `unverified_secrets: 0`. That is not merely because verification was disabled — it is because the AWS detector **filters the fake key out as a false positive before it ever becomes a result**. Observed at `--log-level=5`, from the `trufflehog.aws` child logger:
+
+```text
+2026-07-06T23:13:43Z	info-3	trufflehog.aws	Failed to decode account number	{"detector_worker_id": "mDQPq", "detector": {"type":"AWS"}, "timeout": 10, "err": "can't get account number from AKIAJ/ASIAJ or AKIAI/ASIAI keys"}
+2026-07-06T23:13:43Z	info-4	trufflehog	Skipping result: false positive	{"detector_worker_id": "mDQPq", "detector": {"type":"AWS"}, "timeout": 10, "result": "AKIAIOSFODNN7EXAMPLE", "reason": "contains term: example"}
+```
+
+Combined with `Verify: !*noVerification` → **false** (`main.go:520`) and the all‑zero `verification_caching` block in the summary (`{"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}`), this proves the dry‑run emitted **no** live‑API verification traffic.
+
+### A.2 Transitional / terminator states
+
+- `dataErrChan closed, all chunks processed` (info‑5, carrying `"mime": "text/plain; charset=utf-8", "timeout": 60`) marks the **end of chunk feeding** for the unit.
+- The **128 per‑worker** `finished scanning chunks` lines (info‑4) precede the **single terminal** `finished scanning` summary (info‑0). Reporting this before/after distinction — many per‑worker completions vs. one aggregate summary — was an explicit goal of the investigation.
+
+### A.3 The version is `dev`
+
+The canonical default build reports `trufflehog dev`. This is *not* a release number and was deliberately **not** stamped to look like one — it is the honest default‑build value (`pkg/version/version.go:3`).
+
+### A.4 What I inferred vs. observed
+
+For transparency, the only claims **inferred from reading source** (rather than observed at runtime) are: (a) the per‑chunk `prefilter.Match` path in `FindDetectorMatches` (`ahocorasickcore.go:242`, Section 4.3), and (b) the numeric channel buffer capacities 6400 / 3200 / 6400 (derived from the constants at `engine.go:503,507,508,627`, Section 5.3). Everything else in Sections 2–6 sits next to a log line I captured.
+
+---
+
+## Appendix B — Coverage matrix (every named item, answered)
 
 | Question item | Section | Exact function/struct | `file:line` | Adjacent observed evidence |
 |---------------|---------|-----------------------|-------------|----------------------------|
