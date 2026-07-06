@@ -10,7 +10,8 @@
 
 | Parameter | Value |
 |-----------|-------|
-| Repository commit | `e42153d44a5e5c37c1bd0c70e074781e9edcb760` (verified with `git rev-parse HEAD`) |
+| Source baseline commit | `e42153d44a5e5c37c1bd0c70e074781e9edcb760` — the TruffleHog source under analysis; **all `file:line` citations resolve against it**. Verified with `git rev-parse e42153d44…` and `git log --oneline -1 e42153d44…`, **not** `git rev-parse HEAD`. |
+| Deliverable commit (HEAD) | `4e12e7640b98c222fb8d399633fbad7e7038fc8e` — the commit that adds *this* document; the only change since the baseline (verified below) |
 | Build command | `CGO_ENABLED=0 go build -o /tmp/trufflehog_bin .` |
 | Go toolchain | `go1.24.2 linux/amd64` (matches `go.mod` `toolchain go1.24.2` [go.mod:L5]) |
 | Binary version | `trufflehog dev` — this is a **default/dev build**, *not* a release value (stated per rule) |
@@ -22,11 +23,76 @@
 
 All measurements below are **my own fresh captures on this host**, each repeated ≥2–3 times. Where my absolute numbers differ from a higher-core reference machine, I say so; the qualitative conclusions are identical and are what the question turns on. This document is the sole persistent artifact of the investigation; every temporary input file, script, and the built binary were deleted afterward, leaving the repository unchanged.
 
+### Reproducibility evidence — environment, build, and commit provenance
+
+The parameter table above condenses the commands below; each is shown here with its complete, unedited output.
+
+**Source baseline vs. deliverable commit** — the analyzed source is untouched; the sole change is this document:
+
+```console
+$ git rev-parse e42153d44a5e5c37c1bd0c70e074781e9edcb760
+e42153d44a5e5c37c1bd0c70e074781e9edcb760
+$ git log --oneline -1 e42153d44a5e5c37c1bd0c70e074781e9edcb760
+e42153d4 [Fix] Added Prefix In Dockerhub Detector Regex (#4084)
+$ git log --oneline -1 HEAD
+4e12e764 docs: add ReDoS/computational-complexity DoS security analysis for TruffleHog pattern matching
+$ git diff --name-status e42153d44a5e5c37c1bd0c70e074781e9edcb760 HEAD
+A	blitzy/documentation/trufflehog_e42153d44a5e.md
+```
+
+→ The **source baseline** is `e42153d44…` (every `file:line` citation in this document resolves against it); `HEAD` (`4e12e764…`) is the **deliverable** commit. Since the baseline, `git diff --name-status` lists exactly one added file — this document — proving **zero TruffleHog source files were modified**.
+
+**Go toolchain, canonical build, exit code, and artifact:**
+
+```console
+$ go version
+go version go1.24.2 linux/amd64
+$ CGO_ENABLED=0 go build -o /tmp/trufflehog_bin . ; echo "exit=$?"
+exit=0
+$ ls -la /tmp/trufflehog_bin
+-rwxr-xr-x 1 root root 194309626 Jul  6 23:20 /tmp/trufflehog_bin
+```
+
+→ The canonical build completes with `exit=0` and no C compiler (`CGO_ENABLED=0`; go-re2 executes RE2 as WASM via wazero [go.mod:L285]), producing a ~194 MB static binary; the toolchain matches `go.mod` [go.mod:L5].
+
+**Binary version — a default/`dev` build (stated as such, not a release value; it is emitted on stderr):**
+
+```console
+$ /tmp/trufflehog_bin --version 2>&1
+trufflehog dev
+```
+
+**Host CPU count and default concurrency:**
+
+```console
+$ nproc
+4
+$ /tmp/trufflehog_bin filesystem --help 2>&1 | grep -E 'concurrency'
+      --concurrency=128          Number of concurrent workers.
+```
+
+→ The default `--concurrency=128` is `runtime.NumCPU()` [main.go:L58] = **128** on this host; `nproc` reports the cgroup quota (**4**), which caps *active* parallelism and explains the ~4-CPU sample percentages in §5. Every timing run below pins `--concurrency=1` for deterministic attribution.
+
+**Measurement flags on the canonical `filesystem` entry point** (the `no-verification` grep also matches `--[no-]no-verification-cache`; `--scan-entire-chunk` is a *hidden* flag — present on the binary but omitted from `--help`):
+
+```console
+$ /tmp/trufflehog_bin filesystem --help 2>&1 | grep -E 'no-verification|print-avg-detector-time|profile|detector-timeout'
+      --[no-]profile             Enables profiling and sets a pprof and fgprof
+      --[no-]no-verification     Don't verify the results.
+      --[no-]print-avg-detector-time  
+      --detector-timeout=DETECTOR-TIMEOUT  
+      --[no-]no-verification-cache  
+$ grep -n 'scan-entire-chunk' main.go
+68:	scanEntireChunk            = cli.Flag("scan-entire-chunk", "Scan the entire chunk for secrets.").Hidden().Default("false").Bool()
+```
+
+→ All flags used below are present: `--profile` [main.go:L53], `--no-verification` [main.go:L59], `--print-avg-detector-time` [main.go:L72], `--detector-timeout` [main.go:L77], and the hidden `--scan-entire-chunk` [main.go:L68].
+
 ---
 
 ## 1. Direct verdict
 
-**No — a crafted file cannot trigger a catastrophic-backtracking ReDoS that hangs or times out TruffleHog's scan. It is impossible by construction.** Every detector compiles its regular expression with the linear-time **RE2** engine (`github.com/wasilibs/go-re2` [go.mod:L100]), a finite-automaton matcher that performs **no backtracking**. A backtracking engine is the prerequisite for catastrophic "evil regex" blow-up; TruffleHog's detector path does not use one.
+**No — a crafted file cannot trigger a catastrophic-backtracking ReDoS that hangs or times out TruffleHog's scan. It is impossible by construction.** **No detector on the scan path uses a catastrophic-backtracking regex engine.** The overwhelming majority — **867 detector `.go` files** — compile their patterns with the linear-time **RE2** engine (`github.com/wasilibs/go-re2` [go.mod:L100]), a finite-automaton matcher that performs **no backtracking**; the remaining **3** detector files use Go's **standard-library `regexp`**, itself an RE2-derived automaton with only a *bounded* backtracker (fixed budget), so it too is ReDoS-safe (the exact 867 / 3 / 0 inventory is proven in §2). The backtracking-capable `regexp2` engine is present only as an *indirect* dependency and is used **nowhere** on the detector path. A backtracking engine is the prerequisite for catastrophic "evil regex" blow-up; TruffleHog's detector path does not use one.
 
 The **worst** an attacker can achieve against the pattern-matching layer is a **bounded, linear (constant-factor) slowdown** — never an exponential blow-up, never a hang.
 
@@ -41,7 +107,7 @@ Everything below substantiates this with complete, unedited command output next 
 
 ## 2. Regex-engine evidence — why catastrophic backtracking is impossible
 
-Catastrophic backtracking (ReDoS) requires a **backtracking** regex engine. TruffleHog's detectors do not use one; they use Google's **RE2** via the pure-Go WASM binding `go-re2`.
+Catastrophic backtracking (ReDoS) requires a **backtracking** regex engine. **No detector on TruffleHog's scan path uses one.** 867 detector files compile their patterns with Google's **RE2** via the pure-Go WASM binding `go-re2`, and the remaining 3 detector files use Go's ReDoS-safe **standard-library `regexp`** (the full 867 / 3 / 0 inventory is quantified just below).
 
 **Engine identity from `go.mod`:**
 
@@ -120,7 +186,7 @@ $ sed -n '5p;10p' pkg/common/patterns.go
 const EmailPattern = `\b((?i)(?:[a-z0-9!#$%&'*+/=?^_\x60{|}~-]+(?:\.[a-z0-9!#$%&'*+/=?^_\x60{|}~-]+)*|"(?:[\x01-\x08\x0b\x0c\x0e-\x1f\x21\x23-\x5b\x5d-\x7f]|\\[\x01-\x09\x0b\x0c\x0e-\x7f])*")@(?:(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]*[a-z0-9])?|\[(?:(?:(2(5[0-5]|[0-4][0-9])|1[0-9][0-9]|[1-9]?[0-9]))\.){3}(?:(2(5[0-5]|[0-4][0-9])|1[0-9][0-9]|[1-9]?[0-9])|[a-z0-9-]*[a-z0-9]:(?:[\x01-\x08\x0b\x0c\x0e-\x1f\x21-\x5a\x53-\x7f]|\\[\x01-\x09\x0b\x0c\x0e-\x7f])+)\]))\b`
 ```
 
-`common.EmailPattern` [patterns.go:L10] is the most structurally complex shared building block — it is the RFC-5322-flavored email regex, embedded in ~16 detectors. Notably, `pkg/common/patterns.go` imports the **Go standard library** `"regexp"` [patterns.go:L5] (not go-re2), so patterns built purely from this constant compile under the stdlib engine — again, RE2-derived and ReDoS-safe. The `alegra` detector combines it with a prefix:
+`common.EmailPattern` [patterns.go:L10] is the most structurally complex shared building block — it is the RFC-5322-flavored email regex, embedded in ~16 detectors. Crucially, **it is only a `const` string** [patterns.go:L10] — it compiles no regex by itself, so **the engine that executes it is decided by whichever detector `MustCompile`s it**, not by `pkg/common/patterns.go`. (That file's stdlib `"regexp"` import [patterns.go:L5] is used only by its helper *functions*, e.g. `PrefixRegex` — not to compile `EmailPattern`.) The named `alegra` candidate imports `regexp "github.com/wasilibs/go-re2"` [alegra.go:L10] and compiles the combined pattern with **go-re2 / RE2**:
 
 ```console
 $ sed -n '28p;42p' pkg/detectors/alegra/alegra.go
@@ -128,7 +194,7 @@ $ sed -n '28p;42p' pkg/detectors/alegra/alegra.go
 	idMatches := idPat.FindAllStringSubmatch(dataStr, -1)
 ```
 
-`idPat` [alegra.go:L28] = `PrefixRegex(["alegra"]) + common.EmailPattern`, executed via `idPat.FindAllStringSubmatch(dataStr, -1)` [alegra.go:L42] (the API-key half runs at [alegra.go:L41]). Keyword: `alegra`.
+`idPat` [alegra.go:L28] = `PrefixRegex(["alegra"]) + common.EmailPattern`, **compiled with go-re2** (the file's `regexp` alias [alegra.go:L10]) and executed via `idPat.FindAllStringSubmatch(dataStr, -1)` [alegra.go:L42] (the API-key half runs at [alegra.go:L41]). Keyword: `alegra`. So for this candidate the complex email pattern runs on **RE2** — the linear-time guarantee applies to it, not the stdlib engine.
 
 ### 3.3 Representative detector — `anthropic`
 
@@ -217,7 +283,7 @@ $ /tmp/trufflehog_bin filesystem /tmp/redos_lab/attack_span.bin --no-verificatio
 2026-07-06T22:40:14Z	info-0	trufflehog	finished scanning	{"chunks": 820, "bytes": 10903552, "verified_secrets": 0, "unverified_secrets": 0, "scan_duration": "267.890989ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
 ```
 
-For the attack file, `--print-avg-detector-time` prints **only its header and no detector lines**, because the accounting runs only when a detector returns ≥ 1 result [main.go:L963-L964] and the evil input matches nothing:
+For the attack file, `--print-avg-detector-time` prints **only its header and no detector lines**, because the per-detector accounting is result-gated — it runs only when a detector returns ≥ 1 result: `if e.printAvgDetectorTime && len(results) > 0` [engine.go:L1092-L1104]. (The CLI-level print call itself is `if *printAvgDetectorTime { printAverageDetectorTime(eng) }` [main.go:L963-L964].) The evil input matches nothing, so the accounting map stays empty:
 
 ```console
 $ grep -A0 'Average detector time' attack.err
@@ -467,18 +533,18 @@ This bypasses the ±512 B span limit [ahocorasickcore.go:L155] and feeds the reg
 ```console
 $ python3 -c "open('/tmp/redos_lab/bigrun.bin','wb').write((b'mongodb://'+b'a'*12000+b'!\n')*64)"
 $ python3 timeit.py BIGRUN_DEFAULT 2 -- /tmp/trufflehog_bin filesystem /tmp/redos_lab/bigrun.bin --no-verification --concurrency=1
-[BIGRUN_DEFAULT] run1: wall=1.746s user=1.726s sys=0.211s rc=0
-[BIGRUN_DEFAULT] run2: wall=1.771s user=1.726s sys=0.259s rc=0
+[BIGRUN_DEFAULT] run1: wall=1.738s user=1.751s sys=0.200s rc=0
+[BIGRUN_DEFAULT] run2: wall=1.742s user=1.756s sys=0.192s rc=0
 $ python3 timeit.py BIGRUN_ENTIRE 2 -- /tmp/trufflehog_bin filesystem /tmp/redos_lab/bigrun.bin --no-verification --concurrency=1 --scan-entire-chunk
-[BIGRUN_ENTIRE] run1: wall=1.764s user=1.752s sys=0.231s rc=0
-[BIGRUN_ENTIRE] run2: wall=1.745s user=1.759s sys=0.212s rc=0
+[BIGRUN_ENTIRE] run1: wall=1.799s user=1.790s sys=0.218s rc=0
+[BIGRUN_ENTIRE] run2: wall=1.741s user=1.759s sys=0.196s rc=0
 $ /tmp/trufflehog_bin filesystem /tmp/redos_lab/bigrun.bin --no-verification --concurrency=1 >/dev/null 2>br_def.err ; grep 'finished scanning' br_def.err
-… "chunks": 76, "bytes": 996864, "verified_secrets": 0, "unverified_secrets": 0, "scan_duration": "24.254559ms" …
+2026-07-06T23:14:47Z	info-0	trufflehog	finished scanning	{"chunks": 76, "bytes": 996864, "verified_secrets": 0, "unverified_secrets": 0, "scan_duration": "23.958523ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
 $ /tmp/trufflehog_bin filesystem /tmp/redos_lab/bigrun.bin --no-verification --concurrency=1 --scan-entire-chunk >/dev/null 2>br_ent.err ; grep 'finished scanning' br_ent.err
-… "chunks": 76, "bytes": 996864, "verified_secrets": 0, "unverified_secrets": 0, "scan_duration": "23.902227ms" …
+2026-07-06T23:14:49Z	info-0	trufflehog	finished scanning	{"chunks": 76, "bytes": 996864, "verified_secrets": 0, "unverified_secrets": 0, "scan_duration": "24.359568ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
 ```
 
-Default (span-limited) **1.746 / 1.771 s** vs `--scan-entire-chunk` **1.764 / 1.745 s** — **identical** (scan_duration 24.25 ms vs 23.90 ms). Even handing the regex a full 12000-character evil run per chunk produces **no blow-up**. This is the most direct proof that RE2 handles the pattern's worst case in linear time.
+Default (span-limited) **1.738 / 1.742 s** vs `--scan-entire-chunk` **1.799 / 1.741 s** — **identical** (scan_duration 23.96 ms vs 24.36 ms). Even handing the regex a full 12000-character evil run per chunk produces **no blow-up**. This is the most direct proof that RE2 handles the pattern's worst case in linear time.
 
 ### 8.3 Base64 decoder amplification
 
@@ -518,18 +584,40 @@ $ grep -nE 'archive-max-size|archive-max-depth|archive-timeout' main.go
 | # | Question part | Answer | Evidence |
 |---|---|---|---|
 | a | Can an attacker who commits a crafted file make TruffleHog **hang / time out** and block the pipeline? | **No.** No hang is possible; worst case is a bounded linear slowdown. The soft timeout wouldn't even need to fire because RE2 completes in linear time. | §1, §7, §8 |
-| b | Is the **regex layer exploitable** (catastrophic backtracking / ReDoS)? | **No — impossible by construction.** Detectors compile with linear-time RE2 (`go-re2`), which has no backtracking; the profile is 87.72% RE2-automaton `_ExternalCode` with < 2% *bounded* stdlib backtracking. | §2, §5 |
-| c | **Which patterns** are exploitable? | **None.** The most "dangerous-looking" candidates — `mongodb.connStrPat` (nested `(?:,…)*`/`(?:&…)*`) [mongodb.go:L32], `common.EmailPattern` [patterns.go:L10] via `alegra` [alegra.go:L28], and representative `anthropic` [anthropic.go:L27] — all run linearly under RE2. | §3, §8.2 |
+| b | Is the **regex layer exploitable** (catastrophic backtracking / ReDoS)? | **No — impossible by construction.** No detector on the scan path uses a catastrophic-backtracking engine: **867** detector files compile with linear-time RE2 (`go-re2`) and **3** use Go's ReDoS-safe stdlib `regexp` (`regexp2` is indirect/unused). The profile is 87.72% RE2-automaton `_ExternalCode` with < 2% *bounded* stdlib backtracking. | §2, §5 |
+| c | **Which patterns** are exploitable? | **None.** The most "dangerous-looking" candidates — `mongodb.connStrPat` (nested `(?:,…)*`/`(?:&…)*`) [mongodb.go:L32], the `common.EmailPattern` *string constant* [patterns.go:L10] as compiled by `alegra` with go-re2 [alegra.go:L10,L28], and representative `anthropic` [anthropic.go:L27] — all run linearly under RE2. | §3, §8.2 |
 | d | **How much slower** is a crafted file than a normal file of **equivalent size**? | **Not slower — ratio ≈ 0.97×** at 8 MiB. A file of *legitimate* matches costs more (~2.2×) but only linearly in match count (1216 matches), never exponentially. | §4 Tables 1 & 2 |
 | e | **Timing + CPU-profiling evidence** provided? | **Yes** — `time`/per-run wall+user+sys, `--print-avg-detector-time` (`MongoDB: 29.437232ms`), pprof (`runtime._ExternalCode` 87.72%), and fgprof (`runtime.gopark` 84.31%). | §4, §5 |
 
-**Named items addressed explicitly:** flags `--no-verification` [main.go:L59], `--concurrency` [main.go:L58], `--print-avg-detector-time` [main.go:L72], `--profile` [main.go:L53], `--scan-entire-chunk` [main.go:L68], `--detector-timeout` [main.go:L77], `--archive-max-size/-max-depth/-timeout` [main.go:L78-L80]. Mechanisms: Aho-Corasick prefilter [ahocorasickcore.go:L127,L241; engine.go:L795], ±512 B span limiting [ahocorasickcore.go:L155,L160], 10 KiB chunking [chunker.go:L14-L18], decoder chain [decoders.go:L8-L16], soft timeout [engine.go:L1066-L1068,L1076-L1077; http.go:L18], metrics [metrics.go:L38-L46]. Patterns/files: `mongodb` [mongodb.go:L14,L32,L40,L44,L49], `common.EmailPattern` [patterns.go:L5,L10], `alegra` [alegra.go:L28,L41,L42], `anthropic` [anthropic.go:L27,L36,L37,L44], `Detector` contract [detectors.go:L19,L21,L24,L87], filesystem source [filesystem.go:L73,L85]. Engines: `go-re2 v1.9.0` [go.mod:L100], `wazero v1.9.0` [go.mod:L285], `aho-corasick v1.0.3` [go.mod:L17], `fgprof v0.9.5` [go.mod:L46], `regexp2 v1.4.0` indirect/unused [go.mod:L187].
+**Named items addressed explicitly:** flags `--no-verification` [main.go:L59], `--concurrency` [main.go:L58], `--print-avg-detector-time` [main.go:L72], `--profile` [main.go:L53], `--scan-entire-chunk` [main.go:L68], `--detector-timeout` [main.go:L77], `--archive-max-size/-max-depth/-timeout` [main.go:L78-L80]. Mechanisms: Aho-Corasick prefilter [ahocorasickcore.go:L127,L241; engine.go:L795], ±512 B span limiting [ahocorasickcore.go:L155,L160], 10 KiB chunking [chunker.go:L14-L18], decoder chain [decoders.go:L8-L16], soft timeout [engine.go:L1066-L1068,L1076-L1077; http.go:L18], metrics [metrics.go:L38-L46]. Patterns/files: `mongodb` [mongodb.go:L14,L32,L40,L44,L49], `common.EmailPattern` [patterns.go:L5,L10], `alegra` [alegra.go:L10,L28,L41,L42], `anthropic` [anthropic.go:L27,L36,L37,L44], `Detector` contract [detectors.go:L19,L21,L24,L87], filesystem source [filesystem.go:L73,L85]. Engines: `go-re2 v1.9.0` [go.mod:L100], `wazero v1.9.0` [go.mod:L285], `aho-corasick v1.0.3` [go.mod:L17], `fgprof v0.9.5` [go.mod:L46], `regexp2 v1.4.0` indirect/unused [go.mod:L187].
 
 ### Practical CI takeaway
 
 TruffleHog's **regex pattern-matching cannot be weaponized into a ReDoS hang** — the engine choice (linear-time RE2) makes catastrophic backtracking impossible, and five further defense layers bound attacker impact to a linear constant factor. The only realistic residual cost is **linear**: a file stuffed with many *valid-looking* secrets costs more only in proportion to the number of matches (my 1216-match 8 MiB file took ~4.4 s vs ~2.0 s for a non-matching file of the same size). If **total scan throughput** on very large inputs is a CI concern, address it as a *linear-scaling/throughput* consideration (input size limits, parallelism, path filtering) — **not** as a catastrophic-backtracking vulnerability, because that vulnerability class does not exist on this detector path.
 
 > **Caveat worth flagging to operators:** the per-detector `--detector-timeout` is **soft/advisory** — it logs but does not preempt a CPU-bound detector (§7). This is harmless given RE2's linear-time guarantee, but operators should not rely on `--detector-timeout` as a hard kill-switch for a runaway detector. For the *adjacent* archive vector (§9), use `--archive-max-size/-max-depth/-timeout` instead.
+
+## 11. Cleanup & repository-unchanged evidence
+
+Per the read-only constraint, every temporary artifact created for this investigation — the built binary (`/tmp/trufflehog_bin`), the `/tmp/redos_lab` input files, and the observation scripts — is deleted, leaving the repository with **only** this document changed:
+
+```console
+$ rm -rf /tmp/redos_lab /tmp/trufflehog_bin
+$ ls -d /tmp/redos_lab /tmp/trufflehog_bin 2>&1
+ls: cannot access '/tmp/redos_lab': No such file or directory
+ls: cannot access '/tmp/trufflehog_bin': No such file or directory
+```
+
+The working tree then shows exactly one changed path (this document) and **zero** TruffleHog source files; `git diff --name-status` against the source baseline confirms the document is the only addition since `e42153d44…`:
+
+```console
+$ git status --porcelain
+ M blitzy/documentation/trufflehog_e42153d44a5e.md
+$ git diff --name-status e42153d44a5e5c37c1bd0c70e074781e9edcb760 HEAD
+A	blitzy/documentation/trufflehog_e42153d44a5e.md
+```
+
+→ The single ` M` entry is this very revision of the answer document (committed as the deliverable); no `pkg/**`, `main.go`, `go.mod`, or `go.sum` file is modified. TruffleHog's source is untouched — exactly as required.
 
 ---
 
