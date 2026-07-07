@@ -274,11 +274,15 @@ $ python3 timeit.py BENIGN_KW 3 -- /tmp/trufflehog_bin filesystem /tmp/redos_lab
 
 **Ratio attack:benign = 1.986 / 2.038 ≈ 0.97× — no meaningful difference.** Scale: 8 MiB, `chunks=820` per scan; values stable across 3 runs. The attack file is *not* slower; it is marginally faster because it yields zero matches.
 
-The scan metadata confirms equal work and zero secrets (note the attack's `scan_duration` is *lower* than benign):
+The scan metadata for **all three** files confirms equal work — each reports `chunks=820`, `bytes=10903552` and zero secrets — and directly substantiates the headline that the attack's `scan_duration` is *lower* than either benign file (the attack is, if anything, marginally faster because it produces zero matches):
 
 ```console
 $ /tmp/trufflehog_bin filesystem /tmp/redos_lab/attack_span.bin --no-verification --concurrency=1 --print-avg-detector-time >/dev/null 2>attack.err ; grep 'finished scanning' attack.err
-2026-07-06T22:40:14Z	info-0	trufflehog	finished scanning	{"chunks": 820, "bytes": 10903552, "verified_secrets": 0, "unverified_secrets": 0, "scan_duration": "267.890989ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
+2026-07-07T02:31:19Z	info-0	trufflehog	finished scanning	{"chunks": 820, "bytes": 10903552, "verified_secrets": 0, "unverified_secrets": 0, "scan_duration": "271.744712ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
+$ /tmp/trufflehog_bin filesystem /tmp/redos_lab/benign_nokeyword.bin --no-verification --concurrency=1 --print-avg-detector-time >/dev/null 2>benign_nokw.err ; grep 'finished scanning' benign_nokw.err
+2026-07-07T02:31:21Z	info-0	trufflehog	finished scanning	{"chunks": 820, "bytes": 10903552, "verified_secrets": 0, "unverified_secrets": 0, "scan_duration": "332.298111ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
+$ /tmp/trufflehog_bin filesystem /tmp/redos_lab/benign_keyword.bin --no-verification --concurrency=1 --print-avg-detector-time >/dev/null 2>benign_kw.err ; grep 'finished scanning' benign_kw.err
+2026-07-07T02:31:23Z	info-0	trufflehog	finished scanning	{"chunks": 820, "bytes": 10903552, "verified_secrets": 0, "unverified_secrets": 0, "scan_duration": "361.786435ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
 ```
 
 For the attack file, `--print-avg-detector-time` prints **only its header and no detector lines**, because the per-detector accounting is result-gated — it runs only when a detector returns ≥ 1 result: `if e.printAvgDetectorTime && len(results) > 0` [engine.go:L1092-L1104]. (The CLI-level print call itself is `if *printAvgDetectorTime { printAverageDetectorTime(eng) }` [main.go:L963-L964].) The evil input matches nothing, so the accounting map stays empty:
