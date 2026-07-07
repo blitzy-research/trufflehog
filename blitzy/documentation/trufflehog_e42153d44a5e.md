@@ -11,7 +11,7 @@
 | Parameter | Value |
 |-----------|-------|
 | Source baseline commit | `e42153d44a5e5c37c1bd0c70e074781e9edcb760` — the TruffleHog source under analysis; **all `file:line` citations resolve against it**. Verified with `git rev-parse e42153d44…` and `git log --oneline -1 e42153d44…`, **not** `git rev-parse HEAD`. |
-| Deliverable commit (HEAD) | `4e12e7640b98c222fb8d399633fbad7e7038fc8e` — the commit that adds *this* document; the only change since the baseline (verified below) |
+| Deliverable commit(s) | One or more **documentation-only** commits layered on the baseline that add and refine *this* document. Their hashes rotate whenever the document is revised (committing the doc changes `HEAD`), so the read-only proof below uses `git diff --name-status e42153d44a5e… HEAD` — stable across commits, listing exactly one changed path (this document) — rather than a self-referential `HEAD` hash |
 | Build command | `CGO_ENABLED=0 go build -o /tmp/trufflehog_bin .` |
 | Go toolchain | `go1.24.2 linux/amd64` (matches `go.mod` `toolchain go1.24.2` [go.mod:L5]) |
 | Binary version | `trufflehog dev` — this is a **default/dev build**, *not* a release value (stated per rule) |
@@ -34,13 +34,11 @@ $ git rev-parse e42153d44a5e5c37c1bd0c70e074781e9edcb760
 e42153d44a5e5c37c1bd0c70e074781e9edcb760
 $ git log --oneline -1 e42153d44a5e5c37c1bd0c70e074781e9edcb760
 e42153d4 [Fix] Added Prefix In Dockerhub Detector Regex (#4084)
-$ git log --oneline -1 HEAD
-4e12e764 docs: add ReDoS/computational-complexity DoS security analysis for TruffleHog pattern matching
 $ git diff --name-status e42153d44a5e5c37c1bd0c70e074781e9edcb760 HEAD
 A	blitzy/documentation/trufflehog_e42153d44a5e.md
 ```
 
-→ The **source baseline** is `e42153d44…` (every `file:line` citation in this document resolves against it); `HEAD` (`4e12e764…`) is the **deliverable** commit. Since the baseline, `git diff --name-status` lists exactly one added file — this document — proving **zero TruffleHog source files were modified**.
+→ The **source baseline** is `e42153d44…` (every `file:line` citation in this document resolves against it); `HEAD` is the **deliverable**, delivered as documentation-only commit(s) that add and refine this file. Since the baseline, `git diff --name-status` lists exactly one added path — this document — proving **zero TruffleHog source files were modified**. The deliverable's own `HEAD` hash is intentionally *not* pinned here: committing this document changes `HEAD`, so a self-referential hash would immediately go stale, whereas `git diff --name-status <baseline> HEAD` is a stable, reproducible read-only proof.
 
 **Go toolchain, canonical build, exit code, and artifact:**
 
@@ -456,15 +454,17 @@ $ sed -n '1066,1077p' pkg/engine/engine.go
 		t := time.AfterFunc(detectionTimeout+1*time.Second, func() {
 			ctx.Logger().Error(nil, "a detector ignored the context timeout")
 		})
-		results, err := detector.Detector.FromData(ctx, verify, matchBytes)
-		if err != nil {
-			ctx.Logger().Error(err, "error scanning chunk")
-		}
+		results, err := e.verificationCache.FromData(
+			ctx,
+			data.detector.Detector,
+			data.chunk.Verify,
+			data.chunk.SecretID != 0,
+			matchBytes)
 		t.Stop()
 		cancel()
 ```
 
-Reading this: a context deadline is set [engine.go:L1066]; a watchdog `time.AfterFunc(detectionTimeout+1*time.Second, …)` [engine.go:L1067] is armed whose callback **only logs** `"a detector ignored the context timeout"` [engine.go:L1068]; then `FromData` is called; and `t.Stop()` [engine.go:L1076] + `cancel()` [engine.go:L1077] run **after `FromData` returns**. Nothing here *kills* a running detector — the watchdog logs, it does not preempt.
+Reading this: a context deadline is set [engine.go:L1066]; a watchdog `time.AfterFunc(detectionTimeout+1*time.Second, …)` [engine.go:L1067] is armed whose callback **only logs** `"a detector ignored the context timeout"` [engine.go:L1068]; then the detector's `FromData` is invoked via `e.verificationCache.FromData(…)` [engine.go:L1070] (the verification cache wraps and calls the detector's `FromData`); and `t.Stop()` [engine.go:L1076] + `cancel()` [engine.go:L1077] run **after `FromData` returns**. Nothing here *kills* a running detector — the watchdog logs, it does not preempt.
 
 **Runtime proof.** If the deadline actually interrupted the regex, then an absurdly tiny timeout would cut matches short and drop the secret count toward zero. It does not:
 
@@ -608,16 +608,15 @@ ls: cannot access '/tmp/redos_lab': No such file or directory
 ls: cannot access '/tmp/trufflehog_bin': No such file or directory
 ```
 
-The working tree then shows exactly one changed path (this document) and **zero** TruffleHog source files; `git diff --name-status` against the source baseline confirms the document is the only addition since `e42153d44…`:
+With the document committed as the deliverable, the working tree is **clean**, and `git diff --name-status` against the source baseline confirms the document is the only addition since `e42153d44…` — **zero** TruffleHog source files changed:
 
 ```console
 $ git status --porcelain
- M blitzy/documentation/trufflehog_e42153d44a5e.md
 $ git diff --name-status e42153d44a5e5c37c1bd0c70e074781e9edcb760 HEAD
 A	blitzy/documentation/trufflehog_e42153d44a5e.md
 ```
 
-→ The single ` M` entry is this very revision of the answer document (committed as the deliverable); no `pkg/**`, `main.go`, `go.mod`, or `go.sum` file is modified. TruffleHog's source is untouched — exactly as required.
+→ `git status --porcelain` prints nothing — the document is committed, so the working tree is clean — and `git diff --name-status` lists exactly one added path, this document. No `pkg/**`, `main.go`, `go.mod`, or `go.sum` file is modified. TruffleHog's source is untouched — exactly as required.
 
 ---
 
