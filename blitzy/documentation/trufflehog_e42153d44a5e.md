@@ -401,7 +401,7 @@ func (ac *Core) FindDetectorMatches(chunkData []byte) []*DetectorMatch {
 }
 ```
 
-> *Labeled inference.* I did not directly observe a per‑chunk log line for `FindDetectorMatches` in this run; the `Match` path (`ahocorasickcore.go:242`) is **inferred from reading the source**. What *is* observed is that a matching detector actually ran on the chunk — the AWS detector's `trufflehog.aws` log lines appear (Section 5.4), which is only possible if the prefilter matched the chunk to the AWS detector.
+> *Labeled inference.* I did not directly observe a per‑chunk log line for `FindDetectorMatches` in this run; the `Match` path (`ahocorasickcore.go:242`) is **inferred from reading the source**. What *is* observed is that a matching detector actually ran on the chunk — the AWS detector's log lines appear (Section 5.4), which is only possible if the prefilter matched the chunk to the AWS detector.
 
 ### 4.4 The detector set (no exact count asserted)
 
@@ -554,7 +554,7 @@ This before/after distinction is important and was explicitly exercised:
 2026-07-06T23:13:39Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 106, "verified_secrets": 0, "unverified_secrets": 0, "scan_duration": "5.362495ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
 ```
 
-**Observed concurrency evidence (interleaving).** In the `--log-level=5` capture the 128 `finished scanning chunks` lines actually span 130 output lines, because the two `trufflehog.aws` detector lines (below) interleave *between* chunk‑completion lines. That interleaving is direct, observed proof that the scanner and detector pools run concurrently; their relative ordering varies run‑to‑run while the counts stay fixed.
+**Observed concurrency evidence (interleaving).** In the `--log-level=5` capture the 128 `finished scanning chunks` lines actually span 130 output lines, because the two AWS detector lines (below) — one under the `trufflehog.aws` child logger, one under the base `trufflehog` logger — interleave *between* chunk‑completion lines. That interleaving is direct, observed proof that the scanner and detector pools run concurrently; their relative ordering varies run‑to‑run while the counts stay fixed.
 
 **Causal reasoning.** The buffered channels implement a classic **fan‑out / fan‑in**: the source manager enumerates and chunks a source, scanner workers decode chunks and match detectors (pushing onto `detectableChunksChan`/`verificationOverlapChunksChan`), detector workers run detection and push results onto `results`, and notifier workers write output. The buffers let each stage proceed without lock‑stepping the others.
 
@@ -653,7 +653,7 @@ At this level the engine‑initialization (`info-4`), chunking (`info-3`), and p
 $ /tmp/trufflehog filesystem /tmp/th_scan --no-verification --log-level=5
 ```
 
-**Output (captured 2026-07-06T23:13:43Z).** This is the **complete, unedited** output — **all 147 lines in their observed order, nothing collapsed or elided**. It includes every one of the **128** `finished scanning chunks` lines (each carrying a distinct 5-character `scanner_worker_id` from `common.RandomID(5)`), plus the two `trufflehog.aws` detector lines that **interleave** among the chunk-completion lines:
+**Output (captured 2026-07-06T23:13:43Z).** This is the **complete, unedited** output — **all 147 lines in their observed order, nothing collapsed or elided**. It includes every one of the **128** `finished scanning chunks` lines (each carrying a distinct 5-character `scanner_worker_id` from `common.RandomID(5)`), plus the two AWS detector lines (one under the `trufflehog.aws` child logger, one under the base `trufflehog` logger) that **interleave** among the chunk-completion lines:
 
 ```text
 2026-07-06T23:13:43Z	info-2	trufflehog	trufflehog dev
@@ -811,7 +811,7 @@ $ /tmp/trufflehog filesystem /tmp/th_scan --no-verification --log-level=5
 
 ### A.1 Dry‑run safety proof (a boundary case)
 
-The seeded AWS key produces **both** `verified_secrets: 0` **and** `unverified_secrets: 0`. That is not merely because verification was disabled — it is because the AWS detector **filters the fake key out as a false positive before it ever becomes a result**. Observed at `--log-level=5`, from the `trufflehog.aws` child logger:
+The seeded AWS key produces **both** `verified_secrets: 0` **and** `unverified_secrets: 0`. That is not merely because verification was disabled — it is because the AWS detector **filters the fake key out as a false positive before it ever becomes a result**. Observed at `--log-level=5`, from the AWS detector (the first line under the `trufflehog.aws` child logger, the second under the base `trufflehog` logger):
 
 ```text
 2026-07-06T23:13:43Z	info-3	trufflehog.aws	Failed to decode account number	{"detector_worker_id": "mDQPq", "detector": {"type":"AWS"}, "timeout": 10, "err": "can't get account number from AKIAJ/ASIAJ or AKIAI/ASIAI keys"}
