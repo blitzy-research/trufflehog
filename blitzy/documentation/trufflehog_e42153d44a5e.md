@@ -20,7 +20,24 @@ It resolves all six sub‑questions explicitly and by name:
 
 **Methodology (run‑first):** every factual claim below is backed by output captured from a canonical build of this commit, exercised through the real `trufflehog filesystem` entry point (`main.go:143`). Code `file:line` citations are the grounding; the captured output is the primary evidence. All fixtures, scripts, and binaries were created outside the repository tree and removed afterward (see §10); the only persisted change is this document.
 
-**A note on the keys used.** The verified public test key `AKIAYVP4CIPPERUVIFXG` shown in `README.md:197-199` lives in the *external* module `github.com/trufflesecurity/test_keys`, not in this repo, and the AWS‑documentation example id `AKIAIOSFODNN7EXAMPLE` is filtered out by the detector (demonstrated below). The AWS fixtures therefore use a **synthetic, randomly‑generated, non‑verifiable** AWS‑format key id `AKIA2HAFCFGWPBBBW43J` with secret `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`. These are not real credentials; all runs use `--no-verification`, so the keys surface only as *unverified* results.
+**A note on the keys used.** The verified public test key `AKIAYVP4CIPPERUVIFXG` shown in `README.md:197-199` lives in the *external* module `github.com/trufflesecurity/test_keys`, not in this repo, and the AWS‑documentation example id `AKIAIOSFODNN7EXAMPLE` is dropped as a **known false positive** by the engine's false‑positive filter (`engine.go:1141-1142` invokes `detectors.FilterKnownFalsePositives`, `pkg/detectors/falsepositives.go:177`) because its lowercased form contains the term `example` — the "contains term" branch of `IsKnownFalsePositive` (`falsepositives.go:85`, `falsepositives.go:95-99`); this is shown by the observed output immediately below. The AWS fixtures therefore use a **synthetic, randomly‑generated, non‑verifiable** AWS‑format key id `AKIA2HAFCFGWPBBBW43J` with secret `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`. These are not real credentials; all runs use `--no-verification`, so the keys surface only as *unverified* results.
+
+*Observed evidence for the example‑id filtering.* The AWS‑documentation example pair `aws_access_key_id = AKIAIOSFODNN7EXAMPLE aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY` (a 106‑byte fixture) yields **zero** results — `finished scanning` reports `"unverified_secrets": 0`:
+```text
+$ /tmp/th_investigation/trufflehog filesystem /tmp/th_investigation/fixtures/g_examplekey --no-verification --results=verified,unverified,unknown
+🐷🔑🐷  TruffleHog. Unearth your secrets. 🐷🔑🐷
+
+2026-07-07T00:11:37Z	info-0	trufflehog	running source	{"source_manager_worker_id": "qGpHJ", "with_units": true}
+2026-07-07T00:11:37Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 106, "verified_secrets": 0, "unverified_secrets": 0, "scan_duration": "4.699515ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
+```
+
+Re‑running the identical scan at `--log-level=4` and filtering with `grep` (the per‑worker "finished scanning chunks" shutdown lines are excluded *by the `grep` in the command shown*, so the block below is exactly what that command emits) surfaces the engine's `V(4)` skip log naming the reason:
+```text
+$ /tmp/th_investigation/trufflehog filesystem /tmp/th_investigation/fixtures/g_examplekey --log-level=4 --no-verification --results=verified,unverified,unknown 2>&1 | grep 'Skipping result: false positive'
+2026-07-07T00:12:42Z	info-4	trufflehog	Skipping result: false positive	{"detector_worker_id": "fUEME", "detector": {"type":"AWS"}, "timeout": 10, "result": "AKIAIOSFODNN7EXAMPLE", "reason": "contains term: example"}
+```
+
+The skip log is emitted at `falsepositives.go:194` (`ctx.Logger().V(4).Info("Skipping result: false positive", "result", string(result.Raw), "reason", reason)`) immediately before the result is discarded via `continue` (`falsepositives.go:195`); the `reason` string `contains term: example` is constructed by the "contains term" branch of `IsKnownFalsePositive` (`falsepositives.go:98`). The filtered value is the AWS **access key id** (`result.Raw`), which is why this synthetic‑key note uses a randomly‑generated id instead of the AWS‑documentation example.
 
 ---
 
@@ -40,10 +57,10 @@ The module targets `go 1.23.1` with `toolchain go1.24.2` (`go.mod:3`, `go.mod:5`
 **Canonical build command and result:**
 
 ```text
-$ CGO_ENABLED=0 go build -o /tmp/th_investigation/trufflehog .
+$ CGO_ENABLED=0 go build -o /tmp/th_investigation/trufflehog . && echo BUILD_OK
 BUILD_OK
 $ ls -la /tmp/th_investigation/trufflehog
--rwxr-xr-x 1 root root 194183078 Jul  6 22:33 /tmp/th_investigation/trufflehog
+-rwxr-xr-x 1 root root 194183078 Jul  6 23:36 /tmp/th_investigation/trufflehog
 ```
 
 (The AAP‑canonical form is `CGO_ENABLED=0 go build -o trufflehog .`; only the output path differs.)
@@ -57,7 +74,17 @@ trufflehog dev
 
 All output shown below therefore comes from build `trufflehog dev` on Go 1.24.3.
 
-**Concurrency:** the container reports `nproc` = **128**, and `--concurrency` defaults to `runtime.NumCPU()` (`main.go:58`), so the engine runs 128 workers per pool. This matters: it makes arrival order at the notifier non‑deterministic, which is directly observable in §5.
+**Concurrency:** the container reports `nproc` = **128**, and `--concurrency` defaults to `runtime.NumCPU()` (`main.go:58`). The engine does **not** run one flat pool of that size — it starts four pools whose sizes derive from `concurrency`: the **scanner** pool is `concurrency` workers (`engine.go:663-664`); the **detector** pool is `concurrency × detectorWorkerMultiplier`, where the multiplier defaults to **8** (`engine.go:676`, default set at `engine.go:345`); the **verification‑overlap** and **notifier** pools are each `concurrency × 1` (multipliers default to `1` at `engine.go:353` and `engine.go:349`; pool sizes computed at `engine.go:691` and `engine.go:706`). On this 128‑CPU host that is **128 scanner, 1024 detector, 128 verification‑overlap, and 128 notifier** workers — confirmed by the engine's own `V(2)` startup log:
+
+```text
+$ /tmp/th_investigation/trufflehog filesystem /tmp/th_investigation/fixtures/a_plaintext --log-level=4 --no-verification --results=verified,unverified,unknown 2>&1 | grep 'starting .* workers'
+2026-07-07T00:17:02Z	info-2	trufflehog	starting scanner workers	{"count": 128}
+2026-07-07T00:17:02Z	info-2	trufflehog	starting detector workers	{"count": 1024}
+2026-07-07T00:17:02Z	info-2	trufflehog	starting verificationOverlap workers	{"count": 128}
+2026-07-07T00:17:02Z	info-2	trufflehog	starting notifier workers	{"count": 128}
+```
+
+This matters because having multiple concurrent workers per pool makes the **arrival order** of results at the notifier non‑deterministic, which is directly observable in §5 (which decoder type survives dedup for fixture (d), and which detector carries the overlap error for fixture (f)).
 
 **Invocation flags used** (default configuration as a normal user would run it, plus the result selection needed to surface *unverified* keys):
 
@@ -135,7 +162,8 @@ detectors:
 
 ## 4. Per‑condition runs (complete, unedited output)
 
-Each fixture was run through the real entry point in both plain and JSON modes. The plain runs are shown with their **complete** terminal output including the stderr banner (timestamps and the random `source_manager_worker_id` vary run‑to‑run). The `Detector Type:` / `Decoder Type:` (plain, `pkg/output/plain.go:63-64`) and `DetectorName` / `DecoderName` (JSON, `pkg/output/json.go:63,65`) fields are quoted exactly as printed.
+Each fixture was run through the real entry point in **both** plain and JSON modes, and the **complete, unedited** output of each invocation is shown below — the exact command on the first `$` line, then everything the process wrote to the terminal (`2>&1`): the stderr banner/logs and the stdout results, in the order they were emitted. In plain mode the run‑variable fields are the log timestamps, the random `source_manager_worker_id`, the `scan_duration`, and (because `ExtraData` is a Go map) the relative order of the `Account:`/`Resource_type:` lines. In JSON mode the two structured log lines (`"msg":"running source"` and `"msg":"finished scanning"`) frame the result object(s). The `Detector Type:` / `Decoder Type:` (plain, `pkg/output/plain.go:63-64`) and `DetectorName` / `DecoderName` (JSON, `pkg/output/json.go:63,65`) fields are quoted exactly as printed.
+
 
 ### (a) Plain text — 1 result, `Decoder Type: PLAIN`
 
@@ -143,8 +171,7 @@ Each fixture was run through the real entry point in both plain and JSON modes. 
 $ /tmp/th_investigation/trufflehog filesystem /tmp/th_investigation/fixtures/a_plaintext --no-verification --results=verified,unverified,unknown
 🐷🔑🐷  TruffleHog. Unearth your secrets. 🐷🔑🐷
 
-2026-07-06T22:50:02Z	info-0	trufflehog	running source	{"source_manager_worker_id": "rlGiE", "with_units": true}
-2026-07-06T22:50:02Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 106, "verified_secrets": 0, "unverified_secrets": 1, "scan_duration": "5.637252ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
+2026-07-06T23:50:34Z	info-0	trufflehog	running source	{"source_manager_worker_id": "HwhQn", "with_units": true}
 Found unverified result 🐷🔑❓
 Detector Type: AWS
 Decoder Type: PLAIN
@@ -153,18 +180,27 @@ Account: 702237780396
 Resource_type: Access key
 File: /tmp/th_investigation/fixtures/a_plaintext/secrets.txt
 Line: 1
+
+2026-07-06T23:50:34Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 106, "verified_secrets": 0, "unverified_secrets": 1, "scan_duration": "5.086842ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
 ```
 
 JSON:
-```json
+```text
+$ /tmp/th_investigation/trufflehog filesystem /tmp/th_investigation/fixtures/a_plaintext --json --no-verification --results=verified,unverified,unknown
+{"level":"info-0","ts":"2026-07-06T23:50:36Z","logger":"trufflehog","msg":"running source","source_manager_worker_id":"v4AyE","with_units":true}
 {"SourceMetadata":{"Data":{"Filesystem":{"file":"/tmp/th_investigation/fixtures/a_plaintext/secrets.txt","line":1}}},"SourceID":1,"SourceType":15,"SourceName":"trufflehog - filesystem","DetectorType":2,"DetectorName":"AWS","DetectorDescription":"AWS (Amazon Web Services) is a comprehensive cloud computing platform offering a wide range of on-demand services like computing power, storage, databases. API keys for AWS can have varying amount of access to these services depending on the IAM policy attached.","DecoderName":"PLAIN","Verified":false,"VerificationFromCache":false,"Raw":"AKIA2HAFCFGWPBBBW43J","RawV2":"AKIA2HAFCFGWPBBBW43J:LXOB+fI7ILFiIm9tifZ6CJAqS8wVGJ/UJbSDsOSn","Redacted":"AKIA2HAFCFGWPBBBW43J","ExtraData":{"account":"702237780396","resource_type":"Access key"},"StructuredData":null}
+{"level":"info-0","ts":"2026-07-06T23:50:36Z","logger":"trufflehog","msg":"finished scanning","chunks":1,"bytes":106,"verified_secrets":0,"unverified_secrets":1,"scan_duration":"5.081597ms","trufflehog_version":"dev","verification_caching":{"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
 ```
-**Result count: 1.** `DecoderName":"PLAIN"`, `DetectorType":2` (= AWS; enum `detectors.pb.go`).
+
+**Result count: 1.** `"DecoderName":"PLAIN"`, `"DetectorType":2` (= AWS in the `DetectorType` enum, `pkg/pb/detectorspb/detectors.pb.go:83`). The result is printed between the `running source` and `finished scanning` log lines; `finished scanning` reports `"unverified_secrets": 1`.
 
 ### (b) Base64 only — 1 result, `Decoder Type: BASE64`
 
 ```text
 $ /tmp/th_investigation/trufflehog filesystem /tmp/th_investigation/fixtures/b_base64 --no-verification --results=verified,unverified,unknown
+🐷🔑🐷  TruffleHog. Unearth your secrets. 🐷🔑🐷
+
+2026-07-06T23:50:38Z	info-0	trufflehog	running source	{"source_manager_worker_id": "n6pJm", "with_units": true}
 Found unverified result 🐷🔑❓
 Detector Type: AWS
 Decoder Type: BASE64
@@ -173,18 +209,36 @@ Resource_type: Access key
 Account: 702237780396
 File: /tmp/th_investigation/fixtures/b_base64/secrets.txt
 Line: 1
+
+2026-07-06T23:50:38Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 106, "verified_secrets": 0, "unverified_secrets": 1, "scan_duration": "5.105488ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
 ```
 
 JSON:
-```json
+```text
+$ /tmp/th_investigation/trufflehog filesystem /tmp/th_investigation/fixtures/b_base64 --json --no-verification --results=verified,unverified,unknown
+{"level":"info-0","ts":"2026-07-06T23:50:40Z","logger":"trufflehog","msg":"running source","source_manager_worker_id":"qDmGa","with_units":true}
 {"SourceMetadata":{"Data":{"Filesystem":{"file":"/tmp/th_investigation/fixtures/b_base64/secrets.txt","line":1}}},"SourceID":1,"SourceType":15,"SourceName":"trufflehog - filesystem","DetectorType":2,"DetectorName":"AWS","DetectorDescription":"AWS (Amazon Web Services) is a comprehensive cloud computing platform offering a wide range of on-demand services like computing power, storage, databases. API keys for AWS can have varying amount of access to these services depending on the IAM policy attached.","DecoderName":"BASE64","Verified":false,"VerificationFromCache":false,"Raw":"AKIA2HAFCFGWPBBBW43J","RawV2":"AKIA2HAFCFGWPBBBW43J:LXOB+fI7ILFiIm9tifZ6CJAqS8wVGJ/UJbSDsOSn","Redacted":"AKIA2HAFCFGWPBBBW43J","ExtraData":{"account":"702237780396","resource_type":"Access key"},"StructuredData":null}
+{"level":"info-0","ts":"2026-07-06T23:50:40Z","logger":"trufflehog","msg":"finished scanning","chunks":1,"bytes":106,"verified_secrets":0,"unverified_secrets":1,"scan_duration":"5.415928ms","trufflehog_version":"dev","verification_caching":{"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
 ```
-**Result count: 1.** `DecoderName":"BASE64"`. Same `Raw`/`RawV2`/`DetectorType` as (a): the Base64 decoder decoded the blob in place and the AWS detector matched the recovered key. The blob text itself contains no literal `AKIA`, so the `PLAIN` decoder produced no match here.
+
+**Result count: 1.** `"DecoderName":"BASE64"`. Same `Raw`/`RawV2`/`DetectorType` as (a): the Base64 decoder decoded the blob in place and the AWS detector matched the recovered key. The blob text itself contains no literal `AKIA`, so the `PLAIN` decoder produced no match here. (The fixture file is 141 bytes, yet `finished scanning` reports `"bytes": 106` — the counter reflects decoded/scanned chunk bytes, not raw file size.)
 
 ### (c) Base64 line 1 + plain text line 2 — **2 results** (`PLAIN` + `BASE64`, different lines)
 
 ```text
 $ /tmp/th_investigation/trufflehog filesystem /tmp/th_investigation/fixtures/c_twoline_blobfirst --no-verification --results=verified,unverified,unknown
+🐷🔑🐷  TruffleHog. Unearth your secrets. 🐷🔑🐷
+
+2026-07-06T23:50:41Z	info-0	trufflehog	running source	{"source_manager_worker_id": "CLIrR", "with_units": true}
+Found unverified result 🐷🔑❓
+Detector Type: AWS
+Decoder Type: BASE64
+Raw result: AKIA2HAFCFGWPBBBW43J
+Resource_type: Access key
+Account: 702237780396
+File: /tmp/th_investigation/fixtures/c_twoline_blobfirst/secrets.txt
+Line: 1
+
 Found unverified result 🐷🔑❓
 Detector Type: AWS
 Decoder Type: PLAIN
@@ -194,47 +248,56 @@ Account: 702237780396
 File: /tmp/th_investigation/fixtures/c_twoline_blobfirst/secrets.txt
 Line: 2
 
-Found unverified result 🐷🔑❓
-Detector Type: AWS
-Decoder Type: BASE64
-Raw result: AKIA2HAFCFGWPBBBW43J
-Resource_type: Access key
-Account: 702237780396
-File: /tmp/th_investigation/fixtures/c_twoline_blobfirst/secrets.txt
-Line: 1
+2026-07-06T23:50:41Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 212, "verified_secrets": 0, "unverified_secrets": 2, "scan_duration": "6.12908ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
 ```
 
-JSON (two lines):
-```json
+JSON:
+```text
+$ /tmp/th_investigation/trufflehog filesystem /tmp/th_investigation/fixtures/c_twoline_blobfirst --json --no-verification --results=verified,unverified,unknown
+{"level":"info-0","ts":"2026-07-06T23:50:43Z","logger":"trufflehog","msg":"running source","source_manager_worker_id":"9lMaX","with_units":true}
 {"SourceMetadata":{"Data":{"Filesystem":{"file":"/tmp/th_investigation/fixtures/c_twoline_blobfirst/secrets.txt","line":2}}},"SourceID":1,"SourceType":15,"SourceName":"trufflehog - filesystem","DetectorType":2,"DetectorName":"AWS","DetectorDescription":"AWS (Amazon Web Services) is a comprehensive cloud computing platform offering a wide range of on-demand services like computing power, storage, databases. API keys for AWS can have varying amount of access to these services depending on the IAM policy attached.","DecoderName":"PLAIN","Verified":false,"VerificationFromCache":false,"Raw":"AKIA2HAFCFGWPBBBW43J","RawV2":"AKIA2HAFCFGWPBBBW43J:LXOB+fI7ILFiIm9tifZ6CJAqS8wVGJ/UJbSDsOSn","Redacted":"AKIA2HAFCFGWPBBBW43J","ExtraData":{"account":"702237780396","resource_type":"Access key"},"StructuredData":null}
 {"SourceMetadata":{"Data":{"Filesystem":{"file":"/tmp/th_investigation/fixtures/c_twoline_blobfirst/secrets.txt","line":1}}},"SourceID":1,"SourceType":15,"SourceName":"trufflehog - filesystem","DetectorType":2,"DetectorName":"AWS","DetectorDescription":"AWS (Amazon Web Services) is a comprehensive cloud computing platform offering a wide range of on-demand services like computing power, storage, databases. API keys for AWS can have varying amount of access to these services depending on the IAM policy attached.","DecoderName":"BASE64","Verified":false,"VerificationFromCache":false,"Raw":"AKIA2HAFCFGWPBBBW43J","RawV2":"AKIA2HAFCFGWPBBBW43J:LXOB+fI7ILFiIm9tifZ6CJAqS8wVGJ/UJbSDsOSn","Redacted":"AKIA2HAFCFGWPBBBW43J","ExtraData":{"account":"702237780396","resource_type":"Access key"},"StructuredData":null}
+{"level":"info-0","ts":"2026-07-06T23:50:43Z","logger":"trufflehog","msg":"finished scanning","chunks":1,"bytes":212,"verified_secrets":0,"unverified_secrets":2,"scan_duration":"5.856848ms","trufflehog_version":"dev","verification_caching":{"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
 ```
-**Result count: 2** — this is the user's "reported twice with different decoder types." The `PLAIN` result is at `line 2`, the `BASE64` result at `line 1`; identical `Raw`/`RawV2`/`DetectorType`, different `SourceMetadata` line. (Both JSON objects above are shown complete and verbatim, including the full `DetectorDescription`, exactly as emitted.)
+
+**Result count: 2** — this is the user's "reported twice with different decoder types." One result is `Decoder Type: PLAIN` at `line 2`, the other `Decoder Type: BASE64` at `line 1`; identical `Raw`/`RawV2`/`DetectorType`, different `SourceMetadata` line. (Which of the two results prints first is arrival‑order dependent and varies run‑to‑run — here the plain run emitted `BASE64`@line1 first while the JSON run emitted `PLAIN`@line2 first — but the count is always 2; see §5.2. Both JSON objects are shown complete and verbatim, including the full `DetectorDescription`.)
 
 ### (d) Plain text line 1 + Base64 line 2 — **1 result** (dedup collapse)
 
 ```text
 $ /tmp/th_investigation/trufflehog filesystem /tmp/th_investigation/fixtures/d_twoline_plainfirst --no-verification --results=verified,unverified,unknown
+🐷🔑🐷  TruffleHog. Unearth your secrets. 🐷🔑🐷
+
+2026-07-06T23:50:45Z	info-0	trufflehog	running source	{"source_manager_worker_id": "erISk", "with_units": true}
 Found unverified result 🐷🔑❓
 Detector Type: AWS
 Decoder Type: PLAIN
 Raw result: AKIA2HAFCFGWPBBBW43J
-Resource_type: Access key
 Account: 702237780396
+Resource_type: Access key
 File: /tmp/th_investigation/fixtures/d_twoline_plainfirst/secrets.txt
 Line: 1
+
+2026-07-06T23:50:45Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 212, "verified_secrets": 0, "unverified_secrets": 1, "scan_duration": "5.3914ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
 ```
 
-JSON (one line):
-```json
+JSON:
+```text
+$ /tmp/th_investigation/trufflehog filesystem /tmp/th_investigation/fixtures/d_twoline_plainfirst --json --no-verification --results=verified,unverified,unknown
+{"level":"info-0","ts":"2026-07-06T23:50:47Z","logger":"trufflehog","msg":"running source","source_manager_worker_id":"QzaUL","with_units":true}
 {"SourceMetadata":{"Data":{"Filesystem":{"file":"/tmp/th_investigation/fixtures/d_twoline_plainfirst/secrets.txt","line":1}}},"SourceID":1,"SourceType":15,"SourceName":"trufflehog - filesystem","DetectorType":2,"DetectorName":"AWS","DetectorDescription":"AWS (Amazon Web Services) is a comprehensive cloud computing platform offering a wide range of on-demand services like computing power, storage, databases. API keys for AWS can have varying amount of access to these services depending on the IAM policy attached.","DecoderName":"PLAIN","Verified":false,"VerificationFromCache":false,"Raw":"AKIA2HAFCFGWPBBBW43J","RawV2":"AKIA2HAFCFGWPBBBW43J:LXOB+fI7ILFiIm9tifZ6CJAqS8wVGJ/UJbSDsOSn","Redacted":"AKIA2HAFCFGWPBBBW43J","ExtraData":{"account":"702237780396","resource_type":"Access key"},"StructuredData":null}
+{"level":"info-0","ts":"2026-07-06T23:50:47Z","logger":"trufflehog","msg":"finished scanning","chunks":1,"bytes":212,"verified_secrets":0,"unverified_secrets":1,"scan_duration":"4.651895ms","trufflehog_version":"dev","verification_caching":{"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
 ```
-**Result count: 1** — this is the user's "deduplicated down to a single result." Same content as (c), lines swapped. Here the `PLAIN` match is at `line 1`; the `BASE64` decoder decodes the line‑2 blob but the line‑1 plaintext key is *still present*, so the recovered key's first occurrence is at `line 1` too — identical `SourceMetadata` to the `PLAIN` match, so the second result is deduplicated away (§7‑Q4/Q6). The single survivor's decoder type is **not fixed** across runs — see §5.
+
+**Result count: 1** — this is the user's "deduplicated down to a single result." Same content as (c), lines swapped. `finished scanning` reports `"unverified_secrets": 1`. Here the surviving result is `Decoder Type: PLAIN` at `line 1`; the `BASE64` decoder decodes the line‑2 blob but the line‑1 plaintext key is *still present*, so the recovered key's first occurrence is at `line 1` too — identical `SourceMetadata` to the `PLAIN` match, so the second result is deduplicated away (§7‑Q4/Q6). The single survivor's decoder type is **not fixed** across runs — both runs shown above happened to survive as `PLAIN`, but §5.1 shows it is sometimes `BASE64`.
 
 ### (e) Escaped Unicode — 1 result, `Decoder Type: ESCAPED_UNICODE`
 
 ```text
 $ /tmp/th_investigation/trufflehog filesystem /tmp/th_investigation/fixtures/e_escunicode --no-verification --results=verified,unverified,unknown
+🐷🔑🐷  TruffleHog. Unearth your secrets. 🐷🔑🐷
+
+2026-07-06T23:50:48Z	info-0	trufflehog	running source	{"source_manager_worker_id": "sDvaj", "with_units": true}
 Found unverified result 🐷🔑❓
 Detector Type: AWS
 Decoder Type: ESCAPED_UNICODE
@@ -243,19 +306,28 @@ Resource_type: Access key
 Account: 702237780396
 File: /tmp/th_investigation/fixtures/e_escunicode/secrets.txt
 Line: 1
+
+2026-07-06T23:50:48Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 631, "verified_secrets": 0, "unverified_secrets": 1, "scan_duration": "4.758621ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
 ```
 
 JSON:
-```json
+```text
+$ /tmp/th_investigation/trufflehog filesystem /tmp/th_investigation/fixtures/e_escunicode --json --no-verification --results=verified,unverified,unknown
+{"level":"info-0","ts":"2026-07-06T23:50:50Z","logger":"trufflehog","msg":"running source","source_manager_worker_id":"ZaBU1","with_units":true}
 {"SourceMetadata":{"Data":{"Filesystem":{"file":"/tmp/th_investigation/fixtures/e_escunicode/secrets.txt","line":1}}},"SourceID":1,"SourceType":15,"SourceName":"trufflehog - filesystem","DetectorType":2,"DetectorName":"AWS","DetectorDescription":"AWS (Amazon Web Services) is a comprehensive cloud computing platform offering a wide range of on-demand services like computing power, storage, databases. API keys for AWS can have varying amount of access to these services depending on the IAM policy attached.","DecoderName":"ESCAPED_UNICODE","Verified":false,"VerificationFromCache":false,"Raw":"AKIA2HAFCFGWPBBBW43J","RawV2":"AKIA2HAFCFGWPBBBW43J:LXOB+fI7ILFiIm9tifZ6CJAqS8wVGJ/UJbSDsOSn","Redacted":"AKIA2HAFCFGWPBBBW43J","ExtraData":{"account":"702237780396","resource_type":"Access key"},"StructuredData":null}
+{"level":"info-0","ts":"2026-07-06T23:50:50Z","logger":"trufflehog","msg":"finished scanning","chunks":1,"bytes":631,"verified_secrets":0,"unverified_secrets":1,"scan_duration":"4.537858ms","trufflehog_version":"dev","verification_caching":{"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
 ```
-**Result count: 1.** `DecoderName":"ESCAPED_UNICODE"`. Only the escaped‑Unicode decoder produced a match: the raw bytes are `\u00XX` sequences with no literal `AKIA` and no ≥20‑char Base64 run, so neither `PLAIN` nor `BASE64` matched.
+
+**Result count: 1.** `"DecoderName":"ESCAPED_UNICODE"`. Only the escaped‑Unicode decoder produced a match: the raw bytes are `\u00XX` sequences with no literal `AKIA` and no ≥20‑char Base64 run, so neither `PLAIN` nor `BASE64` matched.
 
 ### (f) Multi‑detector overlap — 2 results; one carries the overlap error
 
-Command (adds the custom detector via `--config`):
+Plain (adds the custom detector via `--config`), **without** `--allow-verification-overlap`:
 ```text
 $ /tmp/th_investigation/trufflehog filesystem /tmp/th_investigation/fixtures/f_overlap/data --config /tmp/th_investigation/fixtures/f_overlap/overlap_detectors.yaml --no-verification --results=verified,unverified,unknown
+🐷🔑🐷  TruffleHog. Unearth your secrets. 🐷🔑🐷
+
+2026-07-06T23:50:52Z	info-0	trufflehog	running source	{"source_manager_worker_id": "s4d9F", "with_units": true}
 Found unverified result 🐷🔑❓
 Verification issue: More than one detector has found this result. For your safety, verification has been disabled.You can override this behavior by using the --allow-verification-overlap flag.
 Detector Type: Postman
@@ -271,15 +343,22 @@ Raw result: PMAK-qnwfsLyRSyfCwfpHaQP1UzDhrgpWvHjbYzjpRCMshjt417zWcrzyHUArs7r
 Name: overlapdemo
 File: /tmp/th_investigation/fixtures/f_overlap/data/s.txt
 Line: 1
+
+2026-07-06T23:50:52Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 83, "verified_secrets": 0, "unverified_secrets": 2, "scan_duration": "5.993868ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
 ```
 
-JSON:
-```json
-{"SourceMetadata":{"Data":{"Filesystem":{"file":"/tmp/th_investigation/fixtures/f_overlap/data/s.txt","line":1}}},"SourceID":1,"SourceType":15,"SourceName":"trufflehog - filesystem","DetectorType":118,"DetectorName":"Postman","DetectorDescription":"Postman is a collaboration platform for API development. Postman API keys can be used to access and modify collections, environments, and other resources.","DecoderName":"PLAIN","Verified":false,"VerificationError":"More than one detector has found this result. For your safety, verification has been disabled.You can override this behavior by using the --allow-verification-overlap flag.","VerificationFromCache":false,"Raw":"PMAK-qnwfsLyRSyfCwfpHaQP1UzDhrgpWvHjbYzjpRCMshjt417zWcrzyHUArs7r","RawV2":"","Redacted":"","ExtraData":null,"StructuredData":null}
-{"SourceMetadata":{"Data":{"Filesystem":{"file":"/tmp/th_investigation/fixtures/f_overlap/data/s.txt","line":1}}},"SourceID":1,"SourceType":15,"SourceName":"trufflehog - filesystem","DetectorType":904,"DetectorName":"CustomRegex","DetectorDescription":"This is a user-defined detector with no description provided.","DecoderName":"PLAIN","Verified":false,"VerificationFromCache":false,"Raw":"PMAK-qnwfsLyRSyfCwfpHaQP1UzDhrgpWvHjbYzjpRCMshjt417zWcrzyHUArs7r","RawV2":"","Redacted":"","ExtraData":{"name":"overlapdemo"},"StructuredData":null}
+JSON (same command, `--json`), **without** the flag:
+```text
+$ /tmp/th_investigation/trufflehog filesystem /tmp/th_investigation/fixtures/f_overlap/data --config /tmp/th_investigation/fixtures/f_overlap/overlap_detectors.yaml --json --no-verification --results=verified,unverified,unknown
+{"level":"info-0","ts":"2026-07-06T23:50:54Z","logger":"trufflehog","msg":"running source","source_manager_worker_id":"VaY3a","with_units":true}
+{"SourceMetadata":{"Data":{"Filesystem":{"file":"/tmp/th_investigation/fixtures/f_overlap/data/s.txt","line":1}}},"SourceID":1,"SourceType":15,"SourceName":"trufflehog - filesystem","DetectorType":904,"DetectorName":"CustomRegex","DetectorDescription":"This is a user-defined detector with no description provided.","DecoderName":"PLAIN","Verified":false,"VerificationError":"More than one detector has found this result. For your safety, verification has been disabled.You can override this behavior by using the --allow-verification-overlap flag.","VerificationFromCache":false,"Raw":"PMAK-qnwfsLyRSyfCwfpHaQP1UzDhrgpWvHjbYzjpRCMshjt417zWcrzyHUArs7r","RawV2":"","Redacted":"","ExtraData":{"name":"overlapdemo"},"StructuredData":null}
+{"SourceMetadata":{"Data":{"Filesystem":{"file":"/tmp/th_investigation/fixtures/f_overlap/data/s.txt","line":1}}},"SourceID":1,"SourceType":15,"SourceName":"trufflehog - filesystem","DetectorType":118,"DetectorName":"Postman","DetectorDescription":"Postman is a collaboration platform for API development. Postman API keys can be used to access and modify collections, environments, and other resources.","DecoderName":"PLAIN","Verified":false,"VerificationFromCache":false,"Raw":"PMAK-qnwfsLyRSyfCwfpHaQP1UzDhrgpWvHjbYzjpRCMshjt417zWcrzyHUArs7r","RawV2":"","Redacted":"","ExtraData":null,"StructuredData":null}
+{"level":"info-0","ts":"2026-07-06T23:50:54Z","logger":"trufflehog","msg":"finished scanning","chunks":1,"bytes":83,"verified_secrets":0,"unverified_secrets":2,"scan_duration":"6.423896ms","trufflehog_version":"dev","verification_caching":{"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
 ```
-**Result count: 2**, both `Decoder Type: PLAIN`, both `line 1`, same `Raw`. The `Postman` result (`DetectorType":118`) carries `"VerificationError":"More than one detector has found this result. For your safety, verification has been disabled...."` — this is the user's "overlap error." The `CustomRegex` result (`DetectorType":904`) is emitted without the error. Note that overlap **does not reduce the count** (still 2) — it only disables verification on the affected result.
 
+**Result count: 2**, both `Decoder Type: PLAIN`, both `line 1`, same `Raw`. Exactly one of the two results carries `"VerificationError":"More than one detector has found this result. For your safety, verification has been disabled.You can override this behavior by using the --allow-verification-overlap flag."` (plain: `Verification issue:` line) — this is the user's "overlap error." **Which** detector carries it is arrival‑order dependent and varies run‑to‑run: the plain run above tagged `Postman` (`"DetectorType":118`) while the JSON run tagged `CustomRegex` (`"DetectorType":904`); the other result is emitted clean (see the §5.3 distribution). Note that overlap **does not reduce the count** (still 2) — it only disables verification on the affected result.
+
+The complete plain and JSON output **with** `--allow-verification-overlap` (no overlap error on either result) is shown in §5.3.
 
 ---
 
@@ -342,8 +421,12 @@ With the flag (12 identical runs):
 
 With `--allow-verification-overlap`, the overlap error **never** appears (0/12): the routing condition `!e.verificationOverlap` at `engine.go:796` is now false, so the chunk is never sent to the overlap worker and `errOverlap` is never set. The suppression flips cleanly. (Complete plain/JSON output for both flag states is in §4(f) and below.)
 
-Complete plain output **with** `--allow-verification-overlap` (no "Verification issue" line on either result):
+Complete plain output **with** `--allow-verification-overlap` (exact command first; no `Verification issue:` line on either result):
 ```text
+$ /tmp/th_investigation/trufflehog filesystem /tmp/th_investigation/fixtures/f_overlap/data --config /tmp/th_investigation/fixtures/f_overlap/overlap_detectors.yaml --allow-verification-overlap --no-verification --results=verified,unverified,unknown
+🐷🔑🐷  TruffleHog. Unearth your secrets. 🐷🔑🐷
+
+2026-07-06T23:50:55Z	info-0	trufflehog	running source	{"source_manager_worker_id": "ZPGOU", "with_units": true}
 Found unverified result 🐷🔑❓
 Detector Type: CustomRegex
 Decoder Type: PLAIN
@@ -358,6 +441,17 @@ Decoder Type: PLAIN
 Raw result: PMAK-qnwfsLyRSyfCwfpHaQP1UzDhrgpWvHjbYzjpRCMshjt417zWcrzyHUArs7r
 File: /tmp/th_investigation/fixtures/f_overlap/data/s.txt
 Line: 1
+
+2026-07-06T23:50:55Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 83, "verified_secrets": 0, "unverified_secrets": 2, "scan_duration": "4.65511ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
+```
+
+Complete JSON output **with** `--allow-verification-overlap` (neither result object carries a `VerificationError` field):
+```text
+$ /tmp/th_investigation/trufflehog filesystem /tmp/th_investigation/fixtures/f_overlap/data --config /tmp/th_investigation/fixtures/f_overlap/overlap_detectors.yaml --json --allow-verification-overlap --no-verification --results=verified,unverified,unknown
+{"level":"info-0","ts":"2026-07-06T23:50:57Z","logger":"trufflehog","msg":"running source","source_manager_worker_id":"EXOLE","with_units":true}
+{"SourceMetadata":{"Data":{"Filesystem":{"file":"/tmp/th_investigation/fixtures/f_overlap/data/s.txt","line":1}}},"SourceID":1,"SourceType":15,"SourceName":"trufflehog - filesystem","DetectorType":904,"DetectorName":"CustomRegex","DetectorDescription":"This is a user-defined detector with no description provided.","DecoderName":"PLAIN","Verified":false,"VerificationFromCache":false,"Raw":"PMAK-qnwfsLyRSyfCwfpHaQP1UzDhrgpWvHjbYzjpRCMshjt417zWcrzyHUArs7r","RawV2":"","Redacted":"","ExtraData":{"name":"overlapdemo"},"StructuredData":null}
+{"SourceMetadata":{"Data":{"Filesystem":{"file":"/tmp/th_investigation/fixtures/f_overlap/data/s.txt","line":1}}},"SourceID":1,"SourceType":15,"SourceName":"trufflehog - filesystem","DetectorType":118,"DetectorName":"Postman","DetectorDescription":"Postman is a collaboration platform for API development. Postman API keys can be used to access and modify collections, environments, and other resources.","DecoderName":"PLAIN","Verified":false,"VerificationFromCache":false,"Raw":"PMAK-qnwfsLyRSyfCwfpHaQP1UzDhrgpWvHjbYzjpRCMshjt417zWcrzyHUArs7r","RawV2":"","Redacted":"","ExtraData":null,"StructuredData":null}
+{"level":"info-0","ts":"2026-07-06T23:50:57Z","logger":"trufflehog","msg":"finished scanning","chunks":1,"bytes":83,"verified_secrets":0,"unverified_secrets":2,"scan_duration":"5.664368ms","trufflehog_version":"dev","verification_caching":{"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
 ```
 
 ---
@@ -375,15 +469,21 @@ Line: 1
 | (e) escaped unicode | 1 — `ESCAPED_UNICODE` | 1 | none |
 | (f) overlap (Postman + custom) | 2 — `Postman`, `CustomRegex` | 2 | none (different `DetectorType`) |
 
-Observed `finished scanning` banners (the `unverified_secrets` field is the post‑dedup emitted count). These are quoted up to and including the count‑relevant fields; the trailing per‑run fields (`scan_duration`, `trufflehog_version`, `verification_caching`) vary run‑to‑run and are shown **complete and verbatim** for a full run in §4(a) (line beginning `finished scanning`):
+Observed `finished scanning` banners (the `unverified_secrets` field is the post‑dedup emitted count). Each line below is the **complete, unedited** plain‑mode `finished scanning` log line for that fixture, byte‑identical to the one emitted in the corresponding §4 run (the `scan_duration` is that run's per‑run figure):
 
 ```text
-(a) finished scanning  {"chunks": 1, "bytes": 106, "verified_secrets": 0, "unverified_secrets": 1, ...}
-(b) finished scanning  {"chunks": 1, "bytes": 106, "verified_secrets": 0, "unverified_secrets": 1, ...}
-(c) finished scanning  {"chunks": 1, "bytes": 212, "verified_secrets": 0, "unverified_secrets": 2, ...}
-(d) finished scanning  {"chunks": 1, "bytes": 212, "verified_secrets": 0, "unverified_secrets": 1, ...}
-(e) finished scanning  {"chunks": 1, "bytes": 631, "verified_secrets": 0, "unverified_secrets": 1, ...}
-(f) finished scanning  {"chunks": 1, "bytes":  83, "verified_secrets": 0, "unverified_secrets": 2, ...}
+# (a) plaintext
+2026-07-06T23:50:34Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 106, "verified_secrets": 0, "unverified_secrets": 1, "scan_duration": "5.086842ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
+# (b) base64 only
+2026-07-06T23:50:38Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 106, "verified_secrets": 0, "unverified_secrets": 1, "scan_duration": "5.105488ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
+# (c) blob line1 + plain line2 (two results)
+2026-07-06T23:50:41Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 212, "verified_secrets": 0, "unverified_secrets": 2, "scan_duration": "6.12908ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
+# (d) plain line1 + blob line2 (dedup collapse)
+2026-07-06T23:50:45Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 212, "verified_secrets": 0, "unverified_secrets": 1, "scan_duration": "5.3914ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
+# (e) escaped unicode
+2026-07-06T23:50:48Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 631, "verified_secrets": 0, "unverified_secrets": 1, "scan_duration": "4.758621ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
+# (f) multi-detector overlap, without --allow-verification-overlap
+2026-07-06T23:50:52Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 83, "verified_secrets": 0, "unverified_secrets": 2, "scan_duration": "5.993868ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
 ```
 
 **How "2 matches" for (d) is observed (not merely inferred):** (a) proves the `PLAIN` decoder matches the plaintext form (1), (b) proves the `BASE64` decoder matches the encoded form (1); (c) — the *same two lines* as (d) but reordered — emits both (2); and the §5.1 loop shows the (d) survivor is sometimes `BASE64`, which can only happen if a `BASE64` match was produced. Only the *emission* differs: (c) keeps both, (d) collapses to one. Note the `numFoundResults` counter incremented before the dedup check (`engine.go:1208`) is not surfaced in output, so the pre‑dedup count is established through these observations rather than a single banner field.
@@ -407,7 +507,7 @@ Key distinction the counts make explicit: **overlap (f) does not reduce the coun
 
 **Direct answer:** The reported values come from the `DecoderType` enum: `PLAIN`, `BASE64`, `UTF16`, `ESCAPED_UNICODE` (plus the zero value `UNKNOWN`). In this investigation we observed **`PLAIN`** (a, c, d), **`BASE64`** (b, c), and **`ESCAPED_UNICODE`** (e). `UTF16` is defined and available but was not produced (no UTF‑16 input).
 
-**Evidence:** enum `pkg/pb/detectorspb/detectors.pb.go:25-31` — `UNKNOWN=0, PLAIN=1, BASE64=2, UTF16=3, ESCAPED_UNICODE=4`, with the string names at `detectors.pb.go:35-48`. Each decoder's `Type()`: `PLAIN` (`utf8.go:12-13`), `BASE64` (`base64.go:30-31`), `UTF16` (`utf16.go:14-15`), `ESCAPED_UNICODE` (`escaped_unicode.go:28-29`). The user sees this field as `Decoder Type:` in plain output (`pkg/output/plain.go:64`) and `DecoderName` in JSON (`pkg/output/json.go:65`, set to `r.DecoderType.String()`). Observed verbatim in §4: `Decoder Type: PLAIN`, `Decoder Type: BASE64`, `Decoder Type: ESCAPED_UNICODE`; JSON `"DecoderName":"PLAIN"`, `"BASE64"`, `"ESCAPED_UNICODE"`.
+**Evidence:** enum `pkg/pb/detectorspb/detectors.pb.go:26-30` — `UNKNOWN=0, PLAIN=1, BASE64=2, UTF16=3, ESCAPED_UNICODE=4`, with the string names at `detectors.pb.go:35-41`. Each decoder's `Type()`: `PLAIN` (`utf8.go:12-13`), `BASE64` (`base64.go:30-31`), `UTF16` (`utf16.go:14-15`), `ESCAPED_UNICODE` (`escaped_unicode.go:28-29`). The user sees this field as `Decoder Type:` in plain output (`pkg/output/plain.go:64`) and `DecoderName` in JSON (`pkg/output/json.go:65`, set to `r.DecoderType.String()`). Observed verbatim in §4: `Decoder Type: PLAIN`, `Decoder Type: BASE64`, `Decoder Type: ESCAPED_UNICODE`; JSON `"DecoderName":"PLAIN"`, `"BASE64"`, `"ESCAPED_UNICODE"`.
 
 **Reasoning:** The decoder type is a property of *which decoder recovered the bytes that matched*, carried on the `DecodableChunk` (`decoders.go:18-22`) through detection and onto the result, then printed by the output layer.
 
@@ -417,7 +517,7 @@ Key distinction the counts make explicit: **overlap (f) does not reduce the coun
 - **For a lone AWS key: NO.** Overlap detection does **not** occur for any of fixtures (a)–(e). An AWS access key matches exactly one detector (AWS), so the overlap condition is false and the chunk takes the normal single‑detector path. None of (a)–(e) printed any "verification has been disabled" message.
 - **For a genuinely multi‑detector chunk: YES.** Overlap detection occurs in fixture (f), where two detectors of different types (`Postman` and the custom `CustomRegex`) match the same token. The chunk is routed to the overlap worker and the result is tagged with `errOverlap`.
 
-**Evidence:** the routing gate is `if len(matchingDetectors) > 1 && !e.verificationOverlap` (`pkg/engine/engine.go:796`); `matchingDetectors` comes from `AhoCorasickCore.FindDetectorMatches` (`pkg/engine/ahocorasick/ahocorasickcore.go:241`, called at `engine.go:795`). For (a)–(e), `len(matchingDetectors)` is 1 → the branch is skipped → no overlap (observed: no "Verification issue" line, §4). For (f), the overlap worker (`engine.go:924`) runs `likelyDuplicate` (`engine.go:887-922`) and, on a match, calls `res.SetVerificationError(errOverlap)` (`engine.go:988`); `errOverlap`'s exact text is at `engine.go:39-42`. Observed in §4(f): `Verification issue: More than one detector has found this result. For your safety, verification has been disabled.You can override this behavior by using the --allow-verification-overlap flag.` and JSON `"VerificationError":"More than one detector has found this result...."`. The two detectors' distinct types are visible as `"DetectorType":118` (Postman) and `"DetectorType":904` (CustomRegex).
+**Evidence:** the routing gate is `if len(matchingDetectors) > 1 && !e.verificationOverlap` (`pkg/engine/engine.go:796`); `matchingDetectors` comes from `AhoCorasickCore.FindDetectorMatches` (`pkg/engine/ahocorasick/ahocorasickcore.go:241`, called at `engine.go:795`). For (a)–(e), `len(matchingDetectors)` is 1 → the branch is skipped → no overlap (observed: no "Verification issue" line, §4). For (f), the overlap worker (`engine.go:924`) runs `likelyDuplicate` (`engine.go:887-922`) and, on a match, calls `res.SetVerificationError(errOverlap)` (`engine.go:988`); `errOverlap`'s exact text is at `engine.go:39-42`. Observed in §4(f): `Verification issue: More than one detector has found this result. For your safety, verification has been disabled.You can override this behavior by using the --allow-verification-overlap flag.` and JSON `"VerificationError":"More than one detector has found this result. For your safety, verification has been disabled.You can override this behavior by using the --allow-verification-overlap flag."`. The two detectors' distinct types are visible as `"DetectorType":118` (Postman) and `"DetectorType":904` (CustomRegex).
 
 **Reasoning:** Overlap is fundamentally a *multiple‑detector* phenomenon. It needs `len(matchingDetectors) > 1` on a single decoded chunk, and `likelyDuplicate` further requires the two matches to come from **different detector types** and to be string‑similar above `similarityThreshold = 0.9` (`engine.go:888,900-914`) — with an exact string match short‑circuiting to `true` (`engine.go:904-909`). A single AWS key can never satisfy `> 1`, hence the honest negative result for (a)–(e).
 
@@ -457,7 +557,7 @@ The three fixtures triangulate the exact key composition:
 1. **Whether the plaintext and Base64 occurrences resolve to the same `SourceMetadata` (line).** If they do (plaintext appears before the blob, so the Base64‑decoded chunk still shows the plaintext key first at the same line) → same dedupe key, different decoder type → **collapse to 1** (fixture d). If they don't (blob before plaintext, or separate files/lines) → different keys → **2 results** (fixture c).
 2. **Whether any single decoded chunk trips ≥ 2 detectors.** A lone AWS key never does (1 result or 2, per point 1). Add a second detector matching the same token and the chunk is routed to the overlap path → **overlap error** (fixture f).
 
-On top of that, in the collapse case the **surviving decoder type is nondeterministic** — `PLAIN` 22/30 vs `BASE64` 8/30 in §5.1 — because the notifier keeps whichever result arrives first and, with 128 concurrent workers (`main.go:58`), arrival order varies run to run.
+On top of that, in the collapse case the **surviving decoder type is nondeterministic** — `PLAIN` 22/30 vs `BASE64` 8/30 in §5.1 — because the notifier keeps whichever result arrives first and, with the notifier pool sized at `concurrency` = 128 workers (`engine.go:706`; `concurrency` defaults to `runtime.NumCPU()` = 128, `main.go:58`), the arrival order varies run to run.
 
 **Evidence:** the layout‑to‑outcome mapping is observed directly: (c) and (d) are the *same two lines reordered* yet emit 2 vs 1 (§4). The dedupe key that makes layout decisive is `engine.go:1216` (includes `SourceMetadata`, excludes decoder type). The survivor variance is the §5.1 distribution. The overlap branch is `engine.go:796`. The Base64 in‑place decode that leaves the plaintext key in the chunk (so the recovered key's *first* occurrence — and thus the reported line — depends on ordering) is `pkg/decoders/base64.go:34-49`.
 
@@ -502,10 +602,10 @@ At commit `e42153d4`, the decoder model is **single‑pass over exactly four fix
 | Plain text | ✓ | fixture (a) → `Decoder Type: PLAIN` (§4a); Q1/Q2 |
 | Base64 | ✓ | fixture (b) → `Decoder Type: BASE64` (§4b); `base64.go:34-49`; Q1/Q2 |
 | Escaped Unicode | ✓ | fixture (e) → `Decoder Type: ESCAPED_UNICODE` (§4e); `escaped_unicode.go:28-29`; Q1/Q2 |
-| Decoder type `PLAIN` | ✓ | observed (a,c,d); enum `detectors.pb.go:26` |
-| Decoder type `BASE64` | ✓ | observed (b,c); enum `detectors.pb.go:27` |
-| Decoder type `UTF16` | ✓ | defined `utf16.go:14-15` / enum `detectors.pb.go:28`; not produced (no UTF‑16 input) — stated honestly (Q2) |
-| Decoder type `ESCAPED_UNICODE` | ✓ | observed (e); enum `detectors.pb.go:29` |
+| Decoder type `PLAIN` | ✓ | observed (a,c,d); enum `detectors.pb.go:27` |
+| Decoder type `BASE64` | ✓ | observed (b,c); enum `detectors.pb.go:28` |
+| Decoder type `UTF16` | ✓ | defined `utf16.go:14-15` / enum `detectors.pb.go:29`; not produced (no UTF‑16 input) — stated honestly (Q2) |
+| Decoder type `ESCAPED_UNICODE` | ✓ | observed (e); enum `detectors.pb.go:30` |
 | Overlap detection occurs? | ✓ | negative for lone AWS key (a–e); positive for (f) with errOverlap (§4f); `engine.go:796` (Q3) |
 | Deduplication + effect on count | ✓ | (d) 2→1 vs (c) 2→2; key `engine.go:1216` (Q4, §6) |
 | Dedup before or after overlap | ✓ | AFTER — `scannerWorker` L796 vs `notifierWorker` L1216 (Q5, §7.1) |
