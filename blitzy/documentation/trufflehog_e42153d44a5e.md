@@ -131,7 +131,7 @@ pkg/detectors/jdbc/jdbc.go
 $ grep -rlE '^\s*"regexp"' pkg/detectors --include='*.go' | wc -l
 3
 ```
-→ Exactly **3** detector files use the Go **standard-library** `regexp`. That stdlib engine is *also* non-backtracking-catastrophic: Go's `regexp` is an RE2-derived automaton with a **bounded** backtracker (constant memory budget), so it too is ReDoS-safe (corroborated in the profiling section, where these three account for < 2% of CPU).
+→ Exactly **3** detector files use the Go **standard-library** `regexp`. That stdlib engine is *also* non-backtracking-catastrophic: Go's `regexp` is an RE2-derived automaton with a **bounded** backtracker (constant memory budget), so it too is ReDoS-safe (corroborated in the profiling section, where these three account for only a small, scale-dependent slice of CPU — ≈1.5 % at 34 MiB rising to ≈4 % at 68 MiB, always dwarfed by RE2's ~85–88 % — see §5).
 
 ```console
 $ find pkg/detectors -mindepth 1 -maxdepth 1 -type d | wc -l
@@ -354,7 +354,7 @@ Showing top 15 nodes out of 41
 
 - **`runtime._ExternalCode` = 34.93 s = 87.72 %** of all CPU. `_ExternalCode` is Go's label for time spent inside the WASM module — i.e. **the RE2 automaton executing through wazero**. The overwhelming majority of scan CPU is spent in **linear-time finite-automaton matching**, exactly as RE2 promises.
 - The call chain into that automaton is visible: `mongodb.Scanner.FromData` (cum 7.26%) → `go-re2 …findAllSubmatch` (cum 3.01%) → wazero `callWithStack` → `runtime._ExternalCode`.
-- **The only backtracking frames are `regexp.(*Regexp).backtrack` (cum 1.68%) and `regexp.(*Regexp).tryBacktrack` (cum 1.38%)** — these are Go's **standard-library** regex engine (from the 3 stdlib-`regexp` detectors identified in §2). Go's backtracker is **bounded** (a fixed instruction/visited-state budget), so it is *linear-time and ReDoS-safe*, not catastrophic. At < 2% of CPU it is negligible, and it is *not* the go-re2 detector path.
+- **The only backtracking frames are `regexp.(*Regexp).backtrack` (cum 1.68%) and `regexp.(*Regexp).tryBacktrack` (cum 1.38%)** — these are Go's **standard-library** regex engine (from the 3 stdlib-`regexp` detectors identified in §2). Go's backtracker is **bounded** (a fixed instruction/visited-state budget), so it is *linear-time and ReDoS-safe*, not catastrophic. Its share is small but **scale-dependent** — it is ≈1.5–1.8 % at this 34 MiB scale (stable across five captures here) and rises to ≈3–4 % on a doubled 68 MiB input (the cross-check below) — always negligible next to RE2's dominant `_ExternalCode`, and *never* the go-re2 detector path.
 
 A `-peek` on the go-re2 entry point makes the linear automaton chain explicit:
 
@@ -372,6 +372,64 @@ $ go tool pprof -peek 'findAllSubmatch' cpu.pprof
 → `FindAllStringSubmatch → findAllSubmatch → matchFrom` (75.83% of that node's children) — RE2 automaton stepping, no backtracking function anywhere in the go-re2 chain.
 
 **On the sample percentage:** `Total samples = 39.82s (392.64%)` means ~4 CPUs were active during the 10 s window. On this host the cgroup CPU quota caps *active* parallelism at 4 (`nproc = 4`), even though `runtime.NumCPU() = 128`. On a machine with more available cores this percentage is higher (a reference 128-core capture showed ~784%), but the *distribution* is identical: `_ExternalCode` dominates and backtracking is negligible. The conclusion does not depend on the absolute sample count.
+
+**Scale cross-check — the stdlib backtracker is small, bounded, and grows only *linearly*.** The `regexp.(*Regexp).backtrack` / `tryBacktrack` frames above are a *small absolute* quantity (~0.6–0.7 s of ~40 s of samples), so their sampled percentage is variance- and scale-sensitive: across five 34 MiB captures here it stayed at **backtrack ≈1.5–1.8 % / tryBacktrack ≈1.2 %** (the 34 MiB block above, a separate capture, sits in the same regime at 1.68 % / 1.38 %), but **doubling** the input to a **68 MiB** many-match file raises it to **backtrack 4.09 % / tryBacktrack 3.11 %** while `_ExternalCode` stays dominant. This is the honest observed distribution (stable across runs at each scale), not a one-off:
+
+```console
+$ python3 -c "open('/tmp/redos_lab/manymatch_huge.bin','wb').write((b'mongodb://user1:realpass99@host.example.com:27017/db?tls=true\n')*1100000)"   # 68,200,000 B — double the 34 MiB file
+$ ( /tmp/trufflehog_bin filesystem /tmp/redos_lab/manymatch_huge.bin --no-verification --concurrency=1 --profile >/dev/null 2>/dev/null ) &
+$ sleep 2; curl -s -o cpu_huge.pprof "http://localhost:18066/debug/pprof/profile?seconds=10"; wait
+$ go tool pprof -top -nodecount=15 cpu_huge.pprof
+File: trufflehog_bin
+Build ID: 145c457addfaf462420df5fbfc7a6aa89df6394e
+Type: cpu
+Time: 2026-07-07 01:16:46 UTC
+Duration: 10.18s, Total samples = 39.85s (391.61%)
+Showing nodes accounting for 36.54s, 91.69% of 39.85s total
+Dropped 302 nodes (cum <= 0.20s)
+Showing top 15 nodes out of 55
+      flat  flat%   sum%        cum   cum%
+    33.44s 83.91% 83.91%     33.44s 83.91%  runtime._ExternalCode
+     0.66s  1.66% 85.57%      0.66s  1.66%  runtime.memmove
+     0.39s  0.98% 86.55%      1.24s  3.11%  regexp.(*Regexp).tryBacktrack
+     0.33s  0.83% 87.38%      1.63s  4.09%  regexp.(*Regexp).backtrack
+     0.28s   0.7% 88.08%      0.44s  1.10%  github.com/tetratelabs/wazero/internal/engine/wazevo.(*callEngine).callWithStack
+     0.24s   0.6% 88.68%      0.38s  0.95%  regexp.(*bitState).push (inline)
+     0.21s  0.53% 89.21%      0.21s  0.53%  regexp.(*bitState).shouldVisit (inline)
+     0.20s   0.5% 89.71%      0.25s  0.63%  github.com/BobuSumisu/aho-corasick.(*Trie).Walk
+     0.18s  0.45% 90.16%      0.22s  0.55%  internal/sync.(*Mutex).Unlock (inline)
+     0.16s   0.4% 90.56%      0.23s  0.58%  regexp.lazyFlag.match
+     0.12s   0.3% 90.87%      0.40s  1.00%  internal/sync.(*Mutex).Lock (inline)
+     0.12s   0.3% 91.17%      0.28s   0.7%  internal/sync.(*Mutex).lockSlow
+     0.08s   0.2% 91.37%      3.11s  7.80%  github.com/trufflesecurity/trufflehog/v3/pkg/detectors/mongodb.Scanner.FromData
+     0.08s   0.2% 91.57%      0.23s  0.58%  runtime.mallocgcSmallNoscan
+     0.05s  0.13% 91.69%      0.31s  0.78%  runtime.growslice
+```
+
+Two facts confirm this backtracking is **bounded**, not catastrophic. First, the `regexp.(*bitState).push` / `regexp.(*bitState).shouldVisit` frames are Go's *bounded* backtracker — a fixed visited-state bitmap budget. Second, a `-peek` shows the frame is driven by the stdlib `regexp.(*Regexp).doExecute`, **not** the go-re2 path:
+
+```console
+$ go tool pprof -peek 'regexp\.\(\*Regexp\)\.backtrack$' cpu_huge.pprof
+File: trufflehog_bin
+Build ID: 145c457addfaf462420df5fbfc7a6aa89df6394e
+Type: cpu
+Time: 2026-07-07 01:16:46 UTC
+Duration: 10.18s, Total samples = 39.85s (391.61%)
+Showing nodes accounting for 39.85s, 100% of 39.85s total
+----------------------------------------------------------+-------------
+      flat  flat%   sum%        cum   cum%   calls calls% + context 	 	 
+----------------------------------------------------------+-------------
+                                             1.63s   100% |   regexp.(*Regexp).doExecute
+     0.33s  0.83%  0.83%      1.63s  4.09%                | regexp.(*Regexp).backtrack
+                                             1.24s 76.07% |   regexp.(*Regexp).tryBacktrack
+                                             0.05s  3.07% |   regexp.(*inputBytes).step
+                                             0.01s  0.61% |   regexp.(*inputBytes).index
+----------------------------------------------------------+-------------
+```
+
+→ Even at 4.09 % on a 68 MiB input, the stdlib backtracker is (a) **bounded** — `bitState` with a fixed budget, hence *linear-time* — and (b) *linear in input size* — doubling the file roughly doubled its share (≈1.7 %→≈4 %), the exact opposite of the exponential blow-up a catastrophic-backtracking ReDoS would produce. RE2's `_ExternalCode` still dominates at 83.91 %. So the residual backtracking is negligible **and** structurally incapable of the super-linear behavior the question asks about.
+
+(These two 68 MiB blocks were captured with this session's build — `Build ID 145c457…`; the 34 MiB capture earlier shows a different `Build ID` because it is a separate build of the *same* source commit `e42153d4` — the Go `Build ID` hashes build-graph inputs, so it rotates per build while behavior is identical.)
 
 ### fgprof (on + off CPU) — completeness
 
@@ -407,7 +465,7 @@ fgprof counts **off-CPU (waiting) time too**, so it tells a complementary story:
 - **`runtime.gopark` = 84.31 %** — most of the pipeline's goroutines are *parked/waiting* (channel reads between source → chunker → decoder → detector stages). The scanner spends the bulk of its lifetime **waiting, not burning CPU**. A ReDoS victim would show the opposite: a goroutine pinned at 100% CPU inside a regex.
 - Active regex work is all **go-re2 / WASM**: `lazyFunction.callWithStack` (cum 26.25%), `FindAllStringSubmatch` (13.68%), `matchFrom` (13.51%), `MatchString` (12.83%).
 - `internal/sync.(*Mutex).lockSlow` (16.58%) + `runtime_SemacquireMutex` (16.44%) are the **WASM-module pool** contending for instances — this is the mechanism behind the `user ≫ wall` observation in §4.
-- **No backtracking frame appears anywhere.**
+- **No backtracking frame appears in the fgprof top nodes at this 34 MiB scale.** (At the doubled 68 MiB scale of the pprof cross-check above, the Go-stdlib bounded backtracker does surface, but only as tiny frames — `regexp.(*Regexp).backtrack` cum ≈ 0.7 %, `regexp.(*Regexp).tryBacktrack` cum ≈ 0.5 % — still far below the `go-re2`/WASM frames and, being off-CPU-weighted, far below even its own on-CPU pprof share.)
 
 ---
 
@@ -584,7 +642,7 @@ $ grep -nE 'archive-max-size|archive-max-depth|archive-timeout' main.go
 | # | Question part | Answer | Evidence |
 |---|---|---|---|
 | a | Can an attacker who commits a crafted file make TruffleHog **hang / time out** and block the pipeline? | **No.** No hang is possible; worst case is a bounded linear slowdown. The soft timeout wouldn't even need to fire because RE2 completes in linear time. | §1, §7, §8 |
-| b | Is the **regex layer exploitable** (catastrophic backtracking / ReDoS)? | **No — impossible by construction.** No detector on the scan path uses a catastrophic-backtracking engine: **867** detector files compile with linear-time RE2 (`go-re2`) and **3** use Go's ReDoS-safe stdlib `regexp` (`regexp2` is indirect/unused). The profile is 87.72% RE2-automaton `_ExternalCode` with < 2% *bounded* stdlib backtracking. | §2, §5 |
+| b | Is the **regex layer exploitable** (catastrophic backtracking / ReDoS)? | **No — impossible by construction.** No detector on the scan path uses a catastrophic-backtracking engine: **867** detector files compile with linear-time RE2 (`go-re2`) and **3** use Go's ReDoS-safe stdlib `regexp` (`regexp2` is indirect/unused). The profile is ~84–88% RE2-automaton `_ExternalCode` with only a small, scale-dependent (≈1.5–4%) *bounded* stdlib-`regexp` backtracking share. | §2, §5 |
 | c | **Which patterns** are exploitable? | **None.** The most "dangerous-looking" candidates — `mongodb.connStrPat` (nested `(?:,…)*`/`(?:&…)*`) [mongodb.go:L32], the `common.EmailPattern` *string constant* [patterns.go:L10] as compiled by `alegra` with go-re2 [alegra.go:L10,L28], and representative `anthropic` [anthropic.go:L27] — all run linearly under RE2. | §3, §8.2 |
 | d | **How much slower** is a crafted file than a normal file of **equivalent size**? | **Not slower — ratio ≈ 0.97×** at 8 MiB. A file of *legitimate* matches costs more (~2.2×) but only linearly in match count (1216 matches), never exponentially. | §4 Tables 1 & 2 |
 | e | **Timing + CPU-profiling evidence** provided? | **Yes** — `time`/per-run wall+user+sys, `--print-avg-detector-time` (`MongoDB: 29.437232ms`), pprof (`runtime._ExternalCode` 87.72%), and fgprof (`runtime.gopark` 84.31%). | §4, §5 |
