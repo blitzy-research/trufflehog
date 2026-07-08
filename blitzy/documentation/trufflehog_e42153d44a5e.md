@@ -36,9 +36,11 @@ Code claims cite `file:line` against HEAD `e42153d4`.
   example key, a 4 KB random binary, a real 1×1 PNG, and a Python source file). The fixture
   and all scripts live outside the repository and are removed afterward.
 
-> Note on redaction: the planted GitHub token is a randomly generated, **non‑real** value
-> (it verifies to `false`). Its 36‑character body is redacted below as
-> `ghp_<REDACTED-NONREAL-36CHARS>` while every schema field remains visible.
+> Note on the fixture token: the planted GitHub token is a randomly generated, **non‑real**
+> value (it verifies to `false`; its 36‑character body — `ghp_` followed by 36 random
+> `[a-zA-Z0-9]` characters — matches the GitHub detector's regex but authenticates to
+> nothing). Because it is synthetic and harmless, it is shown **in full, exactly as emitted**
+> in every output block below; nothing is redacted or edited.
 
 ---
 
@@ -251,10 +253,10 @@ Command (stdout only):
 /tmp/trufflehog filesystem /tmp/thog_fixture --json --log-level=2
 ```
 
-Complete finding as printed (token body redacted; every field preserved):
+Complete finding as printed, exactly as emitted (unedited):
 
 ```
-{"SourceMetadata":{"Data":{"Filesystem":{"file":"/tmp/thog_fixture/sub/.env","line":1}}},"SourceID":1,"SourceType":15,"SourceName":"trufflehog - filesystem","DetectorType":8,"DetectorName":"Github","DetectorDescription":"GitHub is a platform for version control and collaboration. Personal access tokens (PATs) can be used to access and modify repositories and other resources.","DecoderName":"PLAIN","Verified":false,"VerificationFromCache":false,"Raw":"ghp_<REDACTED-NONREAL-36CHARS>","RawV2":"","Redacted":"","ExtraData":{"rotation_guide":"https://howtorotate.com/docs/tutorials/github/","version":"2"},"StructuredData":null}
+{"SourceMetadata":{"Data":{"Filesystem":{"file":"/tmp/thog_fixture/sub/.env","line":1}}},"SourceID":1,"SourceType":15,"SourceName":"trufflehog - filesystem","DetectorType":8,"DetectorName":"Github","DetectorDescription":"GitHub is a platform for version control and collaboration. Personal access tokens (PATs) can be used to access and modify repositories and other resources.","DecoderName":"PLAIN","Verified":false,"VerificationFromCache":false,"Raw":"ghp_C5kCdDZpSBtPxRi9pd2NephKWEHNagqr2hGm","RawV2":"","Redacted":"","ExtraData":{"rotation_guide":"https://howtorotate.com/docs/tutorials/github/","version":"2"},"StructuredData":null}
 ```
 
 ### Cause → effect and the source‑dependent location shape
@@ -270,10 +272,12 @@ Complete finding as printed (token body redacted; every field preserved):
   `{"file":"/tmp/thog_fixture/sub/.env","line":1}`. For the **git** source it is
   `message Git` [proto/source_metadata.proto:L94], which additionally carries
   `commit`, `email`, `repository`, and `timestamp`. The README documents a git‑source
-  example (reading, not observed here) at [README.md:L226]. The credential-like values (AWS access key, account number, ARN, user id) are redacted below; the field *structure* is the point, and the unredacted example lives in the project's own `README.md`:
+  example (reading, not observed here). It is quoted **verbatim** below from the project's
+  own `README.md` [README.md:L226]; its credential values are the project's *public* test
+  keys (committed on purpose to `github.com/trufflesecurity/test_keys`), reproduced unedited:
 
   ```
-  {"SourceMetadata":{"Data":{"Git":{"commit":"fbc14303ffbf8fb1c2c1914e8dda7d0121633aca","file":"keys","email":"counter <counter@counters-MacBook-Air.local>","repository":"https://github.com/trufflesecurity/test_keys","timestamp":"2022-06-16 10:17:40 -0700 PDT","line":4}}},"SourceID":0,"SourceType":16,"SourceName":"trufflehog - git","DetectorType":2,"DetectorName":"AWS","DecoderName":"PLAIN","Verified":true,"Raw":"<REDACTED-AWS-KEY>","Redacted":"<REDACTED-AWS-KEY>","ExtraData":{"account":"<REDACTED-ACCOUNT>","arn":"arn:aws:iam::<REDACTED-ACCOUNT>:user/<REDACTED>","user_id":"<REDACTED-USER-ID>"},"StructuredData":null}
+  {"SourceMetadata":{"Data":{"Git":{"commit":"fbc14303ffbf8fb1c2c1914e8dda7d0121633aca","file":"keys","email":"counter \u003ccounter@counters-MacBook-Air.local\u003e","repository":"https://github.com/trufflesecurity/test_keys","timestamp":"2022-06-16 10:17:40 -0700 PDT","line":4}}},"SourceID":0,"SourceType":16,"SourceName":"trufflehog - git","DetectorType":2,"DetectorName":"AWS","DecoderName":"PLAIN","Verified":true,"Raw":"AKIAYVP4CIPPERUVIFXG","Redacted":"AKIAYVP4CIPPERUVIFXG","ExtraData":{"account":"595918472158","arn":"arn:aws:iam::595918472158:user/canarytokens.com@@mirux23ppyky6hx3l6vclmhnj","user_id":"AIDAYVP4CIPPJ5M54LRCY"},"StructuredData":null}
   ```
 
   That README example shows a **`"Verified":true`** shape and the richer git metadata
@@ -337,8 +341,8 @@ Command:
 ```
 
 This run exits 0 and prints the one reportable finding to **stdout** while all traversal
-decisions go to **stderr**. Both streams are shown complete and unedited (only the non‑real
-GitHub token body is redacted).
+decisions go to **stderr**. Both streams are shown complete and unedited (the non‑real
+GitHub token is shown in full, exactly as emitted).
 
 Complete stdout (unedited) — the single unverified finding:
 
@@ -346,7 +350,7 @@ Complete stdout (unedited) — the single unverified finding:
 Found unverified result 🐷🔑❓
 Detector Type: Github
 Decoder Type: PLAIN
-Raw result: ghp_<REDACTED-NONREAL-36CHARS>
+Raw result: ghp_C5kCdDZpSBtPxRi9pd2NephKWEHNagqr2hGm
 Rotation_guide: https://howtorotate.com/docs/tutorials/github/
 Version: 2
 File: /tmp/thog_fixture/sub/.env
