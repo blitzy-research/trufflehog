@@ -28,7 +28,7 @@ That is the direct answer. The nuance, all of it directly observed at runtime, f
 - **Q2 — Is the regex-based pattern matching vulnerable to computational-complexity (ReDoS) attacks?** **No.** Detectors run on RE2 (linear-time, non-backtracking); a classic ReDoS-shaped input scanned *slightly faster* than the benign control (0.79×).
 - **Q3 — Which specific detector patterns can be exploited for disproportionate time?** **None** for *catastrophic* (super-linear) time. The patterns that cost more CPU (e.g. `jdbc`) do so **linearly**, proportional to the number of legitimate matches.
 - **Q4 — How many times slower vs. normal files of equivalent size?** The ReDoS-specific answer is **≈1× (no slowdown)**. The maximum *content-driven* slowdown for a byte-for-byte equal-size file is **≈140× at the pure-scan level (≈5.0× end-to-end wall-clock)** — and it is **linear, not exponential**.
-- **Q5 — Timing measurements AND CPU-profiling data?** Provided: equal-size wall-clock tables across ≥2 runs, plus verbatim `go tool pprof` CPU and fgprof wall-clock output and a benchmark throughput table. The profile shows the go-re2 RE2 engine executing in WebAssembly with **no backtracking function anywhere** in the hot path.
+- **Q5 — Timing measurements AND CPU-profiling data?** Provided: equal-size wall-clock tables across ≥2 runs, plus verbatim `go tool pprof` CPU and fgprof wall-clock output and a benchmark throughput table. The profile shows the go-re2 RE2 engine executing in WebAssembly with **no catastrophic backtracking-engine function** (nothing from `dlclark/regexp2` or any PCRE-style engine) in the hot path — the only frames literally named `backtrack` are Go stdlib `regexp`'s *bounded, linear* one-pass backtracker used by the `jdbc` detector (see the footnote in the CPU-profiling section).
 
 **Bottom line for a CI owner:** A file committed to a scanned repository **cannot hang the scan via regex complexity**. The worst realistic effect an attacker can achieve by content alone is a **bounded, linear** slowdown that still **completes in seconds** (the pathological 150 MB / 793,997-candidate scan finished in ~56 s and never hung). This is a performance consideration, not an availability vulnerability. No remediation is proposed here — that is out of scope for this investigation.
 
@@ -181,7 +181,7 @@ The first line is `benign_equal.txt` (**52.6 ms**); the second is `redos_private
 
 **Answer: None are exploitable for *catastrophic* (super-linear) time.** The only patterns that cost more CPU do so **linearly**, in proportion to the number of legitimate secret candidates they match — not because of algorithmic blow-up.
 
-To answer this concretely, the highest-risk candidate patterns were enumerated and each was fed a crafted input designed to stress it. The candidates were chosen because they *look* dangerous to a reviewer familiar with backtracking-engine ReDoS: the private-key pattern has a nested non-greedy `[\s\S]*?` between two anchors (the textbook catastrophic shape); `jdbc` has a large bounded quantifier `{0,512}` plus a `pass.*?=(.+?)` pair and also compiles a **user-supplied** ignore regex at runtime; `azure_cosmosdb` has a long fixed-count `{86}`; `spv2` mixes character-class ranges with `\A`/`\z` anchors; and `anthropic` has a long `{93}` bounded quantifier. The verbatim patterns, exactly as they appear at the pinned commit, are:
+To answer this concretely, the highest-risk candidate patterns were enumerated and each was fed a crafted input designed to stress it (the per-candidate observed results — keyword, hits, timing across two runs, and crafted-vs-benign ratio — are tabulated under **Q3 per-candidate crafted-input evidence** below). The candidates were chosen because they *look* dangerous to a reviewer familiar with backtracking-engine ReDoS: the private-key pattern has a nested non-greedy `[\s\S]*?` between two anchors (the textbook catastrophic shape); `jdbc` has a large bounded quantifier `{0,512}` plus a `pass.*?=(.+?)` pair and also compiles a **user-supplied** ignore regex at runtime; `azure_cosmosdb` has a long fixed-count `{86}`; `spv2` mixes character-class ranges with `\A`/`\z` anchors; and `anthropic` has a long `{93}` bounded quantifier. The verbatim patterns, exactly as they appear at the pinned commit, are:
 
 ```
 privatekey.go:L33  (go-re2 engine; alias at L13; applied via FindAllString at L51)
@@ -206,7 +206,7 @@ anthropic.go:L27  (go-re2 engine; alias at L10)
   \b(sk-ant-(?:admin01|api03)-[\w\-]{93}AA)\b
 ```
 
-**Observed result:** every one of these ran in **linear** time. The private-key catastrophe-shape scanned an 18 MB file in **40.8 ms** (≈0.79× the benign control — see Q2). The `jdbc` pattern, fed a file of `jdbc:` connection-string candidates, produced **201,581** candidate matches on 18 MB in **≈4.0 s** — more CPU than benign, but that cost is exactly proportional to the 201,581 matches it had to extract and report; doubling the file doubles both. None produced disproportionate (super-linear) time.
+**Observed result:** every one of these ran in **linear** time. The private-key catastrophe-shape scanned an 18 MB file in **40.8 ms** (≈0.79× the benign control — see Q2). The `jdbc` pattern, fed a file of `jdbc:` connection-string candidates, produced **201,581** candidate matches on 18 MB in **≈4.0 s** — more CPU than benign, but that cost is exactly proportional to the 201,581 matches it had to extract and report; doubling the file doubles both. The remaining three named candidates — `azure_cosmosdb`, `spv2`, and `anthropic` — were each fed a dedicated keyword-bearing crafted fixture (byte-for-byte equal-size to a benign control) and likewise ran in **bounded, linear** time: ≈1.8×–9× an equal-size benign scan, stable across two runs, and scaling linearly with size (see **Q3 per-candidate crafted-input evidence** below). None produced disproportionate (super-linear) time.
 
 **On the three standard-library detectors specifically.** `spv2.go`, `azure_cosmosdb.go`, and `jdbc.go` are the *only* detectors that do not use go-re2 (they import stdlib `"regexp"` at `spv2.go:L7`, `azure_cosmosdb.go:L13`, and `jdbc.go:L8` respectively). The Go standard-library `regexp` is itself the RE2/linear-time family, so these three are **equally immune** to catastrophic backtracking. `jdbc` additionally compiles a **user-supplied** ignore regex at runtime via `regexp.Compile(ignoreString)` (`jdbc.go:L35-37`) — but that compiled regex is *also* stdlib-RE2 (it cannot be made catastrophic no matter what string a user supplies) and it is opt-in via a flag, not attacker-controllable through a scanned file.
 
@@ -251,11 +251,51 @@ Each highest-risk detector pattern, with its engine, the verbatim pattern, why i
 |---|---|---|---|---|
 | `pkg/detectors/privatekey/privatekey.go:L33` (applied via `FindAllString`, L51) | go-re2 (alias L13) | `(?i)-----\s*?BEGIN[ A-Z0-9_-]*?PRIVATE KEY\s*?-----[\s\S]*?----\s*?END[ A-Z0-9_-]*? PRIVATE KEY\s*?-----` | nested `*?` non-greedy plus an unbounded `[\s\S]*?` between two anchors — the classic catastrophic-backtracking shape | 40.8 ms on 18 MB, ≈0.79× benign — **linear / fast** |
 | `pkg/detectors/jdbc/jdbc.go:L53` (stdlib `regexp`, import L8) | stdlib RE2 | `(?i)jdbc:[\w]{3,10}:[^\s"']{0,512}`  (also L192 `(?i)pass.*?=(.+?)\b`; plus a user-supplied ignore regex compiled at runtime, L35-37) | large bounded quantifier `{0,512}` and a `pass.*?=(.+?)` pair; runtime-compiled user regex | 4.0 s / 201,581 matches on 18 MB — **linear** (see Q4) |
-| `pkg/detectors/azure_cosmosdb/azure_cosmosdb.go:L30`/`L32` (stdlib `regexp`, import L13) | stdlib RE2 | dbKeyPattern (L30, PrefixRegex expanded): <code>(?i:azure&#124;cosmos)(?:.&#124;[\n\r]){0,40}?([A-Za-z0-9]{86}==)</code>; accountUrlPattern (L32): <code>([a-z0-9-]{3,44}\\.(?:documents&#124;table\\.cosmos)\\.azure\\.com)</code> | long fixed-count `{86}` and a prefix regex | linear (exercised via keyword-dense; no disproportionate time) |
-| `pkg/detectors/azure_entra/serviceprincipal/v2/spv2.go:L32` (stdlib `regexp`, import L7) | stdlib RE2 | <code>(?:[^a-zA-Z0-9_~.-]&#124;\A)([a-zA-Z0-9_~.-]{3}\dQ~[a-zA-Z0-9_~.-]{31,34})(?:[^a-zA-Z0-9_~.-]&#124;\z)</code> | character-class ranges combined with `\A`/`\z` anchors | linear |
-| `pkg/detectors/anthropic/anthropic.go:L27` | go-re2 (alias L10) | <code>\b(sk-ant-(?:admin01&#124;api03)-[\w\\-]{93}AA)\b</code> | long `{93}` bounded quantifier | linear (representative go-re2 detector) |
+| `pkg/detectors/azure_cosmosdb/azure_cosmosdb.go:L30`/`L32` (stdlib `regexp`, import L13) | stdlib RE2 | dbKeyPattern (L30, PrefixRegex expanded): <code>(?i:azure&#124;cosmos)(?:.&#124;[\n\r]){0,40}?([A-Za-z0-9]{86}==)</code>; accountUrlPattern (L32): <code>([a-z0-9-]{3,44}\\.(?:documents&#124;table\\.cosmos)\\.azure\\.com)</code> | long fixed-count `{86}` and a prefix regex | **linear** — crafted `.documents.azure.com` + `{86}==` near-miss fixture: ≈1.4 s / 10 MB (≈9× benign, bounded), and 2×/4× size → 1.94×/3.78× time (see per-candidate evidence below) |
+| `pkg/detectors/azure_entra/serviceprincipal/v2/spv2.go:L32` (stdlib `regexp`, import L7) | stdlib RE2 | <code>(?:[^a-zA-Z0-9_~.-]&#124;\A)([a-zA-Z0-9_~.-]{3}\dQ~[a-zA-Z0-9_~.-]{31,34})(?:[^a-zA-Z0-9_~.-]&#124;\z)</code> | character-class ranges combined with `\A`/`\z` anchors | **linear** — crafted `Q~` near-miss fixture: ≈0.39 s / 10 MB (≈2.5× benign), 5 hits (see per-candidate evidence below) |
+| `pkg/detectors/anthropic/anthropic.go:L27` | go-re2 (alias L10) | <code>\b(sk-ant-(?:admin01&#124;api03)-[\w\\-]{93}AA)\b</code> | long `{93}` bounded quantifier | **linear** — crafted `sk-ant-api03-…{93}` near-miss fixture: ≈0.28 s / 10 MB (≈1.8× benign) (see per-candidate evidence below) |
 
 Every enumerated candidate ran in linear time. The three stdlib-`regexp` detectors (`jdbc`, `azure_cosmosdb`, `spv2`) are the only non-go-re2 detectors, and stdlib `regexp` is itself the RE2/linear family — so they are equally immune to catastrophic backtracking. No pattern in TruffleHog's detector set could be induced to exhibit super-linear behavior.
+
+### Q3 per-candidate crafted-input evidence (observed)
+
+The `privatekey` (≈0.79× benign — Q2/Q4) and `jdbc` (4.0 s / 201,581 matches — Q4) candidates are evidenced by the equal-size timing tables. The three remaining named candidates — `azure_cosmosdb`, `spv2`, and `anthropic` — were each fed a **dedicated crafted fixture that contains that detector's keyword** (so the Aho-Corasick prefilter routes the chunk to it) and is **shaped to maximally stress that detector's own pattern** as a near-miss "ReDoS attempt": for `azure_cosmosdb`, `azure`/`cosmos` markers plus long `[A-Za-z0-9]` runs with **no `==`** to force the `(?:.|[\n\r]){0,40}?([A-Za-z0-9]{86}==)` hunt to try and fail at many offsets, alongside real `.documents.azure.com` URLs; for `spv2`, dense `Q~` tokens with tail lengths straddling the `{31,34}` boundary; for `anthropic`, `sk-ant-api03-`/`sk-ant-admin01-` followed by 150 word-characters that never reach the required `AA` terminator. Each crafted fixture is **byte-for-byte 10,000,000 bytes**, equal to a keyword-free benign control, and was scanned with `./trufflehog filesystem <fixture> --no-verification --no-update` across **2 runs**.
+
+**Provenance (labeled).** These three per-candidate runs were captured during re-verification in the canonical `CGO_ENABLED=0` default-WebAssembly (go-re2/`wazero`) configuration — the same build as everything else in this document — but on a host whose core count differs from the 128-vCPU authoring container. The load-bearing values here are therefore the **crafted-vs-equal-size-benign ratio**, the **stability across the two runs**, and the **linear size-scaling** — all host-independent — not the absolute milliseconds.
+
+| Fixture (10,000,000 bytes, equal size) | keyword that routes it (occurrences) | unverified hits | scan_duration run1 / run2 | ratio vs benign | verdict |
+|---|---|---|---|---|---|
+| `benign_equal` (no detector keywords) | — | 0 | 155.97 ms / 153.55 ms | 1.0× | baseline |
+| `cand_azure_cosmosdb` | `.documents.azure.com` (18,979) | 1 | 1.385 s / 1.431 s | ≈9× | bounded, linear |
+| `cand_spv2` | `q~` / `Q~` (157,732) | 5 | 388.16 ms / 395.06 ms | ≈2.5× | bounded, linear |
+| `cand_anthropic` | `sk-ant-api03` (29,070) | 0 | 278.29 ms / 280.98 ms | ≈1.8× | bounded, linear |
+
+Verbatim `finished scanning` lines (run 1 of each; the `bytes` field is the chunker's peek-inflated count — ~13 MB of chunk data for a 10 MB file):
+
+```
+2026-07-08T08:51:07Z	info-0	trufflehog	finished scanning	{"chunks": 977, "bytes": 12998272, "verified_secrets": 0, "unverified_secrets": 0, "scan_duration": "155.970223ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}   # benign_equal
+2026-07-08T08:51:12Z	info-0	trufflehog	finished scanning	{"chunks": 977, "bytes": 12998272, "verified_secrets": 0, "unverified_secrets": 1, "scan_duration": "1.385190131s", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}   # cand_azure_cosmosdb
+2026-07-08T08:51:17Z	info-0	trufflehog	finished scanning	{"chunks": 977, "bytes": 12998272, "verified_secrets": 0, "unverified_secrets": 5, "scan_duration": "388.159742ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}   # cand_spv2
+2026-07-08T08:51:21Z	info-0	trufflehog	finished scanning	{"chunks": 977, "bytes": 12998272, "verified_secrets": 0, "unverified_secrets": 0, "scan_duration": "278.286137ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}   # cand_anthropic
+```
+
+`azure_cosmosdb` is the highest-cost of the three (≈9× benign), so it was additionally scaled to confirm that cost is **bounded linear content work, not the onset of blow-up**:
+
+| `cand_azure_cosmosdb` size | scan_duration | vs 5 MB |
+|---|---|---|
+| 5,000,000 bytes | 741.72 ms | 1.0× |
+| 10,000,000 bytes | 1.438 s | 1.94× (for 2× the size) |
+| 20,000,000 bytes | 2.806 s | 3.78× (for 4× the size) |
+
+Verbatim `finished scanning` lines for the scaling probe:
+
+```
+2026-07-08T08:52:00Z	info-0	trufflehog	finished scanning	{"chunks": 489, "bytes": 6498944, "verified_secrets": 0, "unverified_secrets": 0, "scan_duration": "741.722987ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}   # 5,000,000 bytes
+2026-07-08T08:52:03Z	info-0	trufflehog	finished scanning	{"chunks": 977, "bytes": 12998272, "verified_secrets": 0, "unverified_secrets": 1, "scan_duration": "1.437967558s", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}   # 10,000,000 bytes
+2026-07-08T08:52:08Z	info-0	trufflehog	finished scanning	{"chunks": 1954, "bytes": 25997824, "verified_secrets": 0, "unverified_secrets": 0, "scan_duration": "2.806297179s", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}   # 20,000,000 bytes
+```
+
+Doubling the file ≈ doubles the time (textbook O(n)); it never explodes. **Result:** every named Q3 candidate is now backed by observed crafted-input output — each was routed (its keyword is present), each **completed without hang or timeout**, each is **stable across runs**, and the worst (`azure_cosmosdb`, ≈9×) **scales linearly** with size. None exhibits disproportionate (super-linear) time.
 
 ---
 
@@ -292,7 +332,7 @@ Time grows in proportion to input size and to the number of hits — the definin
 
 ## CPU-profiling Evidence (Q5)
 
-Three verbatim profiling artifacts are embedded below. Together they prove (a) the hot path is the RE2 engine (go-re2 in WebAssembly) with no backtracking function, and (b) throughput is constant across chunk sizes, i.e. linear in the input.
+Three verbatim profiling artifacts are embedded below. Together they prove (a) the hot path is the RE2 engine (go-re2 in WebAssembly) with no catastrophic backtracking-engine function — any `backtrack`-named frames belong to Go stdlib `regexp`'s bounded, linear one-pass backtracker (see the footnote after artifact (A)) — and (b) throughput is constant across chunk sizes, i.e. linear in the input.
 
 **(A) Live `--profile` server (`main.go:L53`, `main.go:L434`) during a 150 MB keyword-dense scan — `go tool pprof -top` of `http://localhost:18066/debug/pprof/profile`:**
 
@@ -342,6 +382,18 @@ Showing top 30 nodes out of 32
 ```
 
 **Interpretation.** `runtime._ExternalCode` (92.32% flat) is the **go-re2 RE2 engine running as WebAssembly** via the pure-Go `wazero` runtime — the default `CGO_ENABLED=0` mode. The `github.com/tetratelabs/wazero/internal/engine/wazevo.(*callEngine).callWithStack` frames are the WASM host calls, and the `github.com/wasilibs/go-re2/internal.*` frames (`lazyFunction.callWithStack` 4.56% cum, `FindAllStringSubmatch` 4.05%, `matchFrom` 3.87%, `findAllSubmatch` 3.77%) are the RE2 match invocations. The hottest *detector* frames are `postgres.findUriMatches` (4.39% cum) and `postgres.Scanner.FromData` (4.44% cum) — the `postgres` detector, triggered by the fixture's `jdbc:postgresql://` strings — plus `aws/access_keys.scanner.FromData` (0.53% cum). **These three detectors are all go-re2 detectors** (each imports `regexp "github.com/wasilibs/go-re2"`: `pkg/detectors/postgres/postgres.go:L14`, `pkg/detectors/aws/access_keys/accesskey.go:L17`, and `pkg/detectors/aws/common.go:L3`), so their regex cost is spent inside the WebAssembly path above — **not** in any standard-library engine. The single standard-library frame is `regexp.(*Regexp).doExecute` (0.55% cum, 10.73 s) — the Go stdlib `regexp` engine — and it is driven by the one *stdlib* detector this fixture triggers, `jdbc` (stdlib `regexp` at `jdbc.go:L8`, keyword `jdbc`). (Note: `jdbc` is among the 3 stdlib-`regexp` detectors; `aws/access_keys` and `postgres` are **not** — a distinction the profile makes visible because both engines appear at once.) Crucially, **no backtracking-engine function (e.g. anything from `dlclark/regexp2`) appears anywhere in the profile** — this is the profiling proof of the Q2 answer that TruffleHog matches on a linear-time engine only. That scan completed; it did not hang.
+
+**Footnote — "backtracking function" vs. "backtracking *engine*".** When a standard-library-`regexp` detector runs (here, `jdbc`), a CPU profile expanded with `-nodefraction=0` *does* surface Go stdlib frames literally named `regexp.(*Regexp).backtrack` and `regexp.(*Regexp).tryBacktrack`. (They are absent from artifact (A)'s top-30 view only because that view "Dropped 1111 nodes (cum <= 9.78s)": (A) shows their parent `regexp.(*Regexp).doExecute` at 10.73 s cum — just above that threshold — but the `backtrack`/`tryBacktrack` children fall below it and are dropped from the top-30.) These are **not** a catastrophic backtracking *engine*. Go's standard-library `regexp` — the same RE2/linear-time family used throughout TruffleHog — has a `backtrack` code path that is a **bounded, linear** one-pass matcher: per the Go source `src/regexp/backtrack.go` (L5–L14), it "allocates a bit vector with (length of input) * (length of prog) bits ... to make sure it never explores the same (character position, instruction) state multiple times. This limits the search to run in time linear in the length of the test," and it runs only on **small** regexps (guarded by `maxBacktrackProg = 500` and `maxBacktrackVector = 256 * 1024` at `backtrack.go:L32-L33`). It therefore cannot exhibit exponential (catastrophic) backtracking. A focused re-verification scan of a `jdbc:`-dense fixture with `--profile`, captured with `go tool pprof -top -nodefraction=0`, shows those frames are tiny and bounded (verbatim excerpt):
+
+```
+      flat  flat%   sum%        cum   cum%
+     0.38s   0.8% 62.13%      1.08s  2.27%  regexp.(*Regexp).tryBacktrack
+     0.28s  0.59% 68.08%      1.51s  3.18%  regexp.(*Regexp).backtrack
+     0.01s 0.021% 98.04%      1.52s  3.20%  regexp.(*Regexp).doMatch (inline)
+         0     0%   100%      5.58s 11.74%  regexp.(*Regexp).doExecute
+```
+
+The load-bearing profiling claim is therefore precisely scoped: **no *catastrophic backtracking-engine* function (for example, anything from `github.com/dlclark/regexp2`, or a PCRE-style engine) appears anywhere** — that engine is `// indirect` and unused under `pkg/` (`go.mod:L187`). Grepping this profile for `dlclark` / `regexp2` / `pcre` returns zero matches, while the go-re2 / `wazero` RE2 frames dominate the hot path. (This supplementary `-nodefraction=0` capture was taken during re-verification on a host whose core count differs from the 128-vCPU authoring container; absolute sample-seconds scale with core count, but the *proportions* — a few percent, bounded — are the host-independent point.)
 
 **(B) fgprof wall-clock (`/debug/fgprof`) — same scan:**
 
@@ -565,7 +617,7 @@ grep -rc "a detector ignored the context timeout" /work/logs/
 
 ## Conclusion
 
-**Catastrophic-backtracking ReDoS is not reproducible against TruffleHog's detectors.** The detectors compile their patterns on Google RE2 via `github.com/wasilibs/go-re2` (`go.mod:L100`, v1.9.0) — a linear-time, non-backtracking engine — across 867 of 870 detector files, with the remaining 3 on the Go standard-library `regexp` (the same RE2/linear family). The only backtracking engine in the module graph, `github.com/dlclark/regexp2` (`go.mod:L187`, `// indirect`), has zero direct use under `pkg/`. A classic ReDoS-shaped input scanned *slightly faster* than an equal-size benign control (0.79×), and the live CPU profile shows the RE2 engine executing in WebAssembly with no backtracking function anywhere in the hot path.
+**Catastrophic-backtracking ReDoS is not reproducible against TruffleHog's detectors.** The detectors compile their patterns on Google RE2 via `github.com/wasilibs/go-re2` (`go.mod:L100`, v1.9.0) — a linear-time, non-backtracking engine — across 867 of 870 detector files, with the remaining 3 on the Go standard-library `regexp` (the same RE2/linear family). The only backtracking engine in the module graph, `github.com/dlclark/regexp2` (`go.mod:L187`, `// indirect`), has zero direct use under `pkg/`. A classic ReDoS-shaped input scanned *slightly faster* than an equal-size benign control (0.79×), and the live CPU profile shows the RE2 engine executing in WebAssembly with no catastrophic backtracking-engine function (nothing from `dlclark/regexp2` or any PCRE-style engine) anywhere in the hot path — the only `backtrack`-named frames are Go stdlib `regexp`'s bounded, linear one-pass matcher (see the Q5 footnote).
 
 **The real, observed behavior is bounded and linear.** The maximum content-driven slowdown for a byte-for-byte equal-size file is ≈140× at the pure-scan level (≈5.0× end-to-end), and it is strictly linear work proportional to the number of secret candidates in the file — confirmed by linear scaling from 18 MB to 150 MB (8.33× size → 8.33× hits → 7.82× time). Input reaching any single regex is bounded by the 13 KB chunker (`pkg/sources/chunker.go:L14-L18`), the Aho-Corasick keyword prefilter (`pkg/engine/engine.go:L795`), and the ±512-byte extraction window (`pkg/engine/ahocorasick/ahocorasickcore.go:L155`). Even the worst 150 MB / 793,997-candidate scan completed in ~56 s and never hung, and the per-detector timeout (`pkg/engine/engine.go:L1066-L1077`) is soft — it only logs, never force-kills — and never fired.
 
