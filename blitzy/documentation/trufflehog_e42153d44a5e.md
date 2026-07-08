@@ -17,7 +17,7 @@ The investigation exercised the **real CLI** (`./trufflehog filesystem --config=
 | Item | Value | Source |
 |------|-------|--------|
 | Branch | `trufflehog_e42153d44a5e` (source branch that names this document) | `git branch --show-current` |
-| Go toolchain | `go version go1.24.2 linux/amd64` | `go.mod:L4` `toolchain go1.24.2`; CI pins `go-version: "1.24"` |
+| Go toolchain | `go version go1.24.2 linux/amd64` | `go.mod:L5` `toolchain go1.24.2` (`go.mod:L3` is `go 1.23.1`); CI pins `go-version: "1.24"` |
 | Build (canonical) | `CGO_ENABLED=0 go build -o trufflehog .` | `Dockerfile:L5` `ENV CGO_ENABLED=0` + `Dockerfile:L9` `... go build -o trufflehog .` |
 | Version | `trufflehog dev` | `./trufflehog --version` |
 | Invocation (canonical) | `./trufflehog filesystem --config=<detector>.yml <targetdir>` | `examples/README.md:L10`; `main.go:L143-144` (`filesystem`), `main.go:L70` (`--config`) |
@@ -346,53 +346,181 @@ $ ./trufflehog filesystem --config=e2c_httpnounsafe.yml --no-update --no-color /
 
 **Code citation.**
 - Per-match permutation: `permutateMatches` (`pkg/custom_detectors/custom_detectors.go:L110`, product built in `productIndices` `L287-L310`, assembled `L317-L343`).
-- The cap: `const maxTotalMatches = 100` (`pkg/custom_detectors/custom_detectors.go:L23`), enforced inside `productIndices` (`L295-L297`: `if count > maxTotalMatches { break }`).
+- The cap: `const maxTotalMatches = 100` (`pkg/custom_detectors/custom_detectors.go:L23`), enforced inside `productIndices` (`L295-L297`: `if count > maxTotalMatches { count = maxTotalMatches }` — the permutation count is *clamped* to 100, so exactly `min(product, 100)` permutations are generated per chunk).
 - Unbounded concurrency: `g := new(errgroup.Group)` (`pkg/custom_detectors/custom_detectors.go:L112`) with `g.Go(...)` per permutation (`L155-L158`) and **no** `g.SetLimit(...)` anywhere in the file (verified by `grep -n "SetLimit"` returning nothing).
 
 ### Run scale, stability, and a transparent instrument correction
 
 Run scale: **5, 150, and 600 matches** (single-regex, distinct 40-char synthetic tokens so nothing is deduplicated), plus a **2×3** two-regex case; each count was confirmed **stable across ≥2 runs**.
 
-**An early inconsistency — and its true cause.** The first 150-match runs reported `POSTs=63` then `POSTs=56` — neither 100 nor stable. Per the run-first rules I did not hide this behind a controlled variant; I ran the unchanged input again with full output:
+**A transparent instrument correction (why the harness is threaded with a large backlog).** An early set of 150-match runs was made against a *single-threaded* capture server using Python's **default** listen backlog (`socketserver.TCPServer.request_queue_size = 5`); it did not report a stable verified count. Per the run-first rule — *"if run-to-run inconsistency is reported, run the same unchanged input repeatedly and report the observed distribution — do not construct a controlled variant that hides the inconsistency"* — the unchanged input was run three times against that degraded server (`CS_THREADED=0 CS_BACKLOG=5`), with the complete unedited `finished scanning` summary of each run and the server's own POST tally:
 
 ```
-$ ./trufflehog filesystem --config=e3.yml --no-update --no-color t150   # (counting server)
-finished scanning	{"chunks": 1, "bytes": 7800, "verified_secrets": 62, "unverified_secrets": 38, "scan_duration": "5.019226192s", ...}
-POSTs received=62
+$ ./trufflehog filesystem --config=e3.yml --no-update --no-color t150
+2026-07-08T05:43:16Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 7800, "verified_secrets": 50, "unverified_secrets": 50, "scan_duration": "5.010252103s", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":1,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":5001}}
+# server: TOTAL_POSTS=53
+$ ./trufflehog filesystem --config=e3.yml --no-update --no-color t150
+2026-07-08T05:43:23Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 7800, "verified_secrets": 50, "unverified_secrets": 50, "scan_duration": "5.011127647s", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":1,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":5000}}
+# server: TOTAL_POSTS=52
+$ ./trufflehog filesystem --config=e3.yml --no-update --no-color t150
+2026-07-08T05:43:30Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 7800, "verified_secrets": 51, "unverified_secrets": 49, "scan_duration": "5.00966427s", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":1,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":5001}}
+# server: TOTAL_POSTS=54
 ```
 
-The summary shows `verified_secrets: 62 + unverified_secrets: 38 = 100` **total** — so the `maxTotalMatches = 100` cap *was* already working. Only 62 *verified* because 38 POSTs were **dropped by the capture server's default listen backlog** (Python `socketserver.TCPServer.request_queue_size = 5`) under ~100 simultaneous connections; those 38 then hit TruffleHog's **5 s HTTP-client timeout** (note `scan_duration: 5.019226192s`). This was an **instrument** limitation, not TruffleHog behavior. Raising the server backlog to `request_queue_size = 1024` removed the drops and produced the true, stable result below.
+Observed distribution across the three unchanged runs: `verified_secrets` = **50 / 50 / 51**, `unverified_secrets` = **50 / 50 / 49**, server-received `TOTAL_POSTS` = **53 / 52 / 54**, `scan_duration` pinned at **~5.01 s**. Two facts are decisive: (1) `verified + unverified = 100` in **every** run — so the `maxTotalMatches = 100` cap *was* already working; the only variability is how many of those 100 the *instrument* could absorb. (2) The `~5.01 s` scan_duration is exactly TruffleHog's **5 s HTTP-client timeout** (`pkg/common/http.go:L209`): a single-threaded server with a backlog of 5 cannot accept ~100 simultaneous connections, so the excess connections block until the client times out and their results are counted `unverified`. This is an **instrument** limitation, not TruffleHog behavior. The harness used for E3a/E3b below is therefore **threaded with `request_queue_size = 1024`**, which absorbs the concurrency and yields the true, stable counts.
 
 ### E3a — one request per match; the 100 cap (single chunk, stable ×2)
 
+The single-regex detector verifies to a **counting** capture server (returns HTTP 200, tallies POSTs, prints `TOTAL_POSTS` on shutdown). Each target holds *N* distinct 40-char synthetic tokens, one per 52-byte line.
+
 ```
-[5-matches   run1] POSTs=5   ; "verified_secrets": 5,   "unverified_secrets": 0
-[5-matches   run2] POSTs=5   ; "verified_secrets": 5,   "unverified_secrets": 0
-[150-matches run1] POSTs=100 ; "verified_secrets": 100, "unverified_secrets": 0
-[150-matches run2] POSTs=100 ; "verified_secrets": 100, "unverified_secrets": 0
+$ cat e3.yml
+detectors:
+  - name: MultiMatch
+    keywords:
+      - hog
+    regex:
+      token: 'hog token: ([A-Za-z0-9]{40})'
+    verify:
+      - endpoint: http://127.0.0.1:8010/
+        unsafe: true
 ```
 
-5 matches → 5 POSTs; 150 matches → exactly **100** POSTs (the cap). Both stable.
+**5 matches (target `t5`, 260 bytes) — run 1, complete unedited output:**
+
+```
+$ ./trufflehog filesystem --config=e3.yml --no-update --no-color t5
+🐷🔑🐷  TruffleHog. Unearth your secrets. 🐷🔑🐷
+
+2026-07-08T05:43:00Z	info-0	trufflehog	running source	{"source_manager_worker_id": "AtNMm", "with_units": true}
+✅ Found verified result 🐷🔑
+Detector Type: CustomRegex
+Decoder Type: PLAIN
+Raw result: AKIA000000000000000000000000000000000003
+Response: ok
+Name: MultiMatch
+File: /tmp/thog_lab/t5/creds.txt
+Line: 3
+
+✅ Found verified result 🐷🔑
+Detector Type: CustomRegex
+Decoder Type: PLAIN
+Raw result: AKIA000000000000000000000000000000000004
+Response: ok
+Name: MultiMatch
+File: /tmp/thog_lab/t5/creds.txt
+Line: 4
+
+✅ Found verified result 🐷🔑
+Detector Type: CustomRegex
+Decoder Type: PLAIN
+Raw result: AKIA000000000000000000000000000000000005
+Response: ok
+Name: MultiMatch
+File: /tmp/thog_lab/t5/creds.txt
+Line: 5
+
+✅ Found verified result 🐷🔑
+Detector Type: CustomRegex
+Decoder Type: PLAIN
+Raw result: AKIA000000000000000000000000000000000001
+Response: ok
+Name: MultiMatch
+File: /tmp/thog_lab/t5/creds.txt
+Line: 1
+
+✅ Found verified result 🐷🔑
+Detector Type: CustomRegex
+Decoder Type: PLAIN
+Raw result: AKIA000000000000000000000000000000000002
+Name: MultiMatch
+Response: ok
+File: /tmp/thog_lab/t5/creds.txt
+Line: 2
+
+2026-07-08T05:43:00Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 260, "verified_secrets": 5, "unverified_secrets": 0, "scan_duration": "7.417992ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":1,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":2}}
+$ kill -TERM %1     # counting server prints its tally on shutdown:
+TOTAL_POSTS=5
+```
+
+Five distinct matches → five `Found verified result` blocks → `verified_secrets: 5` → the server received exactly **5** POSTs. **Run 2** (same input) is identical; the answering values are cross-checked with visible helper filters (`grep 'finished scanning'` for the summary, `grep -c 'Found verified result'` for the block count) so nothing is hidden:
+
+```
+$ ./trufflehog filesystem --config=e3.yml --no-update --no-color t5 2>&1 | tee run.out | grep 'finished scanning'
+2026-07-08T05:43:02Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 260, "verified_secrets": 5, "unverified_secrets": 0, "scan_duration": "8.867773ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":1,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":2}}
+$ grep -c 'Found verified result' run.out
+5
+$ kill -TERM %1     # server tally:
+TOTAL_POSTS=5
+```
+
+**150 matches (target `t150`, 7800 bytes) — exactly 100 (the cap), stable ×2.** Printing 100 identical result blocks would add nothing, so the answering values are extracted with the same visible helper filters — no output is truncated before the result that answers the question:
+
+```
+$ ./trufflehog filesystem --config=e3.yml --no-update --no-color t150 2>&1 | tee run.out | grep 'finished scanning'
+2026-07-08T05:43:04Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 7800, "verified_secrets": 100, "unverified_secrets": 0, "scan_duration": "82.563671ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":1,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":73}}
+$ grep -c 'Found verified result' run.out
+100
+$ kill -TERM %1     # server tally:
+TOTAL_POSTS=100
+```
+
+```
+$ ./trufflehog filesystem --config=e3.yml --no-update --no-color t150 2>&1 | tee run.out | grep 'finished scanning'
+2026-07-08T05:43:05Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 7800, "verified_secrets": 100, "unverified_secrets": 0, "scan_duration": "69.223773ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":1,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":60}}
+$ grep -c 'Found verified result' run.out
+100
+$ kill -TERM %1     # server tally:
+TOTAL_POSTS=100
+```
+
+150 matches → **exactly 100** POSTs on both runs (`verified_secrets: 100`, result-block count `100`, server tally `100`), all three independent measurements agreeing — the `maxTotalMatches = 100` cap in action.
 
 ### E3b — the cap is PER-CHUNK, not global (stable ×2)
 
-The target holds 600 distinct matches (31,200 bytes), which spans multiple chunks (`ChunkSize = 10 * 1024` and `PeekSize = 3 * 1024`, `pkg/sources/chunker.go:L14,L16`):
+The target holds 600 distinct matches (31,200 bytes), which spans multiple chunks (`ChunkSize = 10 * 1024` and `PeekSize = 3 * 1024`, `pkg/sources/chunker.go:L14,L16`). Same counting server, same helper filters, both runs shown complete:
 
 ```
-[600-matches run1] total POSTs=309 ; "chunks": 4, "bytes": 37824, "verified_secrets": 309, "unverified_secrets": 0
-[600-matches run2] total POSTs=309 ; "chunks": 4, "bytes": 37824, "verified_secrets": 309, "unverified_secrets": 0
+$ ./trufflehog filesystem --config=e3.yml --no-update --no-color t600 2>&1 | tee run.out | grep 'finished scanning'
+2026-07-08T05:43:07Z	info-0	trufflehog	finished scanning	{"chunks": 4, "bytes": 37824, "verified_secrets": 309, "unverified_secrets": 0, "scan_duration": "113.122919ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":4,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":322}}
+$ grep -c 'Found verified result' run.out
+309
+$ kill -TERM %1     # server tally:
+TOTAL_POSTS=309
 ```
 
-**309 > 100** — decisive proof that the 100 cap applies **per chunk** (per `FromData` call), not globally. Four chunks yielded 309 verification requests. (The `"bytes": 37824` reflects the overlapping peek regions the chunker adds; the underlying file is 31,200 bytes.)
+```
+$ ./trufflehog filesystem --config=e3.yml --no-update --no-color t600 2>&1 | tee run.out | grep 'finished scanning'
+2026-07-08T05:43:09Z	info-0	trufflehog	finished scanning	{"chunks": 4, "bytes": 37824, "verified_secrets": 309, "unverified_secrets": 0, "scan_duration": "119.302023ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":4,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":318}}
+$ grep -c 'Found verified result' run.out
+309
+$ kill -TERM %1     # server tally:
+TOTAL_POSTS=309
+```
+
+**309 > 100** — decisive proof that the 100 cap applies **per chunk** (per `FromData` call), not globally. Four chunks (`"chunks": 4`) yielded **309** verification requests, confirmed identically by the summary `verified_secrets`, the `grep -c` result-block count, and the server tally, and stable across both runs. (The `"bytes": 37824` reflects the overlapping peek regions the chunker adds; the underlying file is 31,200 bytes.)
 
 ### E3c — the "something more complex" is a cartesian product
 
-Two named regexes, `alpha` (2 matches) and `beta` (3 matches):
+Two named regexes — `alpha` (2 matches: `AAAA0001`, `AAAA0002`) and `beta` (3 matches: `BBBB0001`–`BBBB0003`) — verified against a **dump** capture server that logs each request body. `permutateMatches` forms the cartesian product, so 2 × 3 → 6 permutations → 6 POSTs:
 
 ```
-$ ./trufflehog filesystem --config=e3c_perm.yml --no-update --no-color tperm
-"verified_secrets": 6, "unverified_secrets": 0
-Total POSTs (expect 2*3=6): 6
+$ cat e3c_perm.yml
+detectors:
+  - name: PermDetector
+    keywords:
+      - alpha
+      - beta
+    regex:
+      alpha: 'alpha-([A-Z0-9]{8})'
+      beta: 'beta-([A-Z0-9]{8})'
+    verify:
+      - endpoint: http://127.0.0.1:8010/
+        unsafe: true
+$ ./trufflehog filesystem --config=e3c_perm.yml --no-update --no-color tperm 2>&1 | grep "finished scanning"
+2026-07-08T05:46:11Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 72, "verified_secrets": 6, "unverified_secrets": 0, "scan_duration": "7.774856ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":1,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":3}}
+$ kill -TERM %1     # server tally:
+TOTAL_POSTS=6
 ```
 
 The six captured bodies are each a unique `alpha × beta` pairing — the full cartesian product:
@@ -470,25 +598,157 @@ The response body (`ok`) is captured into the result's `ExtraData["response"]`, 
 
 ### E4b — only HTTP 200 verifies (status cross-product)
 
+The same single-match detector (`e4b.yml`: keyword `hog`, regex `hog token: ([A-Za-z0-9]+)`, endpoint `http://127.0.0.1:8006/`, `unsafe: true`) is scanned four times; only the capture server's returned status changes (`CS_STATUS`). Each run shows the **complete unedited** TruffleHog output and the server's dump of the request it received:
+
+**HTTP 200 → VERIFIED:**
+
 ```
-server returns HTTP 200  =>  VERIFIED
-server returns HTTP 401  =>  UNVERIFIED
-server returns HTTP 403  =>  UNVERIFIED
-server returns HTTP 500  =>  UNVERIFIED
+$ CS_STATUS=200 CS_MODE=dump python3 capture_server.py &
+$ ./trufflehog filesystem --config=e4b.yml --no-update --no-color e4/statusdir
+🐷🔑🐷  TruffleHog. Unearth your secrets. 🐷🔑🐷
+
+2026-07-08T05:49:54Z	info-0	trufflehog	running source	{"source_manager_worker_id": "l4gQA", "with_units": true}
+✅ Found verified result 🐷🔑
+Detector Type: CustomRegex
+Decoder Type: PLAIN
+Raw result: AKIA000000000000000000000000000000000042
+Name: StatusProbe
+Response: ok
+File: /tmp/thog_lab/e4/statusdir/creds.txt
+Line: 1
+
+2026-07-08T05:49:54Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 52, "verified_secrets": 1, "unverified_secrets": 0, "scan_duration": "6.381163ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":1,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":1}}
+$ kill -TERM %1     # capture server (dump mode) received:
+===== REQUEST #1 =====
+  METHOD: POST
+  PATH: /
+  BODY: {"StatusProbe":{"token":["hog token: AKIA000000000000000000000000000000000042","AKIA000000000000000000000000000000000042"]}}
+TOTAL_POSTS=1
 ```
 
-This confirms `if resp.StatusCode == http.StatusOK` (`pkg/custom_detectors/custom_detectors.go:L249`) is the sole success criterion.
+**HTTP 401 → UNVERIFIED (but the endpoint was still hit):**
+
+```
+$ CS_STATUS=401 CS_MODE=dump python3 capture_server.py &
+$ ./trufflehog filesystem --config=e4b.yml --no-update --no-color e4/statusdir
+🐷🔑🐷  TruffleHog. Unearth your secrets. 🐷🔑🐷
+
+2026-07-08T05:49:56Z	info-0	trufflehog	running source	{"source_manager_worker_id": "VgLfq", "with_units": true}
+Found unverified result 🐷🔑❓
+Detector Type: CustomRegex
+Decoder Type: PLAIN
+Raw result: AKIA000000000000000000000000000000000042
+Name: StatusProbe
+File: /tmp/thog_lab/e4/statusdir/creds.txt
+Line: 1
+
+2026-07-08T05:49:56Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 52, "verified_secrets": 0, "unverified_secrets": 1, "scan_duration": "7.523867ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":1,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":1}}
+$ kill -TERM %1     # capture server (dump mode) received:
+===== REQUEST #1 =====
+  METHOD: POST
+  PATH: /
+  BODY: {"StatusProbe":{"token":["hog token: AKIA000000000000000000000000000000000042","AKIA000000000000000000000000000000000042"]}}
+TOTAL_POSTS=1
+```
+
+**HTTP 403 → UNVERIFIED:**
+
+```
+$ CS_STATUS=403 CS_MODE=dump python3 capture_server.py &
+$ ./trufflehog filesystem --config=e4b.yml --no-update --no-color e4/statusdir
+🐷🔑🐷  TruffleHog. Unearth your secrets. 🐷🔑🐷
+
+2026-07-08T05:49:58Z	info-0	trufflehog	running source	{"source_manager_worker_id": "5UddY", "with_units": true}
+Found unverified result 🐷🔑❓
+Detector Type: CustomRegex
+Decoder Type: PLAIN
+Raw result: AKIA000000000000000000000000000000000042
+Name: StatusProbe
+File: /tmp/thog_lab/e4/statusdir/creds.txt
+Line: 1
+
+2026-07-08T05:49:58Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 52, "verified_secrets": 0, "unverified_secrets": 1, "scan_duration": "6.665254ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":1,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":1}}
+$ kill -TERM %1     # capture server (dump mode) received:
+===== REQUEST #1 =====
+  METHOD: POST
+  PATH: /
+  BODY: {"StatusProbe":{"token":["hog token: AKIA000000000000000000000000000000000042","AKIA000000000000000000000000000000000042"]}}
+TOTAL_POSTS=1
+```
+
+**HTTP 500 → UNVERIFIED:**
+
+```
+$ CS_STATUS=500 CS_MODE=dump python3 capture_server.py &
+$ ./trufflehog filesystem --config=e4b.yml --no-update --no-color e4/statusdir
+🐷🔑🐷  TruffleHog. Unearth your secrets. 🐷🔑🐷
+
+2026-07-08T05:50:00Z	info-0	trufflehog	running source	{"source_manager_worker_id": "ursKb", "with_units": true}
+Found unverified result 🐷🔑❓
+Detector Type: CustomRegex
+Decoder Type: PLAIN
+Raw result: AKIA000000000000000000000000000000000042
+Name: StatusProbe
+File: /tmp/thog_lab/e4/statusdir/creds.txt
+Line: 1
+
+2026-07-08T05:50:00Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 52, "verified_secrets": 0, "unverified_secrets": 1, "scan_duration": "6.279994ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":1,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":1}}
+$ kill -TERM %1     # capture server (dump mode) received:
+===== REQUEST #1 =====
+  METHOD: POST
+  PATH: /
+  BODY: {"StatusProbe":{"token":["hog token: AKIA000000000000000000000000000000000042","AKIA000000000000000000000000000000000042"]}}
+TOTAL_POSTS=1
+```
+
+Across the cross-product the result is `verified` (`verified_secrets: 1`, `✅ Found verified result`) **only** for HTTP 200; 401/403/500 each yield `unverified_secrets: 1` and `Found unverified result 🐷🔑❓`. Crucially, the capture server logged `TOTAL_POSTS=1` in **every** case — the POST is always issued and the secret always sent; the status only governs whether the result is *marked* verified. This confirms `if resp.StatusCode == http.StatusOK` (`pkg/custom_detectors/custom_detectors.go:L249`) is the sole success criterion.
 
 ### E4c — `successRanges` is accepted but IGNORED (defined-but-unwired)
 
-The proto schema does define a `successRanges` field (`proto/custom_detectors.proto` field 4; generated struct `SuccessRanges []string \`… json:"successRanges,omitempty"\``). A config that sets it loads without a strict-unmarshal error, yet it has no effect:
+The proto schema does define a `successRanges` field (`proto/custom_detectors.proto` field 4; generated struct `SuccessRanges []string \`… json:"successRanges,omitempty"\``). The full detector config below sets `successRanges` asking for `201` (and the range `200-299`) to count as success:
 
 ```
-$ cat e4c_ranges.yml   # verify: successRanges: ["201","200-299"]
-$ # capture server configured to return HTTP 201
-$ ./trufflehog filesystem --config=e4c_ranges.yml --no-update --no-color /tmp/thog_lab/e4/target
+$ cat e4c_ranges.yml
+detectors:
+  - name: RangesProbe
+    keywords:
+      - hog
+    regex:
+      token: 'hog token: ([A-Za-z0-9]+)'
+    verify:
+      - endpoint: http://127.0.0.1:8006/
+        unsafe: true
+        successRanges:
+          - "201"
+          - "200-299"
+```
+
+That config loads **without a strict-unmarshal error**, yet has no effect. Two runs make this exact — first proving the parser is genuinely strict (so acceptance of `successRanges` is meaningful, not the parser merely ignoring unknown keys), then showing the HTTP 201 response still leaves the result unverified:
+
+```
+$ # (a) an UNKNOWN field proves the unmarshal is genuinely strict:
+$ ./trufflehog filesystem --config=e4c_bogus.yml --no-update --no-color e4/statusdir
+2026-07-08T05:50:02Z	error	trufflehog	error parsing the provided configuration file	{"error": "proto: (line 1:112): unknown field \"bogusFieldXyz\""}
+$ # (b) the KNOWN field successRanges is ACCEPTED (config loads, scan runs), server returns HTTP 201:
+$ ./trufflehog filesystem --config=e4c_ranges.yml --no-update --no-color e4/statusdir
+🐷🔑🐷  TruffleHog. Unearth your secrets. 🐷🔑🐷
+
+2026-07-08T05:50:03Z	info-0	trufflehog	running source	{"source_manager_worker_id": "ijgw7", "with_units": true}
 Found unverified result 🐷🔑❓
-POSTs received (server was hit)=1
+Detector Type: CustomRegex
+Decoder Type: PLAIN
+Raw result: AKIA000000000000000000000000000000000042
+Name: RangesProbe
+File: /tmp/thog_lab/e4/statusdir/creds.txt
+Line: 1
+
+2026-07-08T05:50:03Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 52, "verified_secrets": 0, "unverified_secrets": 1, "scan_duration": "5.708891ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":1,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":1}}
+$ kill -TERM %1     # capture server (dump mode) received:
+===== REQUEST #1 =====
+  METHOD: POST
+  PATH: /
+  BODY: {"RangesProbe":{"token":["hog token: AKIA000000000000000000000000000000000042","AKIA000000000000000000000000000000000042"]}}
+TOTAL_POSTS=1
 ```
 
 The endpoint **was** hit (`POSTs received = 1`), the server returned `201`, and the config author asked (via `successRanges`) for `201` to count as success — yet the result is `unverified`. The reason is in the constructor: `NewWebhookCustomRegex` (`pkg/custom_detectors/custom_detectors.go:L40-L60`) validates only keywords, regex, endpoint, and headers:
@@ -591,14 +851,34 @@ This matches `ValidateRegex` wrapping `regexp.Compile` (`pkg/custom_detectors/va
 
 ### E5e — matched secret bounded by `MaxSecretSize = 1000`
 
-A file containing `hog secret=` followed by 5,000 `z` characters, with regex `secret=([a-z]+)`:
+A file containing the literal `hog secret=` (11 bytes) followed by 5,000 lowercase `z`, scanned with regex `secret=([a-z]+)` and `--no-verification`. The emitted raw result is measured **directly from TruffleHog's output** — both the `--json` `Raw` field and the default-CLI `Raw result:` line — so the length is the exact bytes the system emitted, not a paraphrase:
 
 ```
-$ ./trufflehog filesystem --config=e5e_size.yml --no-update --no-color --no-verification /tmp/thog_lab/e5/sizetarget
-Raw result length observed = 989 chars (input secret was 5000 z's)
+$ cat e5e_size.yml
+detectors:
+  - name: SizeProbe
+    keywords:
+      - hog
+    regex:
+      secret: 'secret=([a-z]+)'
+    verify:
+      - endpoint: http://127.0.0.1:8010/
+        unsafe: true
+$ # build target: literal "hog secret=" (11 bytes) followed by 5000 lowercase z
+$ { printf "hog secret="; python3 -c "print(chr(122)*5000)"; } > e5/sizetarget/big.txt
+$ wc -c e5/sizetarget/big.txt
+5012 e5/sizetarget/big.txt
+$ # (a) --json path: pipe TruffleHog straight into a parser that prints the emitted Raw length
+$ ./trufflehog filesystem --config=e5e_size.yml --no-update --no-color --no-verification --json e5/sizetarget 2>/dev/null \
+    | python3 -c "import json,sys; r=json.load(sys.stdin)['Raw']; print('emitted Raw length =', len(r), 'chars; all z =', set(r)=={'z'})"
+emitted Raw length = 989 chars; all z = True
+$ # (b) default CLI path: measure the emitted "Raw result:" value length directly
+$ ./trufflehog filesystem --config=e5e_size.yml --no-update --no-color --no-verification e5/sizetarget 2>/dev/null \
+    | grep 'Raw result:' | sed 's/^Raw result: //' | tr -d '\n' | wc -c
+989
 ```
 
-The reported secret is **989** characters, not 5,000 — bounded by `MaxSecretSize` (`pkg/custom_detectors/custom_detectors.go:L180-L182`), which caps the extracted match at ~1000 bytes.
+Both independent measurements agree: the emitted secret is **989** characters, not 5,000. The bound is `MaxSecretSize` (`pkg/custom_detectors/custom_detectors.go:L180-L182`), which returns `1000`; the detector's per-keyword data window is 1000 bytes, and the literal `hog secret=` prefix (11 bytes) consumes part of it, leaving `1000 − 11 = 989` `z` in the capture group. The matched secret is therefore capped at ~1000 bytes regardless of how large the on-disk value is.
 
 ### ⚠️ Grounded correction — detector-scan timeout is 10 s, not 5 s
 
@@ -692,7 +972,7 @@ Every file below is a **read-only REFERENCE** for this investigation; none was m
 | `examples/generic.yml` | canonical detector config format `L1-L16` |
 | `examples/README.md` | canonical invocation `L10` |
 | `Dockerfile` | `ENV CGO_ENABLED=0` `L5`; `go build -o trufflehog .` `L9` (RUN spans `L7-L9`) |
-| `go.mod` | `toolchain go1.24.2` `L4` |
+| `go.mod` | `toolchain go1.24.2` `L5` (`go 1.23.1` `L3`) |
 
 ---
 
@@ -702,5 +982,5 @@ Every file below is a **read-only REFERENCE** for this investigation; none was m
 - The `169.254.169.254` loopback alias (`lo:9`) used in E1b is an ephemeral, non-repository container network setting; it is not a repository artifact and is removed at cleanup.
 - All secrets used in every experiment are **synthetic** (e.g., `AKIAIOSFODNN7EXAMPLEZ1234567890abcdEXAMPLE`, `SYNTHETIC-MITM-TOKEN-abc123`) and match no real credential.
 - The compiled `trufflehog` binary is `.gitignore`'d and does not affect repository state.
-- After the investigation, `git status --porcelain` reports only this single new documentation file; no existing source file was modified. The repository is otherwise byte-for-byte unchanged.
+- No existing source file was modified. The branch's baseline diff contains **only** this single documentation file (`blitzy/documentation/trufflehog_e42153d44a5e.md`): before the deliverable is committed, `git status --porcelain` shows exactly that one path; after it is committed the working tree is clean and `git status --porcelain` is **empty**. The `.gitignore`'d `trufflehog` binary is permitted throughout and never appears in either the diff or `git status`. The repository is otherwise byte-for-byte unchanged.
 
