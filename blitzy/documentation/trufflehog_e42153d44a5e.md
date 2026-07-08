@@ -344,15 +344,18 @@ After parsing, `main.go` assembles the engine configuration, wiring the parsed
 flags and the default detector set (Section 5) into an `engine.Config`:
 
 ```text
-main.go:494   printer := output.PlainPrinter{}                 // default printer unless JSON/legacy/GitHub-Actions
+main.go:494   printer = new(output.PlainPrinter)               // default printer unless JSON/legacy/GitHub-Actions
 main.go:497   if !*jsonLegacy && !*jsonOut { ... banner ... }
-main.go:514   Concurrency: uint8(*concurrency),
+main.go:514   Concurrency: *concurrency,
 main.go:519   Detectors:   append(defaults.DefaultDetectors(), conf.Detectors...),
 main.go:520   Verify:      !*noVerification,
 main.go:525   Dispatcher:  engine.NewPrinterDispatcher(printer),
 ```
 
-- `Concurrency` (`main.go:514`) carries the `128` default straight into the engine.
+- `Concurrency` (`main.go:514`) carries the `128` default straight into the engine
+  as a plain `int` — the `engine.Config.Concurrency` field is declared `int` at
+  `pkg/engine/engine.go:100`, so the parsed `*concurrency` value is passed through
+  with no numeric conversion.
 - `Detectors` (`main.go:519`) is the **default detector set plus any config
   detectors** — with no config, it is exactly `defaults.DefaultDetectors()`
   (Section 5).
@@ -523,11 +526,12 @@ The counts are deterministic because they are pure functions of `--concurrency`
 detector set with the **full default detector list** returned by
 `defaults.DefaultDetectors()`, and the engine builds an **Aho-Corasick keyword
 prefilter** over those detectors during `initialize`. The default set contains
-**829 detector constructors** (read from source at this commit). Neither the
-detector-count nor the prefilter construction is printed at level 2, so both are
-labeled `(inferred from source)`; their existence is corroborated by the engine
-running detectors at all and by the project's own documentation and engineering
-blog (Section 8).
+**831 detectors** — observed directly at runtime as
+`len(defaults.DefaultDetectors()) == 831` (Section 5.4). The prefilter
+construction itself is not printed at level 2, so it is labeled
+`(inferred from source)`; its existence is corroborated by the engine running
+detectors at all and by the project's own documentation and engineering blog
+(Section 8).
 
 ### 5.1 The default detector set is loaded (not the fallback)
 
@@ -552,20 +556,29 @@ So detector preparation for this run happens through the explicit
 ```text
 pkg/engine/defaults/defaults.go:1704   func DefaultDetectors() []detectors.Detector
 pkg/engine/defaults/defaults.go:839    func buildDetectorList() []detectors.Detector
-pkg/engine/defaults/defaults.go:840    return []detectors.Detector{ ... }   // 829 &<pkg>.Scanner{} entries
+pkg/engine/defaults/defaults.go:840    return []detectors.Detector{ ... }   // 829 &<pkg>.Scanner{} + 2 .New() = 831 entries
+pkg/engine/defaults/defaults.go:906    aws_access_keys.New(),                  // constructor-based entry (not a &Scanner{} literal)
+pkg/engine/defaults/defaults.go:907    aws_session_keys.New(),                 // constructor-based entry (not a &Scanner{} literal)
 ```
 
 `DefaultDetectors()` delegates to `buildDetectorList()`, which returns a slice
-literal of **829** detector constructors (`&<pkg>.Scanner{}` entries;
-commented-out entries are excluded from the count). `DefaultDetectors()` then
-performs interface-based auto-initialization over that list (e.g., configuring
-detectors that implement the endpoint-customizer / cloud-provider interfaces)
-before returning it.
+literal of **831** detector constructors: **829** written as the `&<pkg>.Scanner{}`
+literal form plus **2** written as `.New()` constructor calls
+(`aws_access_keys.New()` at `defaults.go:906` and `aws_session_keys.New()` at
+`defaults.go:907`); commented-out entries are excluded from the count. This
+`829 + 2` breakdown is why a naive count of only `&Scanner{}` lines yields 829,
+while the true slice length — and the runtime count in Section 5.4 — is **831**.
+`DefaultDetectors()` then performs interface-based auto-initialization over that
+list (e.g., configuring detectors that implement the endpoint-customizer /
+cloud-provider interfaces) and returns it **unchanged in length**.
 
-> **Labeling:** the count **829** is **read from source** at this commit (a slice
-> literal length), not printed by any level-2 log line — it is labeled
-> `(inferred from source)`. External references describe the library as having
-> "over 800" detectors (Section 8), consistent with the exact figure read here.
+> **Labeling:** the count **831** is **observed** — confirmed at runtime as
+> `len(defaults.DefaultDetectors()) == 831` via the supplementary harness in
+> Section 5.4 — and it exactly matches the source breakdown above (829
+> `&Scanner{}` literals + 2 `.New()` calls). It is not printed by any level-2 log
+> line, which is why it is confirmed by direct instrumentation rather than by a
+> CLI log. External references describe the library as having "over 800" detectors
+> (Section 8), consistent with the exact figure observed here.
 
 ### 5.3 The Aho-Corasick keyword prefilter
 
@@ -582,7 +595,7 @@ Both the construction call and its `V(4)` log line are above the level-2 debug
 threshold used here, so the prefilter's construction is **`(inferred from
 source)`**. Its effect, however, is what makes the scan tractable.
 
-**Why the prefilter exists (cause → effect):** Naively, every one of the 829
+**Why the prefilter exists (cause → effect):** Naively, every one of the 831
 detectors would scan every chunk for each of its keywords — O(detectors ×
 keywords × data) work. The Aho-Corasick core instead builds a single trie of all
 detector keywords and, for each chunk, finds every keyword present in one linear
@@ -593,10 +606,57 @@ startup and reused for every chunk. The project's own engineering write-up
 attributes a roughly 2× overall speedup to this approach and confirms it runs the
 keyword search in linear time before pattern matching (Section 8).
 
-For the 56-byte no-secret file used here, the prefilter finds no detector
-keywords, so no detector's regex stage runs — which is consistent with the
-observed `verified_secrets: 0, unverified_secrets: 0` in the finished-scan
-summary.
+For the 56-byte no-secret file used here, the **observed** result from the
+canonical `--log-level=2` run is that the finished-scan summary reports
+`verified_secrets: 0` and `unverified_secrets: 0`, and standard output is empty —
+no secret is detected or printed. The prefilter's per-chunk keyword-match count is
+**not** surfaced at level 2, so it cannot be read from the CLI logs alone; the
+supplementary harness in Section 5.4 separately confirms that the Aho-Corasick
+core returns **zero** detector matches for this exact sample, so no detector's
+regex stage is triggered for this input.
+
+### 5.4 Instrumented confirmation of detector preparation (supplementary, non-canonical)
+
+Two facts about detector preparation — the size of the default detector set and
+the prefilter's effect on the actual sample — are **not** emitted at
+`--log-level=2`. To ground them in observation rather than in reading alone, they
+were confirmed with a small **out-of-tree** Go harness that calls the **same
+production functions the engine uses at startup**: `defaults.DefaultDetectors()`
+(wired into the run at `main.go:519`) and `ahocorasick.NewAhoCorasickCore(...)`
+(wired at `pkg/engine/engine.go:530`). The harness lived entirely **outside** the
+repository (under `/tmp`) and was removed afterward; no source file was created or
+modified. Because it is invoked directly rather than through the `filesystem` CLI
+entry point, its output is labeled **non-canonical** — it exercises the real code
+paths, not a stand-in, but it is not the user-facing command.
+
+Command and complete output (identical across three runs):
+
+```text
+$ go run probe.go   # harness: defaults.DefaultDetectors() + ahocorasick.NewAhoCorasickCore()
+default_detector_count=831
+generic_detector_in_defaults=false
+keyword_secret_registered=false
+core_detector_matches_count=0
+```
+
+This yields four observed facts:
+
+1. **`default_detector_count=831`** — the runtime length of
+   `defaults.DefaultDetectors()` is **831**, matching the `829 + 2` source
+   breakdown in Section 5.2.
+2. **`generic_detector_in_defaults=false`** — the high-false-positive `generic`
+   detector is **not** part of the default set.
+3. **`keyword_secret_registered=false`** — consequently the keyword `secret`
+   (owned only by the `generic` detector, `pkg/detectors/generic/generic.go:52`)
+   is **not** registered in the prefilter trie for a default run.
+4. **`core_detector_matches_count=0`** — for the exact 56-byte sample, the
+   Aho-Corasick core returns **zero** detector matches. This is the subtle part:
+   the sample word `secrets` does contain the substring `secret`, and the core
+   lowercases input before matching
+   (`pkg/engine/ahocorasick/ahocorasickcore.go:242`), so the algorithm *would*
+   match `secret` if any default detector claimed it — but because none does
+   (facts 2–3), nothing matches, and therefore no detector's regex stage runs for
+   this input.
 
 ---
 
@@ -617,7 +677,7 @@ observable at level 2 (`running source`, `enumerating source`,
 ```text
 2026-07-08T04:45:27Z	info-0	trufflehog	running source	{"source_manager_worker_id": "KyiHq", "with_units": true}
 2026-07-08T04:45:27Z	info-2	trufflehog	enumerating source	{"source_manager_worker_id": "KyiHq"}
-2026-07-08T04:45:27Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 56, "verified_secrets": 0, "unverified_secrets": 0, "scan_duration": "5.258383ms", "trufflehog_version": "dev", "verification_caching": {...}}
+2026-07-08T04:45:27Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 56, "verified_secrets": 0, "unverified_secrets": 0, "scan_duration": "5.258383ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
 ```
 
 Each maps to a specific emitter:
@@ -669,9 +729,13 @@ end-state of the pipeline for a safe, no-secret dry-run.
 ### 6.4 Data-flow diagram
 
 The following diagram summarizes the component-communication path traced above.
-Solid arrows into the pools are the engine starting them; the labeled arrows
-between components are the buffered channels carrying data. Counts are the
-observed values on this 128-core host.
+Solid arrows into the pools are the engine starting them; the labeled solid
+arrows between components are the buffered channels carrying data. The **dashed**
+arrow is deliberately not a channel: it marks the always-on `finished scanning`
+summary, which `run()` emits via `logger.Info` (`main.go:566-574`) after the scan
+returns — a path distinct from the `PrinterDispatcher`/`PlainPrinter` output,
+which prints individual findings only (see Section 6.3). Counts are the observed
+values on this 128-core host.
 
 ```mermaid
 flowchart LR
@@ -684,7 +748,8 @@ flowchart LR
     SW -->|"detectableChunksChan"| DW
     DW -->|"verificationOverlapChunksChan"| VW
     DW -->|"results chan"| NW
-    NW --> OUT["PrinterDispatcher -> PlainPrinter<br/>finished scanning summary (main.go:566-574)"]
+    NW --> FINDINGS["PrinterDispatcher -> PlainPrinter<br/>individual findings only (main.go:525, plain.go:31)<br/>emits nothing for a no-secret scan"]
+    ENG -.->|"after scan returns"| SUMMARY["main.go run(): logger.Info finished scanning<br/>run summary, NOT printer output (main.go:566-574)"]
 ```
 
 This mirrors the project's own architecture notes: `docs/process_flow.md`
@@ -812,7 +877,7 @@ references; all agree with what was observed.
 
 No external source contradicted the observations; where third-party summaries
 give round figures (e.g., "over 800 detectors"), they are consistent with the
-exact `829` read from source at this commit.
+exact `831` observed at this commit.
 
 ---
 
@@ -882,7 +947,7 @@ where possible, confirmed indirectly through an observable effect).
 | Multipliers: detector ×8, verificationOverlap ×1, notifier ×1 | **Inferred from source** (`engine.go:343-354`); product confirmed by observed counts (`1024/128 = 8`) |
 | Channel buffers (detectable 6400, verificationOverlap 3200, results 6400) | **Inferred from source** (`engine.go:503,507-508,515-519,627`; "engine initialized" is `V(4)`) |
 | Aho-Corasick prefilter constructed at startup | **Inferred from source** (`engine.go:529-530`, `ahocorasickcore.go:141`; `V(4)` log) |
-| Default detector set = 829 detectors | **Inferred from source** (slice literal at `defaults.go:840`; `DefaultDetectors()` at `:1704`) |
+| Default detector set = 831 detectors | **Observed** (`len(defaults.DefaultDetectors()) == 831`, Section 5.4 harness) + source breakdown (829 `&Scanner{}` + 2 `.New()`; `defaults.go:840,906-907`) |
 | Engine default-detector fallback does **not** fire | **Inferred from source** (`engine.go:361-364`; detectors supplied at `main.go:519`) |
 | No config file read by default | **Observed by absence** (no config log line) + source `main.go:460-467` |
 
