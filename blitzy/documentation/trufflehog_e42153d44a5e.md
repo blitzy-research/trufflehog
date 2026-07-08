@@ -664,9 +664,14 @@ This yields four observed facts:
 
 **Direct answer:** The pieces communicate through a **fan-out/fan-in pipeline of
 buffered channels**. The `SourceManager` runs the filesystem source and produces
-`sources.Chunk` objects; those flow to the **scanner** pool, then over
-`detectableChunksChan` to the **detector** pool, which routes overlap cases over
-`verificationOverlapChunksChan` and emits results over the `results` channel to
+`sources.Chunk` objects; those flow to the **scanner** pool, which decodes each
+chunk, runs the Aho-Corasick keyword matching (`FindDetectorMatches`,
+`engine.go:795`), and routes the chunk: a single-detector match is sent over
+`detectableChunksChan` to the **detector** pool, while a multi-detector "overlap"
+chunk is sent over `verificationOverlapChunksChan` to the **verificationOverlap**
+pool, which decides the responsible detector and feeds the chunk back to the
+detector pool over `detectableChunksChan`. The **detector** pool then runs the
+actual detector regex stage and emits results over the `results` channel to
 the **notifier** pool; the notifier hands findings to the `PrinterDispatcher`,
 and a final summary line closes the run. Three of these hops are directly
 observable at level 2 (`running source`, `enumerating source`,
@@ -692,16 +697,33 @@ Each maps to a specific emitter:
 
 The `SourceManager` is what produces work. It runs the source and enumerates its
 units (here, the files under the scan directory), turning file content into
-`sources.Chunk` objects. Those chunks are consumed by the scanner pool and pushed
-through the inter-pool channels created during `initialize` (Section 4.4). The
-detector workers pull chunks and run the Aho-Corasick prefilter + matching:
+`sources.Chunk` objects. Those chunks are consumed by the **scanner** workers,
+which decode each chunk and run the Aho-Corasick keyword prefilter + matching to
+find which detectors could apply. This is a **call site inside `scannerWorker`**
+(`engine.go:777-923`) — not a detector-worker function and not a
+`FindDetectorMatches` declaration:
 
 ```text
-pkg/engine/engine.go:795   func (e *Engine) ... FindDetectorMatches(...)   // detector workers consume chunks here
+pkg/engine/engine.go:795   matchingDetectors := e.AhoCorasickCore.FindDetectorMatches(decoded.Chunk.Data)   // inside scannerWorker (engine.go:777-923)
 ```
 
-Results flow over the `results` channel to the notifier pool, which forwards
-findings to the dispatcher configured in Section 3.6:
+The scanner then routes each chunk over the inter-pool channels created during
+`initialize` (Section 4.4): a chunk matching a single detector is sent over
+`detectableChunksChan` (`engine.go:810`) to the detector pool, while a chunk
+matching multiple detectors is sent over `verificationOverlapChunksChan`
+(`engine.go:798`) to the verificationOverlap pool, which decides the responsible
+detector and feeds the chunk back to the detector pool over `detectableChunksChan`
+(`engine.go:1014`). The **detector** workers consume `detectableChunksChan`
+(`engine.go:1037`) and run the actual detector regex/detection stage
+(`detectChunk` → `verificationCache.FromData`, `engine.go:1070`):
+
+```text
+pkg/engine/engine.go:1037   for data := range e.detectableChunksChan   // detectorWorker (engine.go:1036-1188) consumes chunks here
+pkg/engine/engine.go:1070   results, err := e.verificationCache.FromData(...)   // detector regex/detection stage
+```
+
+Results flow over the `results` channel (`engine.go:1186`) to the notifier pool,
+which forwards findings to the dispatcher configured in Section 3.6:
 
 ```text
 main.go:525   Dispatcher: engine.NewPrinterDispatcher(printer)   // wraps the default PlainPrinter (main.go:494)
@@ -746,7 +768,8 @@ flowchart LR
     ENG --> VW["VerificationOverlap Workers<br/>count=128 (engine.go:693)"]
     ENG --> NW["Notifier Workers<br/>count=128 (engine.go:708)"]
     SW -->|"detectableChunksChan"| DW
-    DW -->|"verificationOverlapChunksChan"| VW
+    SW -->|"verificationOverlapChunksChan"| VW
+    VW -->|"detectableChunksChan"| DW
     DW -->|"results chan"| NW
     NW --> FINDINGS["PrinterDispatcher -> PlainPrinter<br/>individual findings only (main.go:525, plain.go:31)<br/>emits nothing for a no-secret scan"]
     ENG -.->|"after scan returns"| SUMMARY["main.go run(): logger.Info finished scanning<br/>run summary, NOT printer output (main.go:566-574)"]
@@ -872,8 +895,13 @@ references; all agree with what was observed.
   and the rationale of the prefilter described in Section 5.3.
 - **Project architecture docs.** In-repo `docs/process_flow.md` (four-stage
   pipeline) and `docs/concurrency.md` (worker-pool/channel model) independently
-  describe the same source → chunk → detector → notifier flow diagrammed in
-  Section 6.4.
+  describe the same pipeline diagrammed in Section 6.4. In particular,
+  `docs/concurrency.md` shows the **scanner** workers decoding chunks and finding
+  matching detectors, routing single matches to the detector pool over
+  `detectableChunksChan` and multi-detector overlaps to the verificationOverlap
+  pool over `verificationOverlapChunksChan` (which feeds back to the detector
+  pool), and the detector pool reporting results to the notifier pool — matching
+  the attribution in Section 6.
 
 No external source contradicted the observations; where third-party summaries
 give round figures (e.g., "over 800 detectors"), they are consistent with the
