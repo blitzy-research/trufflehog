@@ -175,29 +175,48 @@ shared_keywords_fanout_gt1=32
 max_fanout=6 for keyword="azure"
 ```
 
-**Stability note.** Run three times; all three produced byte-identical numbers
-(the default detector set is deterministic). The unique count is therefore
-reported as a stable value.
+**Complete, unedited output — Run 3:**
 
-**Cause → effect (with `file:line`).**
-`ahocorasick.NewAhoCorasickCore(allDetectors)` (`pkg/engine/ahocorasick/ahocorasickcore.go:141`)
+```
+default_detectors=831
+total_keyword_additions=955
+unique_keywords=914
+shared_keywords_fanout_gt1=32
+max_fanout=6 for keyword="azure"
+```
+
+**Stability note.** The harness was run three times (all three complete outputs are
+shown above); every run produced byte-identical numbers (the default detector set is
+deterministic), so the unique count is reported as a stable value.
+
+**Cause → effect (with `file:line`).** The default detector set the harness feeds
+in is the software's own: `defaults.DefaultDetectors()`
+(`pkg/engine/defaults/defaults.go:1704`), which returns the list assembled by
+`buildDetectorList()` (`pkg/engine/defaults/defaults.go:839-1702`) — the canonical
+enumeration of every default detector (the 831 counted above). That slice is passed
+to `ahocorasick.NewAhoCorasickCore(allDetectors)`
+(`pkg/engine/ahocorasick/ahocorasickcore.go:141`), which
 loops over every detector (`for _, d := range allDetectors` at
-`ahocorasickcore.go:145`) and, for each keyword, lowercases it
-(`kwLower := strings.ToLower(kw)` at `ahocorasickcore.go:149`), **appends it once
-to the raw `keywords` slice** (`keywords = append(keywords, kwLower)` at
-`ahocorasickcore.go:150` — one append per `(detector, keyword)` pair, so
-duplicates are possible), and records the mapping
+`pkg/engine/ahocorasick/ahocorasickcore.go:145`) and, for each keyword, lowercases it
+(`kwLower := strings.ToLower(kw)` at `pkg/engine/ahocorasick/ahocorasickcore.go:149`),
+**appends it once to the raw `keywords` slice**
+(`keywords = append(keywords, kwLower)` at
+`pkg/engine/ahocorasick/ahocorasickcore.go:150` — one append per
+`(detector, keyword)` pair, so duplicates are possible), and records the mapping
 `keywordsToDetectors[kwLower] = append(keywordsToDetectors[kwLower], key)`
-(`ahocorasickcore.go:151`). The field is
-`keywordsToDetectors map[string][]DetectorKey` (`ahocorasickcore.go:133`), and the
+(`pkg/engine/ahocorasick/ahocorasickcore.go:151`). The field is
+`keywordsToDetectors map[string][]DetectorKey`
+(`pkg/engine/ahocorasick/ahocorasickcore.go:133`), and the
 trie is built from the raw slice via
 `*ahocorasick.NewTrieBuilder().AddStrings(keywords).Build()`
-(`ahocorasickcore.go:159`). Because `AddStrings` (from
+(`pkg/engine/ahocorasick/ahocorasickcore.go:159`). Because `AddStrings` (from
 `github.com/BobuSumisu/aho-corasick v1.0.3`, `go.mod:17`) assigns each *added*
 pattern its own index, the raw slice's duplicates are added repeatedly — hence the
 canonical measure of *unique* keywords is `len(keywordsToDetectors)`
-(`ahocorasickcore.go:133`), exposed by the getter `func (ac *Core) KeywordsToDetectors()`
-at `ahocorasickcore.go:302`. That is exactly what the harness reads.
+(`pkg/engine/ahocorasick/ahocorasickcore.go:133`), exposed by the getter
+`func (ac *Core) KeywordsToDetectors()`
+at `pkg/engine/ahocorasick/ahocorasickcore.go:302`. That is exactly what the harness
+reads.
 
 - The **831** default detectors contribute **955** total keyword additions (the
   raw slice), which collapse to **914** unique keys in `keywordsToDetectors` — i.e.
@@ -206,12 +225,15 @@ at `ahocorasickcore.go:302`. That is exactly what the harness reads.
   fan-out is **6** — the keyword `"azure"` alone selects six distinct detectors.
 
 **Explicit answer.**
-- **Unique keyword count:** **914** (`len(core.KeywordsToDetectors())`,
-  `ahocorasickcore.go:133`/`:302`). (Total additions to the raw `keywords` slice:
-  **955**; the difference of 41 reflects duplicate `(detector,keyword)` appends at
-  `ahocorasickcore.go:150`.)
+- **Unique keyword count:** **914** (`len(core.KeywordsToDetectors())` — the
+  `keywordsToDetectors` field at `pkg/engine/ahocorasick/ahocorasickcore.go:133`,
+  read through the getter at `pkg/engine/ahocorasick/ahocorasickcore.go:302`). (Total
+  additions to the raw `keywords` slice: **955**; the difference of 41 reflects
+  duplicate `(detector,keyword)` appends at
+  `pkg/engine/ahocorasick/ahocorasickcore.go:150`.)
 - **Shared or distinct?** **SHARED.** A single lowercased keyword maps to multiple
-  `DetectorKey`s in `keywordsToDetectors` (`ahocorasickcore.go:151`): 32 keywords
+  `DetectorKey`s in `keywordsToDetectors`
+  (`pkg/engine/ahocorasick/ahocorasickcore.go:151`): 32 keywords
   have fan-out `> 1`, and `"azure"` reaches a fan-out of 6. Keywords are therefore
   shared across detectors, not maintained distinctly per detector.
 
@@ -224,27 +246,29 @@ at `ahocorasickcore.go:302`. That is exactly what the harness reads.
 sequence look like for a chunk containing **both** a plaintext and an encoded
 secret?
 
-**Setup (crafted input, outside the tree).** Two *different* secrets: an AWS
-key-pair in **plaintext**, and a **different** secret (a Sentry token) that is
-only present in **base64** form — so it can only be matched *after* decoding.
+**Setup (one crafted file -> one chunk, outside the tree).** Per the question's exact
+condition, a **single** file holds **both** secrets so they land in **one chunk**: an
+AWS key-pair in **plaintext** (lines 1-2) and a *different* secret (a Sentry token)
+present **only in base64** form (line 3), so the Sentry keyword can only be matched
+*after* decoding.
 
 ```
 mkdir -p /tmp/th_obs/q2
-printf 'aws_key = AKIAWARWQKZNHMZBLY4I\naws_secret = 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\n' > /tmp/th_obs/q2/plain.txt
-printf 'blob: %s\n' "$(printf ' sentry 27ac84f4bcdb4fca9701f4d6f6f58cd7d96b69c9d9754d40800645a51d668f90\n' | base64 -w0)" > /tmp/th_obs/q2/encoded.txt
+B64=$(printf ' sentry 27ac84f4bcdb4fca9701f4d6f6f58cd7d96b69c9d9754d40800645a51d668f90\n' | base64 -w0)
+{ printf 'aws_key = AKIAWARWQKZNHMZBLY4I\n'; \
+  printf 'aws_secret = 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\n'; \
+  printf 'blob: %s\n' "$B64"; } > /tmp/th_obs/q2/both.txt
 ```
 
-The two crafted files:
+The one crafted file (all three lines in a single file => a single chunk):
 
 ```
-$ cat /tmp/th_obs/q2/plain.txt
-aws_key = AKIAWARWQKZNHMZBLY4I
-aws_secret = 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
+$ cat -n /tmp/th_obs/q2/both.txt
+     1	aws_key = AKIAWARWQKZNHMZBLY4I
+     2	aws_secret = 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
+     3	blob: IHNlbnRyeSAyN2FjODRmNGJjZGI0ZmNhOTcwMWY0ZDZmNmY1OGNkN2Q5NmI2OWM5ZDk3NTRkNDA4MDA2NDVhNTFkNjY4ZjkwCg==
 
-$ cat /tmp/th_obs/q2/encoded.txt
-blob: IHNlbnRyeSAyN2FjODRmNGJjZGI0ZmNhOTcwMWY0ZDZmNmY1OGNkN2Q5NmI2OWM5ZDk3NTRkNDA4MDA2NDVhNTFkNjY4ZjkwCg==
-
-$ grep -c 'sentry\|27ac' /tmp/th_obs/q2/encoded.txt
+$ grep -c 'sentry\|27ac' /tmp/th_obs/q2/both.txt
 0
 ```
 
@@ -252,58 +276,164 @@ The `grep -c` returning **0** confirms the base64 blob contains no plaintext
 `sentry`/`27ac` keyword — the Sentry keyword only exists *after* the blob is
 base64-decoded.
 
+> **Note — no per-decoder log lines exist (at any verbosity).** TruffleHog does
+> **not** log the per-decoder step. In `scannerWorker` the decode loop records only a
+> Prometheus metric —
+> `decodeLatency.WithLabelValues(decoder.Type().String(), ...).Observe(...)`
+> (`pkg/engine/engine.go:788`) — and the *only* logger call in the whole worker is
+> `ctx.Logger().V(4).Info("finished scanning chunks")` (`pkg/engine/engine.go:840`).
+> Decode-before-match is therefore proven from (a) the source ordering (below) and
+> (b) the runtime `DecoderName` field on each finding from the single chunk.
+
+### Run A — the single-chunk scan (primary evidence)
+
 **Command.**
 
 ```
-CGO_ENABLED=0 go run . filesystem /tmp/th_obs/q2 --json --no-update
+CGO_ENABLED=0 go run . filesystem /tmp/th_obs/q2/both.txt --json --no-update
 ```
 
 **Complete, unedited output — stdout (findings):**
 
 ```
-{"SourceMetadata":{"Data":{"Filesystem":{"file":"/tmp/th_obs/q2/encoded.txt","line":1}}},"SourceID":1,"SourceType":15,"SourceName":"trufflehog - filesystem","DetectorType":87,"DetectorName":"SentryToken","DetectorDescription":"Sentry is an error tracking service that helps developers monitor and fix crashes in real time. Sentry tokens can be used to access and manage projects and organizations within Sentry.","DecoderName":"BASE64","Verified":false,"VerificationFromCache":false,"Raw":"27ac84f4bcdb4fca9701f4d6f6f58cd7d96b69c9d9754d40800645a51d668f90","RawV2":"","Redacted":"","ExtraData":null,"StructuredData":null}
-{"SourceMetadata":{"Data":{"Filesystem":{"file":"/tmp/th_obs/q2/plain.txt","line":1}}},"SourceID":1,"SourceType":15,"SourceName":"trufflehog - filesystem","DetectorType":2,"DetectorName":"AWS","DetectorDescription":"AWS (Amazon Web Services) is a comprehensive cloud computing platform offering a wide range of on-demand services like computing power, storage, databases. API keys for AWS can have varying amount of access to these services depending on the IAM policy attached.","DecoderName":"PLAIN","Verified":false,"VerificationFromCache":false,"Raw":"AKIAWARWQKZNHMZBLY4I","RawV2":"AKIAWARWQKZNHMZBLY4I:s6NbZeygUrUdM95K683Lb6IsILWXOJlJ8ZVd1Kw0","Redacted":"AKIAWARWQKZNHMZBLY4I","ExtraData":{"account":"413504919130","resource_type":"Access key"},"StructuredData":null}
+{"SourceMetadata":{"Data":{"Filesystem":{"file":"/tmp/th_obs/q2/both.txt","line":3}}},"SourceID":1,"SourceType":15,"SourceName":"trufflehog - filesystem","DetectorType":87,"DetectorName":"SentryToken","DetectorDescription":"Sentry is an error tracking service that helps developers monitor and fix crashes in real time. Sentry tokens can be used to access and manage projects and organizations within Sentry.","DecoderName":"BASE64","Verified":false,"VerificationFromCache":false,"Raw":"27ac84f4bcdb4fca9701f4d6f6f58cd7d96b69c9d9754d40800645a51d668f90","RawV2":"","Redacted":"","ExtraData":null,"StructuredData":null}
+{"SourceMetadata":{"Data":{"Filesystem":{"file":"/tmp/th_obs/q2/both.txt","line":1}}},"SourceID":1,"SourceType":15,"SourceName":"trufflehog - filesystem","DetectorType":2,"DetectorName":"AWS","DetectorDescription":"AWS (Amazon Web Services) is a comprehensive cloud computing platform offering a wide range of on-demand services like computing power, storage, databases. API keys for AWS can have varying amount of access to these services depending on the IAM policy attached.","DecoderName":"BASE64","Verified":false,"VerificationFromCache":false,"Raw":"AKIAWARWQKZNHMZBLY4I","RawV2":"AKIAWARWQKZNHMZBLY4I:s6NbZeygUrUdM95K683Lb6IsILWXOJlJ8ZVd1Kw0","Redacted":"AKIAWARWQKZNHMZBLY4I","ExtraData":{"account":"413504919130","resource_type":"Access key"},"StructuredData":null}
 ```
 
 **Complete, unedited output — stderr:**
 
 ```
-{"level":"info-0","ts":"2026-07-08T05:13:24Z","logger":"trufflehog","msg":"running source","source_manager_worker_id":"oCIDe","with_units":true}
-{"level":"info-0","ts":"2026-07-08T05:13:24Z","logger":"trufflehog","msg":"finished scanning","chunks":2,"bytes":165,"verified_secrets":0,"unverified_secrets":2,"scan_duration":"145.182055ms","trufflehog_version":"dev","verification_caching":{"Hits":0,"Misses":2,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":203}}
+{"level":"info-0","ts":"2026-07-08T06:13:55Z","logger":"trufflehog","msg":"running source","source_manager_worker_id":"wgE9s","with_units":true}
+{"level":"info-0","ts":"2026-07-08T06:13:55Z","logger":"trufflehog","msg":"finished scanning","chunks":1,"bytes":165,"verified_secrets":0,"unverified_secrets":2,"scan_duration":"157.630549ms","trufflehog_version":"dev","verification_caching":{"Hits":0,"Misses":3,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":356}}
 ```
 
-**Stability note.** A second run produced the identical detector→decoder mapping
-(`AWS`→`PLAIN`, `SentryToken`→`BASE64`).
+`chunks:1` confirms the single file was scanned as **one chunk** containing both
+secrets. The **SentryToken** finding carries `"DecoderName":"BASE64"` — decisive,
+because its keyword is absent from the raw bytes (`grep = 0`): it could only be
+matched **after** the Base64 decoder ran. (`Misses:3` is explained under Run C.)
 
-> **Field-name note.** The JSON finding exposes the decoder as **`DecoderName`**
-> (values `PLAIN`, `BASE64`, …), which is the string form of the internal
-> `DecoderType`. The plaintext AWS finding carries `"DecoderName":"PLAIN"`; the
-> base64-only Sentry finding carries `"DecoderName":"BASE64"`.
+### Run B — same command again (stability + the PLAIN decoder value)
 
-**Cause → effect (with `file:line`).** `scannerWorker`
+Re-running the identical command shows **SentryToken is always `BASE64`** while the
+plaintext **AWS** secret surfaces here with `"DecoderName":"PLAIN"` (it races between
+`PLAIN` and `BASE64`; see the cause->effect below).
+
+**Command.**
+
+```
+CGO_ENABLED=0 go run . filesystem /tmp/th_obs/q2/both.txt --json --no-update
+```
+
+**Complete, unedited output — stdout (findings):**
+
+```
+{"SourceMetadata":{"Data":{"Filesystem":{"file":"/tmp/th_obs/q2/both.txt","line":3}}},"SourceID":1,"SourceType":15,"SourceName":"trufflehog - filesystem","DetectorType":87,"DetectorName":"SentryToken","DetectorDescription":"Sentry is an error tracking service that helps developers monitor and fix crashes in real time. Sentry tokens can be used to access and manage projects and organizations within Sentry.","DecoderName":"BASE64","Verified":false,"VerificationFromCache":false,"Raw":"27ac84f4bcdb4fca9701f4d6f6f58cd7d96b69c9d9754d40800645a51d668f90","RawV2":"","Redacted":"","ExtraData":null,"StructuredData":null}
+{"SourceMetadata":{"Data":{"Filesystem":{"file":"/tmp/th_obs/q2/both.txt","line":1}}},"SourceID":1,"SourceType":15,"SourceName":"trufflehog - filesystem","DetectorType":2,"DetectorName":"AWS","DetectorDescription":"AWS (Amazon Web Services) is a comprehensive cloud computing platform offering a wide range of on-demand services like computing power, storage, databases. API keys for AWS can have varying amount of access to these services depending on the IAM policy attached.","DecoderName":"PLAIN","Verified":false,"VerificationFromCache":false,"Raw":"AKIAWARWQKZNHMZBLY4I","RawV2":"AKIAWARWQKZNHMZBLY4I:s6NbZeygUrUdM95K683Lb6IsILWXOJlJ8ZVd1Kw0","Redacted":"AKIAWARWQKZNHMZBLY4I","ExtraData":{"account":"413504919130","resource_type":"Access key"},"StructuredData":null}
+```
+
+**Complete, unedited output — stderr:**
+
+```
+{"level":"info-0","ts":"2026-07-08T06:14:53Z","logger":"trufflehog","msg":"running source","source_manager_worker_id":"bzy8o","with_units":true}
+{"level":"info-0","ts":"2026-07-08T06:14:53Z","logger":"trufflehog","msg":"finished scanning","chunks":1,"bytes":165,"verified_secrets":0,"unverified_secrets":2,"scan_duration":"148.234034ms","trufflehog_version":"dev","verification_caching":{"Hits":0,"Misses":3,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":353}}
+```
+
+### Run C — requested verbosity (`--log-level=5`), concurrency pinned to 1
+
+The same single-chunk scan at `--log-level=5` (trace) with `--concurrency=1` (one
+scanner worker -> minimal noise), to show the requested verbose sequence:
+
+**Command.**
+
+```
+CGO_ENABLED=0 go run . filesystem /tmp/th_obs/q2/both.txt --json --log-level=5 --concurrency=1 --no-update
+```
+
+**Complete, unedited output — stdout (findings):**
+
+```
+{"SourceMetadata":{"Data":{"Filesystem":{"file":"/tmp/th_obs/q2/both.txt","line":3}}},"SourceID":1,"SourceType":15,"SourceName":"trufflehog - filesystem","DetectorType":87,"DetectorName":"SentryToken","DetectorDescription":"Sentry is an error tracking service that helps developers monitor and fix crashes in real time. Sentry tokens can be used to access and manage projects and organizations within Sentry.","DecoderName":"BASE64","Verified":false,"VerificationFromCache":false,"Raw":"27ac84f4bcdb4fca9701f4d6f6f58cd7d96b69c9d9754d40800645a51d668f90","RawV2":"","Redacted":"","ExtraData":null,"StructuredData":null}
+{"SourceMetadata":{"Data":{"Filesystem":{"file":"/tmp/th_obs/q2/both.txt","line":1}}},"SourceID":1,"SourceType":15,"SourceName":"trufflehog - filesystem","DetectorType":2,"DetectorName":"AWS","DetectorDescription":"AWS (Amazon Web Services) is a comprehensive cloud computing platform offering a wide range of on-demand services like computing power, storage, databases. API keys for AWS can have varying amount of access to these services depending on the IAM policy attached.","DecoderName":"BASE64","Verified":false,"VerificationFromCache":false,"Raw":"AKIAWARWQKZNHMZBLY4I","RawV2":"AKIAWARWQKZNHMZBLY4I:s6NbZeygUrUdM95K683Lb6IsILWXOJlJ8ZVd1Kw0","Redacted":"AKIAWARWQKZNHMZBLY4I","ExtraData":{"account":"413504919130","resource_type":"Access key"},"StructuredData":null}
+```
+
+**Complete, unedited output — stderr (19 lines):**
+
+```
+{"level":"info-2","ts":"2026-07-08T06:14:10Z","logger":"trufflehog","msg":"trufflehog dev"}
+{"level":"info-4","ts":"2026-07-08T06:14:10Z","logger":"trufflehog","msg":"default engine options set"}
+{"level":"info-4","ts":"2026-07-08T06:14:10Z","logger":"trufflehog","msg":"engine initialized"}
+{"level":"info-4","ts":"2026-07-08T06:14:10Z","logger":"trufflehog","msg":"setting up aho-corasick core"}
+{"level":"info-4","ts":"2026-07-08T06:14:10Z","logger":"trufflehog","msg":"set up aho-corasick core"}
+{"level":"info-2","ts":"2026-07-08T06:14:10Z","logger":"trufflehog","msg":"starting scanner workers","count":1}
+{"level":"info-2","ts":"2026-07-08T06:14:10Z","logger":"trufflehog","msg":"starting detector workers","count":8}
+{"level":"info-2","ts":"2026-07-08T06:14:10Z","logger":"trufflehog","msg":"starting verificationOverlap workers","count":1}
+{"level":"info-2","ts":"2026-07-08T06:14:10Z","logger":"trufflehog","msg":"starting notifier workers","count":1}
+{"level":"info-0","ts":"2026-07-08T06:14:10Z","logger":"trufflehog","msg":"running source","source_manager_worker_id":"SalHE","with_units":true}
+{"level":"info-2","ts":"2026-07-08T06:14:10Z","logger":"trufflehog","msg":"enumerating source","source_manager_worker_id":"SalHE"}
+{"level":"info-3","ts":"2026-07-08T06:14:10Z","logger":"trufflehog","msg":"chunking unit","source_manager_worker_id":"SalHE","unit_kind":"unit","unit":"/tmp/th_obs/q2/both.txt"}
+{"level":"info-3","ts":"2026-07-08T06:14:10Z","logger":"trufflehog","msg":"scanning file","source_manager_worker_id":"SalHE","unit_kind":"unit","unit":"/tmp/th_obs/q2/both.txt","path":"/tmp/th_obs/q2/both.txt"}
+{"level":"info-5","ts":"2026-07-08T06:14:10Z","logger":"trufflehog","msg":"dataErrChan closed, all chunks processed","source_manager_worker_id":"SalHE","unit_kind":"unit","unit":"/tmp/th_obs/q2/both.txt","path":"/tmp/th_obs/q2/both.txt","mime":"text/plain; charset=utf-8","timeout":60}
+{"level":"info-4","ts":"2026-07-08T06:14:10Z","logger":"trufflehog","msg":"finished scanning chunks","scanner_worker_id":"fXI3F"}
+{"level":"info-4","ts":"2026-07-08T06:14:10Z","logger":"trufflehog","msg":"link is empty, skipping update","detector_worker_id":"3egxn","detector":{"type":"SentryToken","version":1},"timeout":10}
+{"level":"info-4","ts":"2026-07-08T06:14:10Z","logger":"trufflehog","msg":"link is empty, skipping update","detector_worker_id":"121im","detector":{"type":"AWS"},"timeout":10}
+{"level":"info-4","ts":"2026-07-08T06:14:10Z","logger":"trufflehog","msg":"link is empty, skipping update","detector_worker_id":"ZK2Vj","detector":{"type":"AWS"},"timeout":10}
+{"level":"info-0","ts":"2026-07-08T06:14:10Z","logger":"trufflehog","msg":"finished scanning","chunks":1,"bytes":165,"verified_secrets":0,"unverified_secrets":2,"scan_duration":"160.116485ms","trufflehog_version":"dev","verification_caching":{"Hits":0,"Misses":3,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":418}}
+```
+
+There is **no** per-decoder/decode/match log line anywhere in the trace (consistent
+with the note above). What the trace *does* reveal is the worker pipeline and —
+crucially — **three** `"link is empty, skipping update"` lines: one for `SentryToken`
+and **two** for `AWS`. Those are the three post-decode verification attempts (matching
+`Misses:3`): the AWS key was keyword-matched under **both** the PLAIN pass *and* the
+BASE64 pass, because the Base64 decoder leaves the intact plaintext AWS key in its
+output (see cause->effect). The notifier LRU then collapses the two AWS sightings into
+one finding (forward reference: Q5), whose `DecoderName` is whichever sighting won the
+race.
+
+**Cause -> effect (with `file:line`).** `scannerWorker`
 (`pkg/engine/engine.go:777`) iterates decoders **first** —
-`for _, decoder := range e.decoders` (`engine.go:784`) →
-`decoded := decoder.FromChunk(chunk)` (`engine.go:786`) — and only *then* runs
-keyword matching on the **decoded** bytes:
+`for _, decoder := range e.decoders` (`pkg/engine/engine.go:784`) ->
+`decoded := decoder.FromChunk(chunk)` (`pkg/engine/engine.go:786`) — and only *then*
+runs keyword matching on the **decoded** bytes:
 `matchingDetectors := e.AhoCorasickCore.FindDetectorMatches(decoded.Chunk.Data)`
-(`engine.go:795`). This decode-then-match sequence repeats **once per decoder**,
-in the order returned by `DefaultDecoders()` (`pkg/decoders/decoders.go:8-16` →
-`{UTF8, Base64, UTF16, EscapedUnicode}`, with the comment
-`// UTF8 must be first for duplicate detection` at `decoders.go:10`). The runtime
-proof: the Sentry token could only be discovered as `DecoderName=BASE64` because
-its keyword did not exist in the raw chunk (grep = 0) — it appeared only after
-`Base64.FromChunk` (`engine.go:786`) decoded the blob, at which point
-`FindDetectorMatches` (`engine.go:795`) saw the decoded `sentry …` bytes and
-selected the Sentry detector. The four-stage flow is corroborated by
-`docs/process_flow.md` (Source Decomposition → Chunk to Detector Matching →
-Secret Detection → Result Notification).
+(`pkg/engine/engine.go:795`). This decode-then-match sequence repeats **once per
+decoder**, in the order returned by `DefaultDecoders()`
+(`pkg/decoders/decoders.go:8-16` -> `{UTF8, Base64, UTF16, EscapedUnicode}`, with the
+comment `// UTF8 must be first for duplicate detection` at
+`pkg/decoders/decoders.go:10`). The decisive runtime proof: the Sentry token was
+discovered as `DecoderName=BASE64` even though its keyword did not exist in the raw
+chunk (`grep = 0`) — it appeared only after `(*Base64).FromChunk`
+(`pkg/decoders/base64.go:34`) decoded the blob, at which point `FindDetectorMatches`
+(`pkg/engine/engine.go:795`) saw the decoded `sentry ...` bytes and selected the
+Sentry detector.
+
+Why AWS appears under **both** decoders (so its `DecoderName` races): the Base64
+decoder only decodes substrings of >=20 base64 characters
+(`getSubstringsOfCharacterSet(chunk.Data, 20, ...)` at `pkg/decoders/base64.go:36`)
+and keeps only those whose decoded bytes are ASCII (`isASCII(dec)` gate at
+`pkg/decoders/base64.go:41`). The long Sentry blob decodes to ASCII (`sentry ...`) and
+is substituted in; the 20-char AWS key `AKIAWARWQKZNHMZBLY4I` decodes to non-ASCII, so
+it is **not** substituted and remains intact in the Base64 decoder's output.
+Consequently the AWS key is keyword-matched under **both** the PLAIN pass and the
+BASE64 pass — hence the two `"link is empty"` AWS lines and `Misses:3` in Run C — and
+the notifier LRU dedupe (`pkg/engine/engine.go:1216`, key excludes `DecoderType`)
+reports it once, the winning decoder decided by the concurrent race (`PLAIN` in Run B,
+`BASE64` in Runs A/C). The four-stage flow is corroborated by `docs/process_flow.md`
+(Source Decomposition -> Chunk to Detector Matching -> Secret Detection -> Result
+Notification).
 
 **Explicit answer.**
-- **Before or after?** **BEFORE.** Decoding happens *before* keyword matching:
-  the decoder loop at `engine.go:784-786` runs, and `FindDetectorMatches` at
-  `engine.go:795` operates on the already-decoded bytes. A base64-only secret is
-  reported with `DecoderName=BASE64` precisely because it was decoded first; the
-  plaintext secret is reported with `DecoderName=PLAIN`.
+- **Before or after?** **BEFORE.** Decoding happens *before* keyword matching: the
+  decoder loop at `pkg/engine/engine.go:784-786` runs, and `FindDetectorMatches` at
+  `pkg/engine/engine.go:795` operates on the already-decoded bytes. In the single
+  chunk containing both secrets, the base64-only Sentry token is reported with
+  `DecoderName=BASE64` (its keyword absent from the raw bytes), and the plaintext AWS
+  key is reported with `DecoderName=PLAIN` (Run B).
+- **What does the verbose sequence look like?** There are **no** per-decoder log
+  lines (decode timing is a Prometheus metric, `pkg/engine/engine.go:788`, not a log);
+  the `--log-level=5` trace (Run C) shows the worker pipeline plus the three
+  post-decode verification attempts, and the `DecoderName` field on each finding is
+  the authoritative runtime record of which decoder produced it.
 
 ---
 
@@ -313,125 +443,231 @@ Secret Detection → Result Notification).
 report at end of scan; (b) do hit/miss numbers change when the **same** scan runs
 twice consecutively — or does the cache **not persist** across invocations?
 
-**The reported metric fields.** The end-of-scan snapshot is the struct literal
-`verificationCacheMetricsSnapshot` (`main.go:551-563`), sourced from
-`InMemoryMetrics` (`pkg/verificationcache/in_memory_metrics.go:9-15`) and printed
-by `logger.Info("finished scanning", ... "verification_caching", verificationCacheMetricsSnapshot)`
-(`main.go:566-574`) — i.e., the log key is **`verification_caching`** (info level,
-visible at the default `--log-level=0`, on **stderr**). The five fields (snapshot
-name then underlying `InMemoryMetrics` field):
+**The reported metric fields.** The end-of-scan snapshot is the anonymous struct
+literal `verificationCacheMetricsSnapshot` (`main.go:551-563`), whose five fields
+are loaded from the `verificationcache.InMemoryMetrics` value constructed at
+`main.go:511` (fields at `pkg/verificationcache/in_memory_metrics.go:9-14`), and it
+is printed by `logger.Info("finished scanning", … "verification_caching", verificationCacheMetricsSnapshot)`
+(`main.go:566-574`) — i.e., the log key is **`verification_caching`**
+(`main.go:573`), emitted at info level (visible at the default `--log-level=0`) on
+**stderr**. The five fields (snapshot name → underlying `InMemoryMetrics` field →
+meaning per `pkg/verificationcache/metrics_reporter.go`):
 
-| Snapshot field | Underlying field (`in_memory_metrics.go`) | Meaning (`metrics_reporter.go`) |
+| Snapshot field | Underlying field | Meaning |
 |---|---|---|
-| `Hits` | `ResultCacheHits` (`:12`) | result-cache hits (`metrics_reporter.go:16-18`) |
-| `Misses` | `ResultCacheMisses` (`:14`) | result-cache misses (`metrics_reporter.go:20-21`) |
-| `HitsWasted` | `ResultCacheHitsWasted` (`:13`) | hits that did **not** elide a remote call because other findings in the chunk were uncached (`metrics_reporter.go:23-27`) |
-| `AttemptsSaved` | `CredentialVerificationsSaved` (`:10`) | remote verifications elided by loading status from cache (`metrics_reporter.go:8-11`) |
-| `VerificationTimeSpentMS` | `FromDataVerifyTimeSpentMS` (`:11`) | wall time in `detector.FromData` with `verify=true` (`metrics_reporter.go:13-14`) |
+| `Hits` | `ResultCacheHits` (`pkg/verificationcache/in_memory_metrics.go:12`) | result-cache hits (`pkg/verificationcache/metrics_reporter.go:18`) |
+| `Misses` | `ResultCacheMisses` (`pkg/verificationcache/in_memory_metrics.go:14`) | result-cache misses (`pkg/verificationcache/metrics_reporter.go:21`) |
+| `HitsWasted` | `ResultCacheHitsWasted` (`pkg/verificationcache/in_memory_metrics.go:13`) | hits that did **not** elide a remote call because other findings in the chunk were uncached (`pkg/verificationcache/metrics_reporter.go:23-27`) |
+| `AttemptsSaved` | `CredentialVerificationsSaved` (`pkg/verificationcache/in_memory_metrics.go:10`) | remote verifications elided by loading status from cache (`pkg/verificationcache/metrics_reporter.go:8-11`) |
+| `VerificationTimeSpentMS` | `FromDataVerifyTimeSpentMS` (`pkg/verificationcache/in_memory_metrics.go:11`) | wall time in `detector.FromData` with `verify=true` (`pkg/verificationcache/metrics_reporter.go:13-14`) |
 
 ### Condition A — cross-invocation (the "run twice" sub-question)
 
-**Command.** The identical scan of the repository's own testdata, run as **two
-separate CLI processes**:
+**Command.** The identical scan of the repository's own testdata, run as **three
+separate CLI processes** (stdout and stderr captured separately for each run):
 
 ```
 CGO_ENABLED=0 go run . filesystem pkg/engine/testdata/secrets.txt --json --no-update
 ```
 
-**Complete, unedited output — Run 1 (stderr; stdout carried 2 findings):**
+**Complete, unedited output — Run 1.** stdout (the two findings):
 
 ```
-{"level":"info-0","ts":"2026-07-08T05:19:42Z","logger":"trufflehog","msg":"running source","source_manager_worker_id":"oPrXR","with_units":true}
-{"level":"info-0","ts":"2026-07-08T05:19:42Z","logger":"trufflehog","msg":"finished scanning","chunks":1,"bytes":372,"verified_secrets":0,"unverified_secrets":2,"scan_duration":"178.04484ms","trufflehog_version":"dev","verification_caching":{"Hits":0,"Misses":2,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":229}}
+{"SourceMetadata":{"Data":{"Filesystem":{"file":"pkg/engine/testdata/secrets.txt","line":3}}},"SourceID":1,"SourceType":15,"SourceName":"trufflehog - filesystem","DetectorType":87,"DetectorName":"SentryToken","DetectorDescription":"Sentry is an error tracking service that helps developers monitor and fix crashes in real time. Sentry tokens can be used to access and manage projects and organizations within Sentry.","DecoderName":"PLAIN","Verified":false,"VerificationFromCache":false,"Raw":"27ac84f4bcdb4fca9701f4d6f6f58cd7d96b69c9d9754d40800645a51d668f90","RawV2":"","Redacted":"","ExtraData":null,"StructuredData":null}
+{"SourceMetadata":{"Data":{"Filesystem":{"file":"pkg/engine/testdata/secrets.txt","line":1}}},"SourceID":1,"SourceType":15,"SourceName":"trufflehog - filesystem","DetectorType":2,"DetectorName":"AWS","DetectorDescription":"AWS (Amazon Web Services) is a comprehensive cloud computing platform offering a wide range of on-demand services like computing power, storage, databases. API keys for AWS can have varying amount of access to these services depending on the IAM policy attached.","DecoderName":"PLAIN","Verified":false,"VerificationFromCache":false,"Raw":"AKIAWARWQKZNHMZBLY4I","RawV2":"AKIAWARWQKZNHMZBLY4I:s6NbZeygUrUdM95K683Lb6IsILWXOJlJ8ZVd1Kw0","Redacted":"AKIAWARWQKZNHMZBLY4I","ExtraData":{"account":"413504919130","resource_type":"Access key"},"StructuredData":null}
 ```
 
-**Complete, unedited output — Run 2 (a fresh, separate process; stdout carried 2 findings):**
+stderr (the two `info-0` log lines):
 
 ```
-{"level":"info-0","ts":"2026-07-08T05:19:46Z","logger":"trufflehog","msg":"running source","source_manager_worker_id":"GF9QB","with_units":true}
-{"level":"info-0","ts":"2026-07-08T05:19:47Z","logger":"trufflehog","msg":"finished scanning","chunks":1,"bytes":372,"verified_secrets":0,"unverified_secrets":2,"scan_duration":"148.045849ms","trufflehog_version":"dev","verification_caching":{"Hits":0,"Misses":2,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":195}}
+{"level":"info-0","ts":"2026-07-08T06:22:39Z","logger":"trufflehog","msg":"running source","source_manager_worker_id":"yfT43","with_units":true}
+{"level":"info-0","ts":"2026-07-08T06:22:39Z","logger":"trufflehog","msg":"finished scanning","chunks":1,"bytes":372,"verified_secrets":0,"unverified_secrets":2,"scan_duration":"154.703374ms","trufflehog_version":"dev","verification_caching":{"Hits":0,"Misses":2,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":211}}
 ```
 
-**Stability note.** The scan was run four separate times; the counts
-`Hits:0, Misses:2, HitsWasted:0, AttemptsSaved:0` were **identical every time**
-(only `VerificationTimeSpentMS` varied as wall-clock: 195–229 ms). If the cache
-persisted across invocations, Run 2 would have reported `Hits:2, Misses:0`;
-instead every process starts cold with `Misses:2`.
+**Complete, unedited output — Run 2** (a fresh, separate process). stdout:
+
+```
+{"SourceMetadata":{"Data":{"Filesystem":{"file":"pkg/engine/testdata/secrets.txt","line":3}}},"SourceID":1,"SourceType":15,"SourceName":"trufflehog - filesystem","DetectorType":87,"DetectorName":"SentryToken","DetectorDescription":"Sentry is an error tracking service that helps developers monitor and fix crashes in real time. Sentry tokens can be used to access and manage projects and organizations within Sentry.","DecoderName":"PLAIN","Verified":false,"VerificationFromCache":false,"Raw":"27ac84f4bcdb4fca9701f4d6f6f58cd7d96b69c9d9754d40800645a51d668f90","RawV2":"","Redacted":"","ExtraData":null,"StructuredData":null}
+{"SourceMetadata":{"Data":{"Filesystem":{"file":"pkg/engine/testdata/secrets.txt","line":1}}},"SourceID":1,"SourceType":15,"SourceName":"trufflehog - filesystem","DetectorType":2,"DetectorName":"AWS","DetectorDescription":"AWS (Amazon Web Services) is a comprehensive cloud computing platform offering a wide range of on-demand services like computing power, storage, databases. API keys for AWS can have varying amount of access to these services depending on the IAM policy attached.","DecoderName":"PLAIN","Verified":false,"VerificationFromCache":false,"Raw":"AKIAWARWQKZNHMZBLY4I","RawV2":"AKIAWARWQKZNHMZBLY4I:s6NbZeygUrUdM95K683Lb6IsILWXOJlJ8ZVd1Kw0","Redacted":"AKIAWARWQKZNHMZBLY4I","ExtraData":{"account":"413504919130","resource_type":"Access key"},"StructuredData":null}
+```
+
+stderr:
+
+```
+{"level":"info-0","ts":"2026-07-08T06:22:44Z","logger":"trufflehog","msg":"running source","source_manager_worker_id":"EWSwt","with_units":true}
+{"level":"info-0","ts":"2026-07-08T06:22:44Z","logger":"trufflehog","msg":"finished scanning","chunks":1,"bytes":372,"verified_secrets":0,"unverified_secrets":2,"scan_duration":"154.909504ms","trufflehog_version":"dev","verification_caching":{"Hits":0,"Misses":2,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":209}}
+```
+
+**Complete, unedited output — Run 3** (a third separate process). stdout:
+
+```
+{"SourceMetadata":{"Data":{"Filesystem":{"file":"pkg/engine/testdata/secrets.txt","line":3}}},"SourceID":1,"SourceType":15,"SourceName":"trufflehog - filesystem","DetectorType":87,"DetectorName":"SentryToken","DetectorDescription":"Sentry is an error tracking service that helps developers monitor and fix crashes in real time. Sentry tokens can be used to access and manage projects and organizations within Sentry.","DecoderName":"PLAIN","Verified":false,"VerificationFromCache":false,"Raw":"27ac84f4bcdb4fca9701f4d6f6f58cd7d96b69c9d9754d40800645a51d668f90","RawV2":"","Redacted":"","ExtraData":null,"StructuredData":null}
+{"SourceMetadata":{"Data":{"Filesystem":{"file":"pkg/engine/testdata/secrets.txt","line":1}}},"SourceID":1,"SourceType":15,"SourceName":"trufflehog - filesystem","DetectorType":2,"DetectorName":"AWS","DetectorDescription":"AWS (Amazon Web Services) is a comprehensive cloud computing platform offering a wide range of on-demand services like computing power, storage, databases. API keys for AWS can have varying amount of access to these services depending on the IAM policy attached.","DecoderName":"PLAIN","Verified":false,"VerificationFromCache":false,"Raw":"AKIAWARWQKZNHMZBLY4I","RawV2":"AKIAWARWQKZNHMZBLY4I:s6NbZeygUrUdM95K683Lb6IsILWXOJlJ8ZVd1Kw0","Redacted":"AKIAWARWQKZNHMZBLY4I","ExtraData":{"account":"413504919130","resource_type":"Access key"},"StructuredData":null}
+```
+
+stderr:
+
+```
+{"level":"info-0","ts":"2026-07-08T06:22:48Z","logger":"trufflehog","msg":"running source","source_manager_worker_id":"CbnFc","with_units":true}
+{"level":"info-0","ts":"2026-07-08T06:22:48Z","logger":"trufflehog","msg":"finished scanning","chunks":1,"bytes":372,"verified_secrets":0,"unverified_secrets":2,"scan_duration":"157.431623ms","trufflehog_version":"dev","verification_caching":{"Hits":0,"Misses":2,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":236}}
+```
+
+**Stability & interpretation.** Across all **three** separate processes the cache
+counts were **identical** — `Hits:0, Misses:2, HitsWasted:0, AttemptsSaved:0` — and
+only `VerificationTimeSpentMS` varied as wall-clock (211 / 209 / 236 ms). If the
+cache persisted across invocations, Run 2 and Run 3 would have reported `Hits:2,
+Misses:0` (the two credentials cached by Run 1); instead **every process starts
+cold with `Misses:2`**, so there is **no cross-invocation persistence**.
 
 ### Condition B — within-process hit accrual (the contrasting/edge branch)
 
 `secrets.txt` is a single chunk, so its four identical Sentry lines cannot produce
-cross-chunk hits (they collapse within the one chunk → `Hits:0`). To exercise the
-**within-process** hit path, scan a directory of 100 files, each containing the
-**same** Sentry credential (so each file is a separate chunk); pin
-`--concurrency=1` so the result-cache store for an early chunk completes before a
-later chunk's lookup.
+cross-chunk hits (they collapse within the one chunk → `Hits:0`, as Condition A
+shows). To exercise the **within-process** hit path, scan a directory of **20
+files**, each containing the **same** Sentry credential (so each file is a separate
+chunk), and pin `--concurrency=1`:
 
 ```
-mkdir -p /tmp/th_obs/q3_many
-for i in $(seq 1 100); do
-  printf ' sentry 27ac84f4bcdb4fca9701f4d6f6f58cd7d96b69c9d9754d40800645a51d668f90\n' > /tmp/th_obs/q3_many/file$i.txt
+mkdir -p /tmp/th_obs/q3/many20
+for i in $(seq 1 20); do
+  printf ' sentry 27ac84f4bcdb4fca9701f4d6f6f58cd7d96b69c9d9754d40800645a51d668f90\n' > /tmp/th_obs/q3/many20/file$i.txt
 done
-CGO_ENABLED=0 go run . filesystem /tmp/th_obs/q3_many --concurrency=1 --no-update
+CGO_ENABLED=0 go run . filesystem /tmp/th_obs/q3/many20 --concurrency=1 --json --no-update
 ```
 
-**Complete, unedited output — stderr:**
+**Complete, unedited output — Run 1.** stdout (20 findings, one per file):
 
 ```
-🐷🔑🐷  TruffleHog. Unearth your secrets. 🐷🔑🐷
-
-2026-07-08T05:19:51Z	info-0	trufflehog	running source	{"source_manager_worker_id": "SUivC", "with_units": true}
-2026-07-08T05:19:51Z	info-0	trufflehog	finished scanning	{"chunks": 100, "bytes": 7300, "verified_secrets": 0, "unverified_secrets": 100, "scan_duration": "78.424504ms", "trufflehog_version": "dev", "verification_caching": {"Hits":92,"Misses":8,"HitsWasted":0,"AttemptsSaved":92,"VerificationTimeSpentMS":510}}
+{"SourceMetadata":{"Data":{"Filesystem":{"file":"/tmp/th_obs/q3/many20/file15.txt","line":1}}},"SourceID":1,"SourceType":15,"SourceName":"trufflehog - filesystem","DetectorType":87,"DetectorName":"SentryToken","DetectorDescription":"Sentry is an error tracking service that helps developers monitor and fix crashes in real time. Sentry tokens can be used to access and manage projects and organizations within Sentry.","DecoderName":"PLAIN","Verified":false,"VerificationFromCache":false,"Raw":"27ac84f4bcdb4fca9701f4d6f6f58cd7d96b69c9d9754d40800645a51d668f90","RawV2":"","Redacted":"","ExtraData":null,"StructuredData":null}
+{"SourceMetadata":{"Data":{"Filesystem":{"file":"/tmp/th_obs/q3/many20/file17.txt","line":1}}},"SourceID":1,"SourceType":15,"SourceName":"trufflehog - filesystem","DetectorType":87,"DetectorName":"SentryToken","DetectorDescription":"Sentry is an error tracking service that helps developers monitor and fix crashes in real time. Sentry tokens can be used to access and manage projects and organizations within Sentry.","DecoderName":"PLAIN","Verified":false,"VerificationFromCache":true,"Raw":"27ac84f4bcdb4fca9701f4d6f6f58cd7d96b69c9d9754d40800645a51d668f90","RawV2":"","Redacted":"","ExtraData":null,"StructuredData":null}
+{"SourceMetadata":{"Data":{"Filesystem":{"file":"/tmp/th_obs/q3/many20/file18.txt","line":1}}},"SourceID":1,"SourceType":15,"SourceName":"trufflehog - filesystem","DetectorType":87,"DetectorName":"SentryToken","DetectorDescription":"Sentry is an error tracking service that helps developers monitor and fix crashes in real time. Sentry tokens can be used to access and manage projects and organizations within Sentry.","DecoderName":"PLAIN","Verified":false,"VerificationFromCache":true,"Raw":"27ac84f4bcdb4fca9701f4d6f6f58cd7d96b69c9d9754d40800645a51d668f90","RawV2":"","Redacted":"","ExtraData":null,"StructuredData":null}
+{"SourceMetadata":{"Data":{"Filesystem":{"file":"/tmp/th_obs/q3/many20/file19.txt","line":1}}},"SourceID":1,"SourceType":15,"SourceName":"trufflehog - filesystem","DetectorType":87,"DetectorName":"SentryToken","DetectorDescription":"Sentry is an error tracking service that helps developers monitor and fix crashes in real time. Sentry tokens can be used to access and manage projects and organizations within Sentry.","DecoderName":"PLAIN","Verified":false,"VerificationFromCache":true,"Raw":"27ac84f4bcdb4fca9701f4d6f6f58cd7d96b69c9d9754d40800645a51d668f90","RawV2":"","Redacted":"","ExtraData":null,"StructuredData":null}
+{"SourceMetadata":{"Data":{"Filesystem":{"file":"/tmp/th_obs/q3/many20/file2.txt","line":1}}},"SourceID":1,"SourceType":15,"SourceName":"trufflehog - filesystem","DetectorType":87,"DetectorName":"SentryToken","DetectorDescription":"Sentry is an error tracking service that helps developers monitor and fix crashes in real time. Sentry tokens can be used to access and manage projects and organizations within Sentry.","DecoderName":"PLAIN","Verified":false,"VerificationFromCache":true,"Raw":"27ac84f4bcdb4fca9701f4d6f6f58cd7d96b69c9d9754d40800645a51d668f90","RawV2":"","Redacted":"","ExtraData":null,"StructuredData":null}
+{"SourceMetadata":{"Data":{"Filesystem":{"file":"/tmp/th_obs/q3/many20/file20.txt","line":1}}},"SourceID":1,"SourceType":15,"SourceName":"trufflehog - filesystem","DetectorType":87,"DetectorName":"SentryToken","DetectorDescription":"Sentry is an error tracking service that helps developers monitor and fix crashes in real time. Sentry tokens can be used to access and manage projects and organizations within Sentry.","DecoderName":"PLAIN","Verified":false,"VerificationFromCache":true,"Raw":"27ac84f4bcdb4fca9701f4d6f6f58cd7d96b69c9d9754d40800645a51d668f90","RawV2":"","Redacted":"","ExtraData":null,"StructuredData":null}
+{"SourceMetadata":{"Data":{"Filesystem":{"file":"/tmp/th_obs/q3/many20/file3.txt","line":1}}},"SourceID":1,"SourceType":15,"SourceName":"trufflehog - filesystem","DetectorType":87,"DetectorName":"SentryToken","DetectorDescription":"Sentry is an error tracking service that helps developers monitor and fix crashes in real time. Sentry tokens can be used to access and manage projects and organizations within Sentry.","DecoderName":"PLAIN","Verified":false,"VerificationFromCache":true,"Raw":"27ac84f4bcdb4fca9701f4d6f6f58cd7d96b69c9d9754d40800645a51d668f90","RawV2":"","Redacted":"","ExtraData":null,"StructuredData":null}
+{"SourceMetadata":{"Data":{"Filesystem":{"file":"/tmp/th_obs/q3/many20/file4.txt","line":1}}},"SourceID":1,"SourceType":15,"SourceName":"trufflehog - filesystem","DetectorType":87,"DetectorName":"SentryToken","DetectorDescription":"Sentry is an error tracking service that helps developers monitor and fix crashes in real time. Sentry tokens can be used to access and manage projects and organizations within Sentry.","DecoderName":"PLAIN","Verified":false,"VerificationFromCache":true,"Raw":"27ac84f4bcdb4fca9701f4d6f6f58cd7d96b69c9d9754d40800645a51d668f90","RawV2":"","Redacted":"","ExtraData":null,"StructuredData":null}
+{"SourceMetadata":{"Data":{"Filesystem":{"file":"/tmp/th_obs/q3/many20/file5.txt","line":1}}},"SourceID":1,"SourceType":15,"SourceName":"trufflehog - filesystem","DetectorType":87,"DetectorName":"SentryToken","DetectorDescription":"Sentry is an error tracking service that helps developers monitor and fix crashes in real time. Sentry tokens can be used to access and manage projects and organizations within Sentry.","DecoderName":"PLAIN","Verified":false,"VerificationFromCache":true,"Raw":"27ac84f4bcdb4fca9701f4d6f6f58cd7d96b69c9d9754d40800645a51d668f90","RawV2":"","Redacted":"","ExtraData":null,"StructuredData":null}
+{"SourceMetadata":{"Data":{"Filesystem":{"file":"/tmp/th_obs/q3/many20/file6.txt","line":1}}},"SourceID":1,"SourceType":15,"SourceName":"trufflehog - filesystem","DetectorType":87,"DetectorName":"SentryToken","DetectorDescription":"Sentry is an error tracking service that helps developers monitor and fix crashes in real time. Sentry tokens can be used to access and manage projects and organizations within Sentry.","DecoderName":"PLAIN","Verified":false,"VerificationFromCache":true,"Raw":"27ac84f4bcdb4fca9701f4d6f6f58cd7d96b69c9d9754d40800645a51d668f90","RawV2":"","Redacted":"","ExtraData":null,"StructuredData":null}
+{"SourceMetadata":{"Data":{"Filesystem":{"file":"/tmp/th_obs/q3/many20/file7.txt","line":1}}},"SourceID":1,"SourceType":15,"SourceName":"trufflehog - filesystem","DetectorType":87,"DetectorName":"SentryToken","DetectorDescription":"Sentry is an error tracking service that helps developers monitor and fix crashes in real time. Sentry tokens can be used to access and manage projects and organizations within Sentry.","DecoderName":"PLAIN","Verified":false,"VerificationFromCache":true,"Raw":"27ac84f4bcdb4fca9701f4d6f6f58cd7d96b69c9d9754d40800645a51d668f90","RawV2":"","Redacted":"","ExtraData":null,"StructuredData":null}
+{"SourceMetadata":{"Data":{"Filesystem":{"file":"/tmp/th_obs/q3/many20/file8.txt","line":1}}},"SourceID":1,"SourceType":15,"SourceName":"trufflehog - filesystem","DetectorType":87,"DetectorName":"SentryToken","DetectorDescription":"Sentry is an error tracking service that helps developers monitor and fix crashes in real time. Sentry tokens can be used to access and manage projects and organizations within Sentry.","DecoderName":"PLAIN","Verified":false,"VerificationFromCache":true,"Raw":"27ac84f4bcdb4fca9701f4d6f6f58cd7d96b69c9d9754d40800645a51d668f90","RawV2":"","Redacted":"","ExtraData":null,"StructuredData":null}
+{"SourceMetadata":{"Data":{"Filesystem":{"file":"/tmp/th_obs/q3/many20/file9.txt","line":1}}},"SourceID":1,"SourceType":15,"SourceName":"trufflehog - filesystem","DetectorType":87,"DetectorName":"SentryToken","DetectorDescription":"Sentry is an error tracking service that helps developers monitor and fix crashes in real time. Sentry tokens can be used to access and manage projects and organizations within Sentry.","DecoderName":"PLAIN","Verified":false,"VerificationFromCache":true,"Raw":"27ac84f4bcdb4fca9701f4d6f6f58cd7d96b69c9d9754d40800645a51d668f90","RawV2":"","Redacted":"","ExtraData":null,"StructuredData":null}
+{"SourceMetadata":{"Data":{"Filesystem":{"file":"/tmp/th_obs/q3/many20/file14.txt","line":1}}},"SourceID":1,"SourceType":15,"SourceName":"trufflehog - filesystem","DetectorType":87,"DetectorName":"SentryToken","DetectorDescription":"Sentry is an error tracking service that helps developers monitor and fix crashes in real time. Sentry tokens can be used to access and manage projects and organizations within Sentry.","DecoderName":"PLAIN","Verified":false,"VerificationFromCache":false,"Raw":"27ac84f4bcdb4fca9701f4d6f6f58cd7d96b69c9d9754d40800645a51d668f90","RawV2":"","Redacted":"","ExtraData":null,"StructuredData":null}
+{"SourceMetadata":{"Data":{"Filesystem":{"file":"/tmp/th_obs/q3/many20/file1.txt","line":1}}},"SourceID":1,"SourceType":15,"SourceName":"trufflehog - filesystem","DetectorType":87,"DetectorName":"SentryToken","DetectorDescription":"Sentry is an error tracking service that helps developers monitor and fix crashes in real time. Sentry tokens can be used to access and manage projects and organizations within Sentry.","DecoderName":"PLAIN","Verified":false,"VerificationFromCache":false,"Raw":"27ac84f4bcdb4fca9701f4d6f6f58cd7d96b69c9d9754d40800645a51d668f90","RawV2":"","Redacted":"","ExtraData":null,"StructuredData":null}
+{"SourceMetadata":{"Data":{"Filesystem":{"file":"/tmp/th_obs/q3/many20/file16.txt","line":1}}},"SourceID":1,"SourceType":15,"SourceName":"trufflehog - filesystem","DetectorType":87,"DetectorName":"SentryToken","DetectorDescription":"Sentry is an error tracking service that helps developers monitor and fix crashes in real time. Sentry tokens can be used to access and manage projects and organizations within Sentry.","DecoderName":"PLAIN","Verified":false,"VerificationFromCache":false,"Raw":"27ac84f4bcdb4fca9701f4d6f6f58cd7d96b69c9d9754d40800645a51d668f90","RawV2":"","Redacted":"","ExtraData":null,"StructuredData":null}
+{"SourceMetadata":{"Data":{"Filesystem":{"file":"/tmp/th_obs/q3/many20/file13.txt","line":1}}},"SourceID":1,"SourceType":15,"SourceName":"trufflehog - filesystem","DetectorType":87,"DetectorName":"SentryToken","DetectorDescription":"Sentry is an error tracking service that helps developers monitor and fix crashes in real time. Sentry tokens can be used to access and manage projects and organizations within Sentry.","DecoderName":"PLAIN","Verified":false,"VerificationFromCache":false,"Raw":"27ac84f4bcdb4fca9701f4d6f6f58cd7d96b69c9d9754d40800645a51d668f90","RawV2":"","Redacted":"","ExtraData":null,"StructuredData":null}
+{"SourceMetadata":{"Data":{"Filesystem":{"file":"/tmp/th_obs/q3/many20/file12.txt","line":1}}},"SourceID":1,"SourceType":15,"SourceName":"trufflehog - filesystem","DetectorType":87,"DetectorName":"SentryToken","DetectorDescription":"Sentry is an error tracking service that helps developers monitor and fix crashes in real time. Sentry tokens can be used to access and manage projects and organizations within Sentry.","DecoderName":"PLAIN","Verified":false,"VerificationFromCache":false,"Raw":"27ac84f4bcdb4fca9701f4d6f6f58cd7d96b69c9d9754d40800645a51d668f90","RawV2":"","Redacted":"","ExtraData":null,"StructuredData":null}
+{"SourceMetadata":{"Data":{"Filesystem":{"file":"/tmp/th_obs/q3/many20/file11.txt","line":1}}},"SourceID":1,"SourceType":15,"SourceName":"trufflehog - filesystem","DetectorType":87,"DetectorName":"SentryToken","DetectorDescription":"Sentry is an error tracking service that helps developers monitor and fix crashes in real time. Sentry tokens can be used to access and manage projects and organizations within Sentry.","DecoderName":"PLAIN","Verified":false,"VerificationFromCache":false,"Raw":"27ac84f4bcdb4fca9701f4d6f6f58cd7d96b69c9d9754d40800645a51d668f90","RawV2":"","Redacted":"","ExtraData":null,"StructuredData":null}
+{"SourceMetadata":{"Data":{"Filesystem":{"file":"/tmp/th_obs/q3/many20/file10.txt","line":1}}},"SourceID":1,"SourceType":15,"SourceName":"trufflehog - filesystem","DetectorType":87,"DetectorName":"SentryToken","DetectorDescription":"Sentry is an error tracking service that helps developers monitor and fix crashes in real time. Sentry tokens can be used to access and manage projects and organizations within Sentry.","DecoderName":"PLAIN","Verified":false,"VerificationFromCache":false,"Raw":"27ac84f4bcdb4fca9701f4d6f6f58cd7d96b69c9d9754d40800645a51d668f90","RawV2":"","Redacted":"","ExtraData":null,"StructuredData":null}
 ```
 
-**Stability note.** Run as three separate processes, all three produced identical
-`Hits:92, Misses:8, HitsWasted:0, AttemptsSaved:92`. Two things follow at once:
-(1) **within a process, hits accrue** — 92 of the 100 chunks loaded verification
-status from the cache; and (2) the **`Misses:8` recurs on every separate process**
-(never `Misses:0`), so each invocation re-warms from cold — again proving **no
-cross-invocation persistence**. For contrast, the *same* 100-file input at the
-default concurrency (128) shows `Hits:0, Misses:100` with
-`VerificationTimeSpentMS≈15949` (all 100 chunks race past the cache before any
-store lands, so all miss and all perform real remote verification) versus
-`VerificationTimeSpentMS≈510` when 92 were served from cache.
+stderr:
 
-**Cause → effect (with `file:line`).** The result cache is created per process and
-only when caching is enabled by default:
+```
+{"level":"info-0","ts":"2026-07-08T06:27:14Z","logger":"trufflehog","msg":"running source","source_manager_worker_id":"V7tKP","with_units":true}
+{"level":"info-0","ts":"2026-07-08T06:27:14Z","logger":"trufflehog","msg":"finished scanning","chunks":20,"bytes":1460,"verified_secrets":0,"unverified_secrets":20,"scan_duration":"75.939188ms","trufflehog_version":"dev","verification_caching":{"Hits":12,"Misses":8,"HitsWasted":0,"AttemptsSaved":12,"VerificationTimeSpentMS":488}}
+```
+
+**Complete, unedited output — Run 2** (a fresh, separate process). stdout:
+
+```
+{"SourceMetadata":{"Data":{"Filesystem":{"file":"/tmp/th_obs/q3/many20/file13.txt","line":1}}},"SourceID":1,"SourceType":15,"SourceName":"trufflehog - filesystem","DetectorType":87,"DetectorName":"SentryToken","DetectorDescription":"Sentry is an error tracking service that helps developers monitor and fix crashes in real time. Sentry tokens can be used to access and manage projects and organizations within Sentry.","DecoderName":"PLAIN","Verified":false,"VerificationFromCache":false,"Raw":"27ac84f4bcdb4fca9701f4d6f6f58cd7d96b69c9d9754d40800645a51d668f90","RawV2":"","Redacted":"","ExtraData":null,"StructuredData":null}
+{"SourceMetadata":{"Data":{"Filesystem":{"file":"/tmp/th_obs/q3/many20/file17.txt","line":1}}},"SourceID":1,"SourceType":15,"SourceName":"trufflehog - filesystem","DetectorType":87,"DetectorName":"SentryToken","DetectorDescription":"Sentry is an error tracking service that helps developers monitor and fix crashes in real time. Sentry tokens can be used to access and manage projects and organizations within Sentry.","DecoderName":"PLAIN","Verified":false,"VerificationFromCache":true,"Raw":"27ac84f4bcdb4fca9701f4d6f6f58cd7d96b69c9d9754d40800645a51d668f90","RawV2":"","Redacted":"","ExtraData":null,"StructuredData":null}
+{"SourceMetadata":{"Data":{"Filesystem":{"file":"/tmp/th_obs/q3/many20/file18.txt","line":1}}},"SourceID":1,"SourceType":15,"SourceName":"trufflehog - filesystem","DetectorType":87,"DetectorName":"SentryToken","DetectorDescription":"Sentry is an error tracking service that helps developers monitor and fix crashes in real time. Sentry tokens can be used to access and manage projects and organizations within Sentry.","DecoderName":"PLAIN","Verified":false,"VerificationFromCache":true,"Raw":"27ac84f4bcdb4fca9701f4d6f6f58cd7d96b69c9d9754d40800645a51d668f90","RawV2":"","Redacted":"","ExtraData":null,"StructuredData":null}
+{"SourceMetadata":{"Data":{"Filesystem":{"file":"/tmp/th_obs/q3/many20/file19.txt","line":1}}},"SourceID":1,"SourceType":15,"SourceName":"trufflehog - filesystem","DetectorType":87,"DetectorName":"SentryToken","DetectorDescription":"Sentry is an error tracking service that helps developers monitor and fix crashes in real time. Sentry tokens can be used to access and manage projects and organizations within Sentry.","DecoderName":"PLAIN","Verified":false,"VerificationFromCache":true,"Raw":"27ac84f4bcdb4fca9701f4d6f6f58cd7d96b69c9d9754d40800645a51d668f90","RawV2":"","Redacted":"","ExtraData":null,"StructuredData":null}
+{"SourceMetadata":{"Data":{"Filesystem":{"file":"/tmp/th_obs/q3/many20/file2.txt","line":1}}},"SourceID":1,"SourceType":15,"SourceName":"trufflehog - filesystem","DetectorType":87,"DetectorName":"SentryToken","DetectorDescription":"Sentry is an error tracking service that helps developers monitor and fix crashes in real time. Sentry tokens can be used to access and manage projects and organizations within Sentry.","DecoderName":"PLAIN","Verified":false,"VerificationFromCache":true,"Raw":"27ac84f4bcdb4fca9701f4d6f6f58cd7d96b69c9d9754d40800645a51d668f90","RawV2":"","Redacted":"","ExtraData":null,"StructuredData":null}
+{"SourceMetadata":{"Data":{"Filesystem":{"file":"/tmp/th_obs/q3/many20/file20.txt","line":1}}},"SourceID":1,"SourceType":15,"SourceName":"trufflehog - filesystem","DetectorType":87,"DetectorName":"SentryToken","DetectorDescription":"Sentry is an error tracking service that helps developers monitor and fix crashes in real time. Sentry tokens can be used to access and manage projects and organizations within Sentry.","DecoderName":"PLAIN","Verified":false,"VerificationFromCache":true,"Raw":"27ac84f4bcdb4fca9701f4d6f6f58cd7d96b69c9d9754d40800645a51d668f90","RawV2":"","Redacted":"","ExtraData":null,"StructuredData":null}
+{"SourceMetadata":{"Data":{"Filesystem":{"file":"/tmp/th_obs/q3/many20/file3.txt","line":1}}},"SourceID":1,"SourceType":15,"SourceName":"trufflehog - filesystem","DetectorType":87,"DetectorName":"SentryToken","DetectorDescription":"Sentry is an error tracking service that helps developers monitor and fix crashes in real time. Sentry tokens can be used to access and manage projects and organizations within Sentry.","DecoderName":"PLAIN","Verified":false,"VerificationFromCache":true,"Raw":"27ac84f4bcdb4fca9701f4d6f6f58cd7d96b69c9d9754d40800645a51d668f90","RawV2":"","Redacted":"","ExtraData":null,"StructuredData":null}
+{"SourceMetadata":{"Data":{"Filesystem":{"file":"/tmp/th_obs/q3/many20/file4.txt","line":1}}},"SourceID":1,"SourceType":15,"SourceName":"trufflehog - filesystem","DetectorType":87,"DetectorName":"SentryToken","DetectorDescription":"Sentry is an error tracking service that helps developers monitor and fix crashes in real time. Sentry tokens can be used to access and manage projects and organizations within Sentry.","DecoderName":"PLAIN","Verified":false,"VerificationFromCache":true,"Raw":"27ac84f4bcdb4fca9701f4d6f6f58cd7d96b69c9d9754d40800645a51d668f90","RawV2":"","Redacted":"","ExtraData":null,"StructuredData":null}
+{"SourceMetadata":{"Data":{"Filesystem":{"file":"/tmp/th_obs/q3/many20/file5.txt","line":1}}},"SourceID":1,"SourceType":15,"SourceName":"trufflehog - filesystem","DetectorType":87,"DetectorName":"SentryToken","DetectorDescription":"Sentry is an error tracking service that helps developers monitor and fix crashes in real time. Sentry tokens can be used to access and manage projects and organizations within Sentry.","DecoderName":"PLAIN","Verified":false,"VerificationFromCache":true,"Raw":"27ac84f4bcdb4fca9701f4d6f6f58cd7d96b69c9d9754d40800645a51d668f90","RawV2":"","Redacted":"","ExtraData":null,"StructuredData":null}
+{"SourceMetadata":{"Data":{"Filesystem":{"file":"/tmp/th_obs/q3/many20/file6.txt","line":1}}},"SourceID":1,"SourceType":15,"SourceName":"trufflehog - filesystem","DetectorType":87,"DetectorName":"SentryToken","DetectorDescription":"Sentry is an error tracking service that helps developers monitor and fix crashes in real time. Sentry tokens can be used to access and manage projects and organizations within Sentry.","DecoderName":"PLAIN","Verified":false,"VerificationFromCache":true,"Raw":"27ac84f4bcdb4fca9701f4d6f6f58cd7d96b69c9d9754d40800645a51d668f90","RawV2":"","Redacted":"","ExtraData":null,"StructuredData":null}
+{"SourceMetadata":{"Data":{"Filesystem":{"file":"/tmp/th_obs/q3/many20/file7.txt","line":1}}},"SourceID":1,"SourceType":15,"SourceName":"trufflehog - filesystem","DetectorType":87,"DetectorName":"SentryToken","DetectorDescription":"Sentry is an error tracking service that helps developers monitor and fix crashes in real time. Sentry tokens can be used to access and manage projects and organizations within Sentry.","DecoderName":"PLAIN","Verified":false,"VerificationFromCache":true,"Raw":"27ac84f4bcdb4fca9701f4d6f6f58cd7d96b69c9d9754d40800645a51d668f90","RawV2":"","Redacted":"","ExtraData":null,"StructuredData":null}
+{"SourceMetadata":{"Data":{"Filesystem":{"file":"/tmp/th_obs/q3/many20/file8.txt","line":1}}},"SourceID":1,"SourceType":15,"SourceName":"trufflehog - filesystem","DetectorType":87,"DetectorName":"SentryToken","DetectorDescription":"Sentry is an error tracking service that helps developers monitor and fix crashes in real time. Sentry tokens can be used to access and manage projects and organizations within Sentry.","DecoderName":"PLAIN","Verified":false,"VerificationFromCache":true,"Raw":"27ac84f4bcdb4fca9701f4d6f6f58cd7d96b69c9d9754d40800645a51d668f90","RawV2":"","Redacted":"","ExtraData":null,"StructuredData":null}
+{"SourceMetadata":{"Data":{"Filesystem":{"file":"/tmp/th_obs/q3/many20/file9.txt","line":1}}},"SourceID":1,"SourceType":15,"SourceName":"trufflehog - filesystem","DetectorType":87,"DetectorName":"SentryToken","DetectorDescription":"Sentry is an error tracking service that helps developers monitor and fix crashes in real time. Sentry tokens can be used to access and manage projects and organizations within Sentry.","DecoderName":"PLAIN","Verified":false,"VerificationFromCache":true,"Raw":"27ac84f4bcdb4fca9701f4d6f6f58cd7d96b69c9d9754d40800645a51d668f90","RawV2":"","Redacted":"","ExtraData":null,"StructuredData":null}
+{"SourceMetadata":{"Data":{"Filesystem":{"file":"/tmp/th_obs/q3/many20/file1.txt","line":1}}},"SourceID":1,"SourceType":15,"SourceName":"trufflehog - filesystem","DetectorType":87,"DetectorName":"SentryToken","DetectorDescription":"Sentry is an error tracking service that helps developers monitor and fix crashes in real time. Sentry tokens can be used to access and manage projects and organizations within Sentry.","DecoderName":"PLAIN","Verified":false,"VerificationFromCache":false,"Raw":"27ac84f4bcdb4fca9701f4d6f6f58cd7d96b69c9d9754d40800645a51d668f90","RawV2":"","Redacted":"","ExtraData":null,"StructuredData":null}
+{"SourceMetadata":{"Data":{"Filesystem":{"file":"/tmp/th_obs/q3/many20/file16.txt","line":1}}},"SourceID":1,"SourceType":15,"SourceName":"trufflehog - filesystem","DetectorType":87,"DetectorName":"SentryToken","DetectorDescription":"Sentry is an error tracking service that helps developers monitor and fix crashes in real time. Sentry tokens can be used to access and manage projects and organizations within Sentry.","DecoderName":"PLAIN","Verified":false,"VerificationFromCache":false,"Raw":"27ac84f4bcdb4fca9701f4d6f6f58cd7d96b69c9d9754d40800645a51d668f90","RawV2":"","Redacted":"","ExtraData":null,"StructuredData":null}
+{"SourceMetadata":{"Data":{"Filesystem":{"file":"/tmp/th_obs/q3/many20/file12.txt","line":1}}},"SourceID":1,"SourceType":15,"SourceName":"trufflehog - filesystem","DetectorType":87,"DetectorName":"SentryToken","DetectorDescription":"Sentry is an error tracking service that helps developers monitor and fix crashes in real time. Sentry tokens can be used to access and manage projects and organizations within Sentry.","DecoderName":"PLAIN","Verified":false,"VerificationFromCache":false,"Raw":"27ac84f4bcdb4fca9701f4d6f6f58cd7d96b69c9d9754d40800645a51d668f90","RawV2":"","Redacted":"","ExtraData":null,"StructuredData":null}
+{"SourceMetadata":{"Data":{"Filesystem":{"file":"/tmp/th_obs/q3/many20/file14.txt","line":1}}},"SourceID":1,"SourceType":15,"SourceName":"trufflehog - filesystem","DetectorType":87,"DetectorName":"SentryToken","DetectorDescription":"Sentry is an error tracking service that helps developers monitor and fix crashes in real time. Sentry tokens can be used to access and manage projects and organizations within Sentry.","DecoderName":"PLAIN","Verified":false,"VerificationFromCache":false,"Raw":"27ac84f4bcdb4fca9701f4d6f6f58cd7d96b69c9d9754d40800645a51d668f90","RawV2":"","Redacted":"","ExtraData":null,"StructuredData":null}
+{"SourceMetadata":{"Data":{"Filesystem":{"file":"/tmp/th_obs/q3/many20/file11.txt","line":1}}},"SourceID":1,"SourceType":15,"SourceName":"trufflehog - filesystem","DetectorType":87,"DetectorName":"SentryToken","DetectorDescription":"Sentry is an error tracking service that helps developers monitor and fix crashes in real time. Sentry tokens can be used to access and manage projects and organizations within Sentry.","DecoderName":"PLAIN","Verified":false,"VerificationFromCache":false,"Raw":"27ac84f4bcdb4fca9701f4d6f6f58cd7d96b69c9d9754d40800645a51d668f90","RawV2":"","Redacted":"","ExtraData":null,"StructuredData":null}
+{"SourceMetadata":{"Data":{"Filesystem":{"file":"/tmp/th_obs/q3/many20/file15.txt","line":1}}},"SourceID":1,"SourceType":15,"SourceName":"trufflehog - filesystem","DetectorType":87,"DetectorName":"SentryToken","DetectorDescription":"Sentry is an error tracking service that helps developers monitor and fix crashes in real time. Sentry tokens can be used to access and manage projects and organizations within Sentry.","DecoderName":"PLAIN","Verified":false,"VerificationFromCache":false,"Raw":"27ac84f4bcdb4fca9701f4d6f6f58cd7d96b69c9d9754d40800645a51d668f90","RawV2":"","Redacted":"","ExtraData":null,"StructuredData":null}
+{"SourceMetadata":{"Data":{"Filesystem":{"file":"/tmp/th_obs/q3/many20/file10.txt","line":1}}},"SourceID":1,"SourceType":15,"SourceName":"trufflehog - filesystem","DetectorType":87,"DetectorName":"SentryToken","DetectorDescription":"Sentry is an error tracking service that helps developers monitor and fix crashes in real time. Sentry tokens can be used to access and manage projects and organizations within Sentry.","DecoderName":"PLAIN","Verified":false,"VerificationFromCache":false,"Raw":"27ac84f4bcdb4fca9701f4d6f6f58cd7d96b69c9d9754d40800645a51d668f90","RawV2":"","Redacted":"","ExtraData":null,"StructuredData":null}
+```
+
+stderr:
+
+```
+{"level":"info-0","ts":"2026-07-08T06:27:19Z","logger":"trufflehog","msg":"running source","source_manager_worker_id":"zq34k","with_units":true}
+{"level":"info-0","ts":"2026-07-08T06:27:19Z","logger":"trufflehog","msg":"finished scanning","chunks":20,"bytes":1460,"verified_secrets":0,"unverified_secrets":20,"scan_duration":"76.777955ms","trufflehog_version":"dev","verification_caching":{"Hits":12,"Misses":8,"HitsWasted":0,"AttemptsSaved":12,"VerificationTimeSpentMS":486}}
+```
+
+**Stability & cross-check.** Both processes reported **identical** cache counts —
+`Hits:12, Misses:8, HitsWasted:0, AttemptsSaved:12` (only `VerificationTimeSpentMS`
+varied: 488 / 486 ms). Two independent facts inside the same output corroborate one
+another: (1) the **aggregate** stderr snapshot says 12 hits / 8 misses; and (2) the
+**per-finding** `VerificationFromCache` field on stdout is `true` for exactly
+**12** findings and `false` for exactly **8** in each run (the field is set on a hit
+at `pkg/verificationcache/verification_cache.go:92`). The two runs emit the **same
+20 findings**, proven identical modulo concurrent emission order:
+
+```
+$ diff <(sort wp1.out) <(sort wp2.out) && echo "IDENTICAL (same 20 findings, modulo emission order)"
+IDENTICAL (same 20 findings, modulo emission order)
+```
+
+**Why `Misses:8` (not 1) even at `--concurrency=1`.** `--concurrency` sizes the
+scanner pool, but detector workers are `concurrency × detectorWorkerMultiplier`
+with `detectorWorkerMultiplier = 8` (`pkg/engine/engine.go:345`) and **no CLI flag
+overrides it**, so at `--concurrency=1` there are still **8 detector workers**
+(exactly the count Q4 observes). All 8 pull a chunk and reach the cache lookup
+before the first remote verification completes and writes its key, so the first 8
+chunks **miss**; the remaining 12 arrive after the key is stored and **hit**. The
+miss count therefore tracks the detector-worker pool size (8) rather than the file
+count — exactly what the 20-file run above shows (`Misses:8`, `Hits:12`).
+
+**Cause → effect (with `file:line`).** The result cache is created **per process**
+and only when caching is enabled (the default):
 `if !*noVerificationCache { engConf.VerificationResultCache = simple.NewCache[detectors.Result]() }`
-(`main.go:535-537`), and the metrics reporter is a fresh
+(`main.go:535-536`), and the metrics reporter is a fresh
 `verificationcache.InMemoryMetrics{}` per process (`main.go:511`), wired via
 `VerificationCacheMetrics` (`main.go:532`). The store is an in-memory
 `patrickmn/go-cache` (`go.mod:80`) wrapped by `simple.Cache[T]`
 (`pkg/cache/simple/simple.go:16-21`) — nothing writes it to disk, so a new process
 begins with an empty cache. Inside `VerificationCache.FromData`
 (`pkg/verificationcache/verification_cache.go:50`), each candidate result's cache
-key is looked up (`v.resultCache.Get(...)` at `verification_cache.go:90`): a hit
-records `AddResultCacheHits(1)` (`:93`), a miss records `AddResultCacheMisses(1)`
-(`:96`); when every result in a chunk is cached it records
-`AddCredentialVerificationsSaved(len(...))` (`:104`); otherwise it performs remote
+key is looked up (`v.resultCache.Get(...)` at
+`pkg/verificationcache/verification_cache.go:90`): a hit records
+`AddResultCacheHits(1)` (`pkg/verificationcache/verification_cache.go:93`) and sets
+`VerificationFromCache = true` (`pkg/verificationcache/verification_cache.go:92`); a
+miss records `AddResultCacheMisses(1)`
+(`pkg/verificationcache/verification_cache.go:96`); when every result in a chunk is
+cached it records `AddCredentialVerificationsSaved(len(...))`
+(`pkg/verificationcache/verification_cache.go:104`); otherwise it performs remote
 verification and **stores** each result (`v.resultCache.Set(...)` at
-`verification_cache.go:130`). The cache key itself, `getResultCacheKey`
-(`verification_cache.go:136-147`), is a Blake2B hash
-(`hasher.NewBlake2B()` set in `New()` at `verification_cache.go:35`;
-`golang.org/x/crypto` `go.mod:107`) over `result.Raw ‖ result.RawV2`
-(`verification_cache.go:140`) plus `result.DetectorType`
-(`binary.Append(..., result.DetectorType)` at `verification_cache.go:141`) — which
-is why 100 copies of the same credential share one key and hits accrue within the
-process.
+`pkg/verificationcache/verification_cache.go:130`). The cache key itself,
+`getResultCacheKey` (`pkg/verificationcache/verification_cache.go:136-147`), is a
+Blake2B hash (`hasher.NewBlake2B()` set in `New()` at
+`pkg/verificationcache/verification_cache.go:35`; `golang.org/x/crypto`
+`go.mod:107`) over `result.Raw ‖ result.RawV2`
+(`pkg/verificationcache/verification_cache.go:140`) plus `result.DetectorType`
+(`binary.Append(..., result.DetectorType)` at
+`pkg/verificationcache/verification_cache.go:141`) — which is why 20 copies of the
+same credential share one key and hits accrue within the process.
 
 **Explicit answer.**
 - **Reported metric fields (by name, with source line):** `Hits`
-  (`ResultCacheHits`, `in_memory_metrics.go:12`), `Misses` (`ResultCacheMisses`,
-  `:14`), `HitsWasted` (`ResultCacheHitsWasted`, `:13`), `AttemptsSaved`
-  (`CredentialVerificationsSaved`, `:10`), and `VerificationTimeSpentMS`
-  (`FromDataVerifyTimeSpentMS`, `:11`) — printed under the `verification_caching`
-  key (`main.go:566-574`).
-- **Persist or not?** **NOT persisted across separate CLI invocations.** The
-  result cache (`simple.NewCache`, `main.go:536`) and metrics
-  (`InMemoryMetrics{}`, `main.go:511`) are constructed fresh per process and held
-  only in memory, so two separate runs of the identical scan produce identical
-  snapshots (misses do not become hits on the second run). **Within** a single
-  process, hits **do** accrue (92 of 100 chunks in Condition B).
+  (`ResultCacheHits`, `pkg/verificationcache/in_memory_metrics.go:12`), `Misses`
+  (`ResultCacheMisses`, `pkg/verificationcache/in_memory_metrics.go:14`),
+  `HitsWasted` (`ResultCacheHitsWasted`,
+  `pkg/verificationcache/in_memory_metrics.go:13`), `AttemptsSaved`
+  (`CredentialVerificationsSaved`, `pkg/verificationcache/in_memory_metrics.go:10`),
+  and `VerificationTimeSpentMS` (`FromDataVerifyTimeSpentMS`,
+  `pkg/verificationcache/in_memory_metrics.go:11`) — printed under the
+  `verification_caching` key (`main.go:573`).
+- **Persist or not?** **NOT persisted across separate CLI invocations.** The result
+  cache (`simple.NewCache`, `main.go:536`) and metrics (`InMemoryMetrics{}`,
+  `main.go:511`) are constructed fresh per process and held only in memory, so the
+  three separate runs of the identical scan produced identical snapshots (`Misses:2`
+  never became `Hits:2`). **Within** a single process, hits **do** accrue (12 of the
+  20 chunks in Condition B).
 
 ---
 
@@ -448,23 +684,142 @@ concurrency to 4:
 CGO_ENABLED=0 go run . filesystem pkg/engine/testdata/secrets.txt --concurrency=4 --log-level=2 --no-update
 ```
 
-**Complete, unedited output — stderr (10 lines):**
+**Output format & method.** Run **without** `--json`, so findings print (console
+format) to **stdout** while the worker-startup logs print to **stderr**; the scan is
+repeated as **three separate processes** to show the counts are stable.
+
+**Run 1 — stdout (the two findings):**
 
 ```
-2026-07-08T05:20:21Z	info-2	trufflehog	trufflehog dev
+Found unverified result 🐷🔑❓
+Detector Type: SentryToken
+Decoder Type: PLAIN
+Raw result: 27ac84f4bcdb4fca9701f4d6f6f58cd7d96b69c9d9754d40800645a51d668f90
+File: pkg/engine/testdata/secrets.txt
+Line: 3
+
+Found unverified result 🐷🔑❓
+Detector Type: AWS
+Decoder Type: PLAIN
+Raw result: AKIAWARWQKZNHMZBLY4I
+Resource_type: Access key
+Account: 413504919130
+File: pkg/engine/testdata/secrets.txt
+Line: 1
+```
+
+**Run 1 — stderr (banner, the four `info-2` worker-startup lines, and the
+end-of-scan snapshot):**
+
+```
+2026-07-08T06:40:06Z	info-2	trufflehog	trufflehog dev
 🐷🔑🐷  TruffleHog. Unearth your secrets. 🐷🔑🐷
 
-2026-07-08T05:20:21Z	info-2	trufflehog	starting scanner workers	{"count": 4}
-2026-07-08T05:20:21Z	info-2	trufflehog	starting detector workers	{"count": 32}
-2026-07-08T05:20:21Z	info-2	trufflehog	starting verificationOverlap workers	{"count": 4}
-2026-07-08T05:20:21Z	info-2	trufflehog	starting notifier workers	{"count": 4}
-2026-07-08T05:20:21Z	info-0	trufflehog	running source	{"source_manager_worker_id": "4uPag", "with_units": true}
-2026-07-08T05:20:21Z	info-2	trufflehog	enumerating source	{"source_manager_worker_id": "4uPag"}
-2026-07-08T05:20:21Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 372, "verified_secrets": 0, "unverified_secrets": 2, "scan_duration": "164.649243ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":2,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":211}}
+2026-07-08T06:40:06Z	info-2	trufflehog	starting scanner workers	{"count": 4}
+2026-07-08T06:40:06Z	info-2	trufflehog	starting detector workers	{"count": 32}
+2026-07-08T06:40:06Z	info-2	trufflehog	starting verificationOverlap workers	{"count": 4}
+2026-07-08T06:40:06Z	info-2	trufflehog	starting notifier workers	{"count": 4}
+2026-07-08T06:40:06Z	info-0	trufflehog	running source	{"source_manager_worker_id": "6Cswo", "with_units": true}
+2026-07-08T06:40:06Z	info-2	trufflehog	enumerating source	{"source_manager_worker_id": "6Cswo"}
+2026-07-08T06:40:06Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 372, "verified_secrets": 0, "unverified_secrets": 2, "scan_duration": "159.845726ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":2,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":249}}
 ```
 
-**Stability note.** Run three times; the four counts were identical every run:
-**scanner=4, detector=32, verificationOverlap=4, notifier=4** — i.e. **4 / 32 / 4 / 4**.
+**Run 2 — stdout:**
+
+```
+Found unverified result 🐷🔑❓
+Detector Type: SentryToken
+Decoder Type: PLAIN
+Raw result: 27ac84f4bcdb4fca9701f4d6f6f58cd7d96b69c9d9754d40800645a51d668f90
+File: pkg/engine/testdata/secrets.txt
+Line: 3
+
+Found unverified result 🐷🔑❓
+Detector Type: AWS
+Decoder Type: PLAIN
+Raw result: AKIAWARWQKZNHMZBLY4I
+Resource_type: Access key
+Account: 413504919130
+File: pkg/engine/testdata/secrets.txt
+Line: 1
+```
+
+**Run 2 — stderr:**
+
+```
+2026-07-08T06:40:10Z	info-2	trufflehog	trufflehog dev
+🐷🔑🐷  TruffleHog. Unearth your secrets. 🐷🔑🐷
+
+2026-07-08T06:40:10Z	info-2	trufflehog	starting scanner workers	{"count": 4}
+2026-07-08T06:40:10Z	info-2	trufflehog	starting detector workers	{"count": 32}
+2026-07-08T06:40:10Z	info-2	trufflehog	starting verificationOverlap workers	{"count": 4}
+2026-07-08T06:40:10Z	info-2	trufflehog	starting notifier workers	{"count": 4}
+2026-07-08T06:40:10Z	info-0	trufflehog	running source	{"source_manager_worker_id": "s58Xg", "with_units": true}
+2026-07-08T06:40:10Z	info-2	trufflehog	enumerating source	{"source_manager_worker_id": "s58Xg"}
+2026-07-08T06:40:10Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 372, "verified_secrets": 0, "unverified_secrets": 2, "scan_duration": "158.114691ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":2,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":226}}
+```
+
+**Run 3 — stdout:**
+
+```
+Found unverified result 🐷🔑❓
+Detector Type: SentryToken
+Decoder Type: PLAIN
+Raw result: 27ac84f4bcdb4fca9701f4d6f6f58cd7d96b69c9d9754d40800645a51d668f90
+File: pkg/engine/testdata/secrets.txt
+Line: 3
+
+Found unverified result 🐷🔑❓
+Detector Type: AWS
+Decoder Type: PLAIN
+Raw result: AKIAWARWQKZNHMZBLY4I
+Resource_type: Access key
+Account: 413504919130
+File: pkg/engine/testdata/secrets.txt
+Line: 1
+```
+
+**Run 3 — stderr:**
+
+```
+2026-07-08T06:40:14Z	info-2	trufflehog	trufflehog dev
+🐷🔑🐷  TruffleHog. Unearth your secrets. 🐷🔑🐷
+
+2026-07-08T06:40:14Z	info-2	trufflehog	starting scanner workers	{"count": 4}
+2026-07-08T06:40:14Z	info-2	trufflehog	starting detector workers	{"count": 32}
+2026-07-08T06:40:14Z	info-2	trufflehog	starting verificationOverlap workers	{"count": 4}
+2026-07-08T06:40:14Z	info-2	trufflehog	starting notifier workers	{"count": 4}
+2026-07-08T06:40:14Z	info-0	trufflehog	running source	{"source_manager_worker_id": "34xCZ", "with_units": true}
+2026-07-08T06:40:14Z	info-2	trufflehog	enumerating source	{"source_manager_worker_id": "34xCZ"}
+2026-07-08T06:40:15Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 372, "verified_secrets": 0, "unverified_secrets": 2, "scan_duration": "138.916497ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":2,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":205}}
+```
+
+**Stability.** Across all three separate processes the four worker counts were
+**identical** — **scanner=4, detector=32, verificationOverlap=4, notifier=4**
+(i.e. **4 / 32 / 4 / 4**); only the timestamps, `source_manager_worker_id`,
+`scan_duration`, and `VerificationTimeSpentMS` (249 / 226 / 205 ms) varied. The two
+findings on stdout were byte-identical across the runs (modulo concurrent emission
+order). Extracting just the counts from each run's stderr:
+
+```
+$ for r in 1 2 3; do echo "run $r:"; grep -oE "starting (scanner|detector|verificationOverlap|notifier) workers.*count.: [0-9]+" q4/run$r.err \
+    | sed -E "s/.*starting (\w+) workers.*: ([0-9]+)/  \1=\2/"; done
+run 1:
+  scanner=4
+  detector=32
+  verificationOverlap=4
+  notifier=4
+run 2:
+  scanner=4
+  detector=32
+  verificationOverlap=4
+  notifier=4
+run 3:
+  scanner=4
+  detector=32
+  verificationOverlap=4
+  notifier=4
+```
 
 **Cause → effect (with `file:line`).** `Config.Concurrency`
 (`pkg/engine/engine.go:100`; the comment at `engine.go:98-99` states it "also
@@ -506,10 +861,13 @@ observable backpressure. Concretely: scanner workers feed
 cannot keep up (e.g., slow remote verification), the buffer fills and scanner
 sends block until a detector worker drains an item. The same bounded-buffer
 mechanism throttles `verificationOverlapChunksChan` (capacity `128 × 25 = 3200`)
-and `results` (capacity `128 × 50 = 6400`). This is exactly the effect that made
-Q3's default-concurrency run take ~16 s: 100 chunks fanned out to 1024 detector
-workers all performing real remote verification concurrently, rate-limited only by
-the bounded channels and the network.
+and `results` (capacity `128 × 50 = 6400`). Because a send on a full Go channel
+blocks until a receiver drains an item, the pipeline's throughput is gated by its
+slowest stage: when the detector workers are all busy with real remote
+verification, the scanner's sends into `detectableChunksChan` stall until a
+detector frees a slot. (Backpressure here is reasoned from the channel sizing in
+source, `engine.go:503-519`/`engine.go:627`, together with Go's blocking-send
+semantics; it is not a numeric value printed by the CLI.)
 
 **Explicit answer.**
 - **What multipliers?** scanner = `concurrency` (no multiplier); **detector ×8**
@@ -531,20 +889,27 @@ the bounded channels and the network.
 (b) does it prevent duplicates across decoder types — i.e. is the same credential
 seen as plaintext **and** base64 reported **once or twice**?
 
-**Setup (crafted input, outside the tree).** The **same** Sentry credential,
-once in plaintext and once base64-encoded, in one file:
+**Setup (crafted inputs, outside the tree).** The **same** Sentry credential in
+three files — combined (plaintext + base64 in one file), plaintext-only, and
+base64-only:
 
 ```
 mkdir -p /tmp/th_obs/q5
 SECRET=' sentry 27ac84f4bcdb4fca9701f4d6f6f58cd7d96b69c9d9754d40800645a51d668f90'
+# combined: plaintext line + base64-blob line (one file)
 { printf '%s\n' "$SECRET"; printf 'blob: %s\n' "$(printf '%s' "$SECRET" | base64 -w0)"; } > /tmp/th_obs/q5/dup.txt
+# controls
+printf '%s\n' "$SECRET" > /tmp/th_obs/q5/plain.txt
+printf 'blob: %s\n' "$(printf '%s' "$SECRET" | base64 -w0)" > /tmp/th_obs/q5/b64.txt
 ```
 
 ```
-$ cat /tmp/th_obs/q5/dup.txt
- sentry 27ac84f4bcdb4fca9701f4d6f6f58cd7d96b69c9d9754d40800645a51d668f90
-blob: IHNlbnRyeSAyN2FjODRmNGJjZGI0ZmNhOTcwMWY0ZDZmNmY1OGNkN2Q5NmI2OWM5ZDk3NTRkNDA4MDA2NDVhNTFkNjY4Zjkw
+$ cat -n /tmp/th_obs/q5/dup.txt
+     1	 sentry 27ac84f4bcdb4fca9701f4d6f6f58cd7d96b69c9d9754d40800645a51d668f90
+     2	blob: IHNlbnRyeSAyN2FjODRmNGJjZGI0ZmNhOTcwMWY0ZDZmNmY1OGNkN2Q5NmI2OWM5ZDk3NTRkNDA4MDA2NDVhNTFkNjY4Zjkw
 ```
+
+### Combined file — reported ONCE (the primary question)
 
 **Command.**
 
@@ -552,29 +917,88 @@ blob: IHNlbnRyeSAyN2FjODRmNGJjZGI0ZmNhOTcwMWY0ZDZmNmY1OGNkN2Q5NmI2OWM5ZDk3NTRkND
 CGO_ENABLED=0 go run . filesystem /tmp/th_obs/q5/dup.txt --json --no-update
 ```
 
-**Complete, unedited output — stdout (exactly ONE finding):**
+Which decoder's sighting reaches the notifier first is a race, so the *winning*
+`DecoderName` varies run to run; both outcomes are shown below, and **each is
+exactly one finding**.
+
+**Representative run — PLAIN wins. Complete stdout (one finding):**
+
+```
+{"SourceMetadata":{"Data":{"Filesystem":{"file":"/tmp/th_obs/q5/dup.txt","line":1}}},"SourceID":1,"SourceType":15,"SourceName":"trufflehog - filesystem","DetectorType":87,"DetectorName":"SentryToken","DetectorDescription":"Sentry is an error tracking service that helps developers monitor and fix crashes in real time. Sentry tokens can be used to access and manage projects and organizations within Sentry.","DecoderName":"PLAIN","Verified":false,"VerificationFromCache":false,"Raw":"27ac84f4bcdb4fca9701f4d6f6f58cd7d96b69c9d9754d40800645a51d668f90","RawV2":"","Redacted":"","ExtraData":null,"StructuredData":null}
+```
+
+stderr:
+
+```
+{"level":"info-0","ts":"2026-07-08T06:48:21Z","logger":"trufflehog","msg":"running source","source_manager_worker_id":"rCPkB","with_units":true}
+{"level":"info-0","ts":"2026-07-08T06:48:21Z","logger":"trufflehog","msg":"finished scanning","chunks":1,"bytes":152,"verified_secrets":0,"unverified_secrets":1,"scan_duration":"75.100122ms","trufflehog_version":"dev","verification_caching":{"Hits":0,"Misses":2,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":123}}
+```
+
+**Representative run — BASE64 wins. Complete stdout (one finding):**
 
 ```
 {"SourceMetadata":{"Data":{"Filesystem":{"file":"/tmp/th_obs/q5/dup.txt","line":1}}},"SourceID":1,"SourceType":15,"SourceName":"trufflehog - filesystem","DetectorType":87,"DetectorName":"SentryToken","DetectorDescription":"Sentry is an error tracking service that helps developers monitor and fix crashes in real time. Sentry tokens can be used to access and manage projects and organizations within Sentry.","DecoderName":"BASE64","Verified":false,"VerificationFromCache":false,"Raw":"27ac84f4bcdb4fca9701f4d6f6f58cd7d96b69c9d9754d40800645a51d668f90","RawV2":"","Redacted":"","ExtraData":null,"StructuredData":null}
 ```
 
-**Complete, unedited output — stderr:**
+stderr:
 
 ```
-{"level":"info-0","ts":"2026-07-08T05:21:01Z","logger":"trufflehog","msg":"running source","source_manager_worker_id":"sn3fw","with_units":true}
-{"level":"info-0","ts":"2026-07-08T05:21:01Z","logger":"trufflehog","msg":"finished scanning","chunks":1,"bytes":152,"verified_secrets":0,"unverified_secrets":1,"scan_duration":"82.632645ms","trufflehog_version":"dev","verification_caching":{"Hits":0,"Misses":2,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":138}}
+{"level":"info-0","ts":"2026-07-08T06:48:26Z","logger":"trufflehog","msg":"running source","source_manager_worker_id":"m3UFc","with_units":true}
+{"level":"info-0","ts":"2026-07-08T06:48:26Z","logger":"trufflehog","msg":"finished scanning","chunks":1,"bytes":152,"verified_secrets":0,"unverified_secrets":1,"scan_duration":"70.16019ms","trufflehog_version":"dev","verification_caching":{"Hits":0,"Misses":2,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":117}}
 ```
 
-**Stability note (and why it *strengthens* the answer).** Run five times, the scan
-produced **exactly one** finding every time (the dedup-to-one is deterministic).
-The *winning* `DecoderName` varied — `PLAIN` on run 1, `BASE64` on runs 2–5 —
-because which sighting reaches the notifier first is a race across the concurrent
-pipeline. As a control, each form is individually detectable: scanning only the
-plaintext line yields `DecoderName=PLAIN`, and scanning only the base64 blob yields
-`DecoderName=BASE64`. So both sightings genuinely exist; the combined file still
-reports one. That the *loser* can be either decoder proves the dedup key does not
-distinguish decoders — if `DecoderType` were part of the key, both would always be
-reported (two findings), regardless of the race.
+Both stderr snapshots show `unverified_secrets:1` (one credential **reported**)
+while `verification_caching` shows `Misses:2` — i.e. **both** the plaintext and the
+base64 sighting traversed the pipeline (two verification-cache lookups), yet the
+notifier collapsed them to a single report.
+
+**Distribution across 25 separate runs (magnitude/stability).** The finding count is
+invariant (always `1`) while the winning decoder splits between the two — which is
+only possible if the dedup key does **not** distinguish decoders:
+
+```
+$ findings=(); plain=0; base64=0; for r in $(seq 1 25); do
+    out=$(CGO_ENABLED=0 go run . filesystem /tmp/th_obs/q5/dup.txt --json --no-update 2>/dev/null)
+    n=$(printf "%s\n" "$out" | grep -c "\"DetectorName\"")
+    dec=$(printf "%s\n" "$out" | grep -o "\"DecoderName\":\"[A-Z0-9]*\"")
+    findings+=("$n"); case "$dec" in *PLAIN*) plain=$((plain+1));; *BASE64*) base64=$((base64+1));; esac
+  done
+  echo "distinct finding-counts: $(printf "%s\n" "${findings[@]}" | sort -u | tr "\n" " ")"
+  echo "winner tally over 25 runs: PLAIN=$plain BASE64=$base64"
+distinct finding-counts: 1 
+winner tally over 25 runs: PLAIN=11 BASE64=14
+```
+
+### Controls — each form is individually detectable
+
+To show both sightings genuinely exist (so the combined "once" is real
+deduplication, not a missed detection), scan each form alone.
+
+**Plaintext-only** — `CGO_ENABLED=0 go run . filesystem /tmp/th_obs/q5/plain.txt --json --no-update`
+
+```
+{"SourceMetadata":{"Data":{"Filesystem":{"file":"/tmp/th_obs/q5/plain.txt","line":1}}},"SourceID":1,"SourceType":15,"SourceName":"trufflehog - filesystem","DetectorType":87,"DetectorName":"SentryToken","DetectorDescription":"Sentry is an error tracking service that helps developers monitor and fix crashes in real time. Sentry tokens can be used to access and manage projects and organizations within Sentry.","DecoderName":"PLAIN","Verified":false,"VerificationFromCache":false,"Raw":"27ac84f4bcdb4fca9701f4d6f6f58cd7d96b69c9d9754d40800645a51d668f90","RawV2":"","Redacted":"","ExtraData":null,"StructuredData":null}
+```
+
+```
+{"level":"info-0","ts":"2026-07-08T06:48:31Z","logger":"trufflehog","msg":"running source","source_manager_worker_id":"LMGjU","with_units":true}
+{"level":"info-0","ts":"2026-07-08T06:48:31Z","logger":"trufflehog","msg":"finished scanning","chunks":1,"bytes":73,"verified_secrets":0,"unverified_secrets":1,"scan_duration":"64.945227ms","trufflehog_version":"dev","verification_caching":{"Hits":0,"Misses":1,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":59}}
+```
+
+**Base64-only** — `CGO_ENABLED=0 go run . filesystem /tmp/th_obs/q5/b64.txt --json --no-update`
+
+```
+{"SourceMetadata":{"Data":{"Filesystem":{"file":"/tmp/th_obs/q5/b64.txt","line":1}}},"SourceID":1,"SourceType":15,"SourceName":"trufflehog - filesystem","DetectorType":87,"DetectorName":"SentryToken","DetectorDescription":"Sentry is an error tracking service that helps developers monitor and fix crashes in real time. Sentry tokens can be used to access and manage projects and organizations within Sentry.","DecoderName":"BASE64","Verified":false,"VerificationFromCache":false,"Raw":"27ac84f4bcdb4fca9701f4d6f6f58cd7d96b69c9d9754d40800645a51d668f90","RawV2":"","Redacted":"","ExtraData":null,"StructuredData":null}
+```
+
+```
+{"level":"info-0","ts":"2026-07-08T06:48:35Z","logger":"trufflehog","msg":"running source","source_manager_worker_id":"1e5Ij","with_units":true}
+{"level":"info-0","ts":"2026-07-08T06:48:35Z","logger":"trufflehog","msg":"finished scanning","chunks":1,"bytes":79,"verified_secrets":0,"unverified_secrets":1,"scan_duration":"82.293898ms","trufflehog_version":"dev","verification_caching":{"Hits":0,"Misses":1,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":59}}
+```
+
+Plaintext-only reports `DecoderName:"PLAIN"` and base64-only reports
+`DecoderName:"BASE64"` — one finding each — so the combined file's single report is
+genuine cross-decoder deduplication, not a missed sighting.
 
 **Cause → effect — primary (notifier LRU).** `notifierWorker`
 (`pkg/engine/engine.go:1189`) builds the dedup key at `engine.go:1216`:
@@ -603,25 +1027,74 @@ does not guarantee, which decoder wins, because the intervening detector/notifie
 stages run concurrently — hence the observed PLAIN/BASE64 variation.)
 
 **Cause → effect — secondary (in-chunk cross-detector overlap).** A *distinct*
-dedup exists for the case where the **same secret is found by multiple different
-detectors within one chunk**. `verificationOverlapWorker` (`engine.go:924`) keys
+dedup exists for when the **same secret is found by multiple different detectors
+within one chunk**. `verificationOverlapWorker` (`pkg/engine/engine.go:924`) keys
 secrets with `type chunkSecretKey struct { secret string; detectorKey ahocorasick.DetectorKey }`
-(`engine.go:882-885`) and calls
-`func likelyDuplicate(ctx, val chunkSecretKey, dupes …) bool` (`engine.go:887`)
-with `const similarityThreshold = 0.9` (`engine.go:888`). It **skips comparisons
-between the same detector type** (`val.detectorKey.Type() == dupeKey.detectorKey.Type()` → `continue`,
-`engine.go:900-902`), logs `"found exact duplicate"` at V(2) on an exact string
-match (`engine.go:905-907`), and otherwise computes Levenshtein similarity
-`strutil.Similarity(valStr, dupe, metrics.NewLevenshtein())` (`engine.go:911`;
-`github.com/adrg/strutil v0.3.1`, `go.mod:19`), logging `"found similar duplicate"`
-at V(2) when `similarity > 0.9` (`engine.go:914-918`). **Runtime note:** scanning
-`pkg/engine/testdata/verificationoverlap_secrets.txt` (a single Postman key) at
-`--log-level=5` starts the verificationOverlap workers —
-`starting verificationOverlap workers {"count": 128}` — but does **not** emit the
-`found exact/similar duplicate` lines, because only **one** detector matches that
-input, so there is no cross-detector overlap to collapse. The overlap path is
-therefore documented from its verified source citations above; it is a separate
-mechanism from the notifier LRU that answers this question.
+(`pkg/engine/engine.go:882-885`) and calls
+`func likelyDuplicate(ctx, val chunkSecretKey, dupes ...) bool`
+(`pkg/engine/engine.go:887`) with `const similarityThreshold = 0.9`
+(`pkg/engine/engine.go:888`). It **skips comparisons between the same detector
+type** (`val.detectorKey.Type() == dupeKey.detectorKey.Type()` → `continue`,
+`pkg/engine/engine.go:900-902`), logs `"found exact duplicate"` at V(2) on an exact
+string match (`pkg/engine/engine.go:905-907`), and otherwise computes Levenshtein
+similarity `strutil.Similarity(valStr, dupe, metrics.NewLevenshtein())`
+(`pkg/engine/engine.go:911`; `github.com/adrg/strutil v0.3.1`, `go.mod:19`), logging
+`"found similar duplicate"` at V(2) when `similarity > 0.9`
+(`pkg/engine/engine.go:914-918`).
+
+**Runtime evidence (workers start; collapse branch not reached with one detector).**
+The repo's `pkg/engine/testdata/verificationoverlap_secrets.txt` holds a single
+Postman key, so only **one** detector matches it — there is no cross-detector
+overlap to collapse. Run at V(2), the level where both the worker-startup lines and
+the `found exact/similar duplicate` lines are emitted:
+
+```
+CGO_ENABLED=0 go run . filesystem pkg/engine/testdata/verificationoverlap_secrets.txt --concurrency=4 --log-level=2 --no-update
+```
+
+Complete stdout (the single Postman finding):
+
+```
+Found unverified result 🐷🔑❓
+Detector Type: Postman
+Decoder Type: PLAIN
+Raw result: PMAK-qnwfsLyRSyfCwfpHaQP1UzDhrgpWvHjbYzjpRCMshjt417zWcrzyHUArs7r
+File: pkg/engine/testdata/verificationoverlap_secrets.txt
+Line: 2
+```
+
+Complete stderr — the verificationOverlap workers **do** start (`count: 4`) but
+**no** `found exact/similar duplicate` line appears, because a lone detector cannot
+overlap with itself (the same-type comparison is skipped at
+`pkg/engine/engine.go:900-902`):
+
+```
+2026-07-08T06:51:41Z	info-2	trufflehog	trufflehog dev
+🐷🔑🐷  TruffleHog. Unearth your secrets. 🐷🔑🐷
+
+2026-07-08T06:51:41Z	info-2	trufflehog	starting scanner workers	{"count": 4}
+2026-07-08T06:51:41Z	info-2	trufflehog	starting detector workers	{"count": 32}
+2026-07-08T06:51:41Z	info-2	trufflehog	starting verificationOverlap workers	{"count": 4}
+2026-07-08T06:51:41Z	info-2	trufflehog	starting notifier workers	{"count": 4}
+2026-07-08T06:51:41Z	info-0	trufflehog	running source	{"source_manager_worker_id": "PRlQx", "with_units": true}
+2026-07-08T06:51:41Z	info-2	trufflehog	enumerating source	{"source_manager_worker_id": "PRlQx"}
+2026-07-08T06:51:41Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 84, "verified_secrets": 0, "unverified_secrets": 1, "scan_duration": "178.398072ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":1,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":176}}
+```
+
+Confirming the absence programmatically:
+
+```
+$ grep -c "found exact duplicate\|found similar duplicate" overlap2.err
+0
+```
+
+So the overlap-collapse branch is verified from source (above) and its worker pool
+is observed starting at runtime; *triggering the collapse itself* requires an input
+where two **different** detectors extract the same/similar secret from one chunk
+(the source's own example: a Postman key `PMAK-…` and a generic "api key" detector
+over the identical inner value), which the default detector set does not produce for
+this test input. This secondary mechanism is separate from the notifier LRU that
+answers the headline question.
 
 **Explicit answer.**
 - **LRU key shape:** `fmt.Sprintf("%s%s%s%+v", result.DetectorType.String(),
@@ -650,24 +1123,46 @@ detectors or only **matched** ones, and (b) does verification time **factor in**
 CGO_ENABLED=0 go run . filesystem pkg/engine/testdata/secrets.txt --print-avg-detector-time --no-update
 ```
 
-**Complete, unedited output — stderr:**
+**Complete, unedited output — stdout (the two findings):**
+
+```
+Found unverified result 🐷🔑❓
+Detector Type: SentryToken
+Decoder Type: PLAIN
+Raw result: 27ac84f4bcdb4fca9701f4d6f6f58cd7d96b69c9d9754d40800645a51d668f90
+File: pkg/engine/testdata/secrets.txt
+Line: 3
+
+Found unverified result 🐷🔑❓
+Detector Type: AWS
+Decoder Type: PLAIN
+Raw result: AKIAWARWQKZNHMZBLY4I
+Resource_type: Access key
+Account: 413504919130
+File: pkg/engine/testdata/secrets.txt
+Line: 1
+```
+
+**Complete, unedited output — stderr (banner, `running source`, the
+`--print-avg-detector-time` dump, then the end-of-scan snapshot):**
 
 ```
 🐷🔑🐷  TruffleHog. Unearth your secrets. 🐷🔑🐷
 
-2026-07-08T05:23:16Z	info-0	trufflehog	running source	{"source_manager_worker_id": "TgUdn", "with_units": true}
+2026-07-08T06:58:14Z	info-0	trufflehog	running source	{"source_manager_worker_id": "eKwGw", "with_units": true}
 Average detector time is the measurement of average time spent on each detector when results are returned.
-AWS: 141.184681ms
-SentryToken: 59.005088ms
-2026-07-08T05:23:16Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 372, "verified_secrets": 0, "unverified_secrets": 2, "scan_duration": "149.687487ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":2,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":198}}
+AWS: 131.657724ms
+SentryToken: 68.146928ms
+2026-07-08T06:58:14Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 372, "verified_secrets": 0, "unverified_secrets": 2, "scan_duration": "137.091936ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":2,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":198}}
 ```
 
-Only the two detectors that **returned results** (`AWS`, `SentryToken`) are listed.
+Only the two detectors that **returned results** — `AWS` and `SentryToken` —
+appear in the dump.
 
 ### Condition B — a detector runs but returns NOTHING → ABSENT
 
-The crafted input contains detector **keywords** but **no valid credential**, so
-keyword matching selects detectors that then return zero results.
+The crafted input holds detector **keywords** but **no valid credential**, so
+keyword matching *selects* detectors that then return zero results:
 
 ```
 mkdir -p /tmp/th_obs/q6
@@ -675,47 +1170,172 @@ printf 'aws token key secret password sentry github gitlab\nno real credentials 
 CGO_ENABLED=0 go run . filesystem /tmp/th_obs/q6/nomatch.txt --print-avg-detector-time --no-update
 ```
 
-**Complete, unedited output — stderr:**
+**Complete, unedited output — stdout:** the captured stdout is **empty — zero
+findings** were printed (`wc -c` on the redirected stdout returns `0`).
+
+**Complete, unedited output — stderr (the dump header prints, but there are ZERO
+detector rows):**
 
 ```
 🐷🔑🐷  TruffleHog. Unearth your secrets. 🐷🔑🐷
 
-2026-07-08T05:23:20Z	info-0	trufflehog	running source	{"source_manager_worker_id": "jflhb", "with_units": true}
+2026-07-08T06:58:31Z	info-0	trufflehog	running source	{"source_manager_worker_id": "hpbAL", "with_units": true}
 Average detector time is the measurement of average time spent on each detector when results are returned.
-2026-07-08T05:23:20Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 90, "verified_secrets": 0, "unverified_secrets": 0, "scan_duration": "5.678797ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
+2026-07-08T06:58:31Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 90, "verified_secrets": 0, "unverified_secrets": 0, "scan_duration": "4.282458ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
 ```
 
-The header prints, but there are **zero detector rows**. This is not because no
-detector *ran*: a temporary keyword-match harness over the identical bytes
-confirms this input **selects 6 detectors** (`Github`, `SentryToken`,
-`GitHubOauth2`, `GitHubApp`, `Gitlab`, and one more) — they ran their `FromData`
-but each returned zero results, so none were recorded.
+**Proof the detectors DID run — naming every selected detector.** The missing rows
+are *not* because no detector executed. A temporary harness runs the real keyword
+matcher — `ahocorasick.NewAhoCorasickCore(defaults.DefaultDetectors())` then
+`core.FindDetectorMatches(...)` — over the **identical** bytes and prints the
+complete selected set. Harness source (`/tmp/th_obs/q6harness/main.go`; module
+`thq6`, whose `go.mod` carries
+`replace github.com/trufflesecurity/trufflehog/v3 => <repo root>` so it links the
+real detector registry):
+
+```go
+package main
+
+import (
+	"fmt"
+	"os"
+	"sort"
+
+	"github.com/trufflesecurity/trufflehog/v3/pkg/engine/ahocorasick"
+	"github.com/trufflesecurity/trufflehog/v3/pkg/engine/defaults"
+)
+
+func main() {
+	data, err := os.ReadFile(os.Args[1])
+	if err != nil {
+		panic(err)
+	}
+	core := ahocorasick.NewAhoCorasickCore(defaults.DefaultDetectors())
+	matches := core.FindDetectorMatches(data)
+	lines := make([]string, 0, len(matches))
+	for _, m := range matches {
+		lines = append(lines, fmt.Sprintf("%s\t(%T)", m.Detector.Type().String(), m.Detector))
+	}
+	sort.Strings(lines)
+	fmt.Printf("selected_detectors=%d\n", len(matches))
+	for _, l := range lines {
+		fmt.Println(l)
+	}
+}
+```
+
+Command and **complete, unedited** output:
+
+```
+$ cd /tmp/th_obs/q6harness && GOFLAGS=-mod=mod go run . /tmp/th_obs/q6/nomatch.txt
+selected_detectors=6
+GitHubApp	(*githubapp.Scanner)
+GitHubOauth2	(*github_oauth2.Scanner)
+Github	(*github.Scanner)
+Gitlab	(*gitlab.Scanner)
+SentryToken	(*sentrytoken.Scanner)
+SentryToken	(*sentrytoken.Scanner)
+```
+
+So **exactly six** detectors are selected: `GitHubApp`, `GitHubOauth2`, `Github`,
+`Gitlab`, and `SentryToken` **twice** (two registered `*sentrytoken.Scanner`
+versions share the `sentry` keyword — that pair is the "sixth"). All six ran
+`FromData` over the keyword-only text, all returned zero results, and therefore
+**none** was recorded by the `len(results) > 0` gate (`pkg/engine/engine.go:1092`)
+— which is exactly why the Condition B dump has no rows.
 
 ### Verification-time inclusion — canonical vs. a LABELED non-canonical contrast
 
-Canonical (verification ON) durations for Condition A, vs. a **non-canonical**
-`--no-verification` contrast (verification skipped), three runs each:
+To prove verification time is *inside* the measured per-detector duration, compare
+the canonical run (verification ON) against a **LABELED non-canonical**
+`--no-verification` run — two runs each. Only stderr is shown per run (the dump
+lives there); the stdout findings are identical to Condition A and, as the final
+block proves, still print under `--no-verification`.
+
+**Canonical (verification ON) — run 1.**
 
 ```
-# canonical (verification ON):
-run1: SentryToken: 59.772822ms AWS: 150.90068ms
-run2: SentryToken: 63.552334ms AWS: 171.80802ms
-run3: SentryToken: 54.472841ms AWS: 166.78287ms
-# LABELED NON-CANONICAL contrast (--no-verification):
-run1: SentryToken: 206.295µs AWS: 245.91µs
-run2: AWS: 235.196µs SentryToken: 265.79µs
-run3: AWS: 183.758µs SentryToken: 254.973µs
+$ CGO_ENABLED=0 go run . filesystem pkg/engine/testdata/secrets.txt --print-avg-detector-time --no-update
+🐷🔑🐷  TruffleHog. Unearth your secrets. 🐷🔑🐷
+
+2026-07-08T06:58:55Z	info-0	trufflehog	running source	{"source_manager_worker_id": "XFONq", "with_units": true}
+Average detector time is the measurement of average time spent on each detector when results are returned.
+AWS: 171.273541ms
+SentryToken: 66.352508ms
+2026-07-08T06:58:55Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 372, "verified_secrets": 0, "unverified_secrets": 2, "scan_duration": "176.515922ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":2,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":236}}
 ```
 
-With verification ON the AWS timing is ~150–172 **ms**; with `--no-verification`
-it collapses to ~184–246 **µs** — a ~1000× drop — because the reported duration
-includes the remote verification performed inside `FromData`.
+**Canonical (verification ON) — run 2** (identical command):
 
-**Stability note.** Across the runs above, the *scope* is stable — the listed set
-is always exactly the result-returning detectors (`{AWS, SentryToken}` in
-Condition A; empty in Condition B). Absolute durations vary run-to-run (as
-expected for wall-clock timing), and the ordering of the two rows varies (a race),
-but the gate/scope never changes.
+```
+$ CGO_ENABLED=0 go run . filesystem pkg/engine/testdata/secrets.txt --print-avg-detector-time --no-update
+🐷🔑🐷  TruffleHog. Unearth your secrets. 🐷🔑🐷
+
+2026-07-08T06:59:00Z	info-0	trufflehog	running source	{"source_manager_worker_id": "nodk7", "with_units": true}
+Average detector time is the measurement of average time spent on each detector when results are returned.
+SentryToken: 73.938748ms
+AWS: 153.588931ms
+2026-07-08T06:59:00Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 372, "verified_secrets": 0, "unverified_secrets": 2, "scan_duration": "158.59796ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":2,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":226}}
+```
+
+**LABELED NON-CANONICAL (`--no-verification`) — run 1.**
+
+```
+$ CGO_ENABLED=0 go run . filesystem pkg/engine/testdata/secrets.txt --print-avg-detector-time --no-verification --no-update
+🐷🔑🐷  TruffleHog. Unearth your secrets. 🐷🔑🐷
+
+2026-07-08T06:59:04Z	info-0	trufflehog	running source	{"source_manager_worker_id": "PsVaH", "with_units": true}
+Average detector time is the measurement of average time spent on each detector when results are returned.
+AWS: 244.4µs
+SentryToken: 316.509µs
+2026-07-08T06:59:04Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 372, "verified_secrets": 0, "unverified_secrets": 2, "scan_duration": "7.804152ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
+```
+
+**LABELED NON-CANONICAL (`--no-verification`) — run 2** (identical command):
+
+```
+$ CGO_ENABLED=0 go run . filesystem pkg/engine/testdata/secrets.txt --print-avg-detector-time --no-verification --no-update
+🐷🔑🐷  TruffleHog. Unearth your secrets. 🐷🔑🐷
+
+2026-07-08T06:59:09Z	info-0	trufflehog	running source	{"source_manager_worker_id": "CyZOI", "with_units": true}
+Average detector time is the measurement of average time spent on each detector when results are returned.
+AWS: 225.993µs
+SentryToken: 327.116µs
+2026-07-08T06:59:09Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 372, "verified_secrets": 0, "unverified_secrets": 2, "scan_duration": "6.133697ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
+```
+
+Findings still print under `--no-verification` (the stdout of the first
+non-canonical run), confirming the detectors still executed — only the remote
+verification step was skipped:
+
+```
+Found unverified result 🐷🔑❓
+Detector Type: AWS
+Decoder Type: PLAIN
+Raw result: AKIAWARWQKZNHMZBLY4I
+Account: 413504919130
+Resource_type: Access key
+File: pkg/engine/testdata/secrets.txt
+Line: 1
+
+Found unverified result 🐷🔑❓
+Detector Type: SentryToken
+Decoder Type: PLAIN
+Raw result: 27ac84f4bcdb4fca9701f4d6f6f58cd7d96b69c9d9754d40800645a51d668f90
+File: pkg/engine/testdata/secrets.txt
+Line: 3
+```
+
+**Interpretation.** With verification ON, the `AWS` duration is **131–171 ms** and
+the end-of-scan snapshot reports `VerificationTimeSpentMS` of **198–236**; with
+`--no-verification` the same detector collapses to **~226–244 µs** with
+`VerificationTimeSpentMS:0` — roughly a **700×** drop. The per-detector time
+therefore **includes** the remote verification performed inside `FromData`.
+
+**Stability note.** Across every run above the *scope* is invariant: the listed set
+is always exactly the result-returning detectors (`{AWS, SentryToken}` in Condition
+A; empty in Condition B). Absolute durations vary run-to-run (wall-clock) and the
+order of the two rows varies (a race), but the gate/scope never changes.
 
 **Cause → effect (with `file:line`).** In `detectChunk`
 (`pkg/engine/engine.go:1044`), the timer is started **only** under the flag:
@@ -745,7 +1365,7 @@ when results are returned.") followed by one `"%s: %s\n"` row per detector
 - **Included or separate?** **INCLUDED** — verification time is part of the
   measured duration: the timer starts at `engine.go:1046-1048`, *before*
   `verificationCache.FromData` (`engine.go:1070-1075`), which performs remote
-  verification. The ~1000× ms-vs-µs contrast between the canonical and
+  verification. The ~700× ms-vs-µs contrast between the canonical and
   `--no-verification` runs confirms it empirically.
 
 ---
@@ -771,7 +1391,7 @@ output above:
     printed under `verification_caching` at `main.go:566-574`).
   - [x] **Persist vs not → NOT across invocations** (identical `Hits:0,Misses:2`
     on separate processes; `simple.NewCache`/`InMemoryMetrics{}` fresh per process,
-    `main.go:511`,`:536`); **within a process hits accrue** (`Hits:92` of 100).
+    `main.go:511`,`:536`); **within a process hits accrue** (`Hits:12` of 20).
 - **Q4 — worker architecture + backpressure.**
   - [x] **Multipliers named** — scanner=concurrency; detector ×8
     (`engine.go:345`); notification ×1 (`engine.go:349`); verificationOverlap ×1
@@ -791,7 +1411,7 @@ output above:
     `engine.go:1092`); matched detectors appear (Condition A), ran-but-empty
     detectors absent (Condition B).
   - [x] **Included vs separate → INCLUDED** (timer `engine.go:1046-1048` spans
-    `FromData` `engine.go:1070-1075`; ~1000× ms-vs-µs contrast).
+    `FromData` `engine.go:1070-1075`; ~700× ms-vs-µs contrast).
 
 **Provenance & read-only guarantee.** All output above was captured live inside
 the container at HEAD `e42153d44a5e5c37c1bd0c70e074781e9edcb760` under default
