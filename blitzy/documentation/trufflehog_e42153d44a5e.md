@@ -30,8 +30,11 @@ go version go1.24.2 linux/amd64
 $ git branch --show-current
 blitzy-56ea4ebb-8c10-4340-bef0-fb6f0b932f88
 
-$ git rev-parse HEAD
+$ git rev-parse origin/trufflehog_e42153d44a5e
 e42153d44a5e5c37c1bd0c70e074781e9edcb760
+
+$ git diff --name-status e42153d44a5e5c37c1bd0c70e074781e9edcb760..HEAD
+A	blitzy/documentation/trufflehog_e42153d44a5e.md
 
 $ CGO_ENABLED=0 go build .
 $ echo $?
@@ -41,12 +44,22 @@ $ ./trufflehog --version
 trufflehog dev
 ```
 
-> **Note on the working branch.** The checkout's *working* branch is
-> `blitzy-56ea4ebb-8c10-4340-bef0-fb6f0b932f88`, but HEAD is exactly
+> **Note on the working branch and commit provenance.** The checkout's *working*
+> branch is `blitzy-56ea4ebb-8c10-4340-bef0-fb6f0b932f88`. Every runtime
+> observation in this document was captured against the **canonical source commit**
 > `e42153d44a5e5c37c1bd0c70e074781e9edcb760` — the commit the source branch
-> `trufflehog_e42153d44a5e` names — so this document is named for that source
-> branch per the deliverable rule. The built `./trufflehog` binary is ignored by
-> `.gitignore:7`, so it does not alter the tracked tree.
+> `trufflehog_e42153d44a5e` names (`git rev-parse origin/trufflehog_e42153d44a5e`)
+> — so this document is named for that source branch per the deliverable rule.
+> This deliverable is a **documentation-only commit layered on top** of that
+> canonical source commit, so the working `HEAD` advances past `e42153d44a5e…` as
+> each revision of this file is committed; the exact deliverable commit hash is
+> therefore intentionally not pinned here. What *is* invariant is that the source
+> tree is byte-for-byte unchanged relative to the canonical commit — `git diff
+> --name-status e42153d44a5e5c37c1bd0c70e074781e9edcb760..HEAD` lists only
+> `A blitzy/documentation/trufflehog_e42153d44a5e.md` (zero source changes) — so
+> every `file:line` citation in this document resolves identically at the
+> canonical source commit and at HEAD. The built `./trufflehog` binary is ignored
+> by `.gitignore:7`, so it does not alter the tracked tree.
 
 > **Container CPU note (used throughout).** In this container Go reports
 > `runtime.NumCPU() = 128` and `GOMAXPROCS = 128` (the cgroup limits `nproc` to
@@ -1421,10 +1434,16 @@ output above:
     `FromData` `engine.go:1070-1075`; ~700× ms-vs-µs contrast).
 
 **Provenance & read-only guarantee.** All output above was captured live inside
-the container at HEAD `e42153d44a5e5c37c1bd0c70e074781e9edcb760` under default
-configuration (only the flags each question requires were varied). The one Go
-observation harness and all crafted scan inputs lived under `/tmp/th_obs`
-(outside the tracked tree) and were removed on completion; the built `./trufflehog`
-binary is `.gitignore`d. No existing repository file (`*.go`, tests, config,
-`go.mod`/`go.sum`, docs) was modified — the only added file is this document.
+the container against the **canonical source commit**
+`e42153d44a5e5c37c1bd0c70e074781e9edcb760` (= `origin/trufflehog_e42153d44a5e`)
+under default configuration (only the flags each question requires were varied).
+This deliverable is a documentation-only commit layered on top of that canonical
+source commit, so the working `HEAD` advances past `e42153d44a5e…` as the file is
+committed; `git diff --name-status e42153d44a5e5c37c1bd0c70e074781e9edcb760..HEAD`
+lists only `A blitzy/documentation/trufflehog_e42153d44a5e.md`, confirming the
+source tree is byte-for-byte unchanged and every citation resolves identically at
+HEAD. The one Go observation harness and all crafted scan inputs lived under
+`/tmp/th_obs` (outside the tracked tree) and were removed on completion; the built
+`./trufflehog` binary is `.gitignore`d. No existing repository file (`*.go`, tests,
+config, `go.mod`/`go.sum`, docs) was modified — the only added file is this document.
 
