@@ -256,7 +256,7 @@ sets the level:
 
 ```text
 main.go:307-308   case *debug:   log.SetLevel(2)
-main.go:310       default:      l := int8(*logLevel)
+main.go:309-310   default:      l := int8(*logLevel)
 main.go:311-314                 if l < -1 || l > 5 {
                                     fmt.Fprintf(os.Stderr, "invalid log level: %d\n", *logLevel)   // main.go:312
                                     os.Exit(1)                                                       // main.go:313
