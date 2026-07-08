@@ -1179,9 +1179,15 @@ Line: 1
 2026-07-08T06:01:23Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 110, "verified_secrets": 0, "unverified_secrets": 1, "scan_duration": "4.720031ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
 ```
 
-**Double URL-encoding (`%252F`, `%252B`) → missed** (the replacer only reverses one
-level; `%252F` becomes `%2F`, not `/`, so the 40-char secret pattern no longer
-matches):
+**Double URL-encoding (`%252F`, `%252B`) → missed** (`UrlEncodedReplacer` is a
+targeted token replacer, **not** a general URL-decoder — it rewrites only the literal
+tokens `%2B`/`%2F`/`%3D` and their lowercase forms, with no `%25`→`%` rule. The
+double-encoded token `%252F` contains none of those literals as a substring, so the
+replacer leaves it **unchanged** — it does *not* become `%2F` or `/`. The residual
+`%` characters fall outside the secret's `[A-Za-z0-9+/]` alphabet, so `SecretPat` can
+no longer match a 40-char run. Confirmed by replaying the exact `strings.NewReplacer`
+from `pkg/detectors/aws/utils.go:L33-L42`: `Replace("%252F")` returns `"%252F"`
+unchanged, whereas `Replace("%2F")` returns `"/"`):
 
 ```
 $ /tmp/trufflehog filesystem /tmp/thqa/fx/q5dblurl --no-verification --results=verified,unverified,unknown
