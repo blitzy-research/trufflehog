@@ -408,12 +408,19 @@ chunk (`grep = 0`) — it appeared only after `(*Base64).FromChunk`
 Sentry detector.
 
 Why AWS appears under **both** decoders (so its `DecoderName` races): the Base64
-decoder only decodes substrings of >=20 base64 characters
-(`getSubstringsOfCharacterSet(chunk.Data, 20, ...)` at `pkg/decoders/base64.go:36`)
-and keeps only those whose decoded bytes are ASCII (`isASCII(dec)` gate at
-`pkg/decoders/base64.go:41`). The long Sentry blob decodes to ASCII (`sentry ...`) and
-is substituted in; the 20-char AWS key `AKIAWARWQKZNHMZBLY4I` decodes to non-ASCII, so
-it is **not** substituted and remains intact in the Base64 decoder's output.
+decoder only *extracts* substrings of **more than 20** (i.e. >=21) consecutive base64
+characters — the extraction gate is `count > threshold` with `threshold = 20`
+(`pkg/decoders/base64.go:97`, `:103`, `:118`, `:125`), applied to the run counted from
+the `getSubstringsOfCharacterSet(chunk.Data, 20, ...)` call at `pkg/decoders/base64.go:36`
+— and, among the extracted substrings, *substitutes* only those whose decoded bytes are
+ASCII (`isASCII(dec)` gate at `pkg/decoders/base64.go:41`). The long Sentry blob is
+extracted and decodes to ASCII (`sentry ...`), so it is substituted in; the 40-char AWS
+secret `s6NbZeygUrUdM95K683Lb6IsILWXOJlJ8ZVd1Kw0` is extracted (40 > 20) but decodes to
+non-ASCII, so the `isASCII` gate rejects it and it is left intact. The 20-char AWS key
+`AKIAWARWQKZNHMZBLY4I` is a run of exactly 20 base64 characters, which does **not**
+exceed the `>20` threshold, so it is never extracted and passes through the Base64
+decoder unchanged (the operative gate for the key is the length threshold, not
+`isASCII`).
 Consequently the AWS key is keyword-matched under **both** the PLAIN pass and the
 BASE64 pass — hence the two `"link is empty"` AWS lines and `Misses:3` in Run C — and
 the notifier LRU dedupe (`pkg/engine/engine.go:1216`, key excludes `DecoderType`)
