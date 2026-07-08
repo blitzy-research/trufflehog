@@ -1,5 +1,9 @@
 # TruffleHog: Decoder Pipeline, Overlap Detection & Deduplication — Investigation
 
+## 1. The question (verbatim)
+
+> I was scanning a file containing both a raw AWS access key and the same key as Base64-encoded, and I got confused by the output. Sometimes TruffleHog reported the secret twice with different decoder types, sometimes it reported an overlap error, and sometime it deduplicated down to a single result. The behaviour seemed inconsistent depending on how I structured the test file. I want to understand how the decoder pipeline, overlap detection, and result deduplication interact at runtime to produce these varying outputs. Verify how TruffleHog's decoder pipeline handles the same secret in multiple encoded forms (plain text, base64, escaped unicode) by observing which decoder types are reported, whether overlap detection occurs, how deduplication affects the final result count, whether the deduplication happens before or after overlap detection, and why the same logical secret sometimes produces one result and sometimes produces multiple. Do not modify any existing source files in the repository, and remove any test data created during the investigation.
+
 > **Scope:** Read-only code investigation. This document is written from **directly observed
 > runtime behavior** of the real TruffleHog scanner built at HEAD
 > `e42153d44a5e5c37c1bd0c70e074781e9edcb760`. Every behavioral claim is accompanied by the exact
@@ -7,10 +11,6 @@
 > reference. Statements that are reasoned from code rather than directly observed are explicitly
 > labeled **(inferred)**. No source file in the repository was modified, and all test data was
 > created under `/tmp` and removed afterward.
-
-## 1. The question (verbatim)
-
-> I was scanning a file containing both a raw AWS access key and the same key as Base64-encoded, and I got confused by the output. Sometimes TruffleHog reported the secret twice with different decoder types, sometimes it reported an overlap error, and sometime it deduplicated down to a single result. The behaviour seemed inconsistent depending on how I structured the test file. I want to understand how the decoder pipeline, overlap detection, and result deduplication interact at runtime to produce these varying outputs. Verify how TruffleHog's decoder pipeline handles the same secret in multiple encoded forms (plain text, base64, escaped unicode) by observing which decoder types are reported, whether overlap detection occurs, how deduplication affects the final result count, whether the deduplication happens before or after overlap detection, and why the same logical secret sometimes produces one result and sometimes produces multiple. Do not modify any existing source files in the repository, and remove any test data created during the investigation.
 
 ---
 
@@ -54,25 +54,32 @@
 ## 3. Environment & canonical build
 
 All commands were run from the repository root on branch `blitzy-6ac3c654-b850-4924-a477-bb99d15f8803`.
+The investigation builds the **pinned TruffleHog source HEAD** `e42153d44a5e5c37c1bd0c70e074781e9edcb760`.
+That commit is an ancestor of the working branch — the only change layered on top of it is this
+documentation file — and **no tracked source file differs from it**:
 
 ```console
-$ git rev-parse HEAD
-e42153d44a5e5c37c1bd0c70e074781e9edcb760
+$ git merge-base --is-ancestor e42153d44a5e5c37c1bd0c70e074781e9edcb760 HEAD ; echo "ancestor_exit=$?"
+ancestor_exit=0
 
-$ git status --porcelain
-            # (empty — clean working tree)
+$ git diff --stat e42153d44a5e5c37c1bd0c70e074781e9edcb760 -- ':(exclude)blitzy/'
+```
 
+The empty `git diff --stat` output above (nothing printed between the command and the next prompt)
+means zero tracked source files differ from the pinned HEAD. The Go toolchain in use:
+
+```console
 $ go version
 go version go1.24.2 linux/amd64
 ```
 
-`go 1.24.2` is the canonical toolchain declared by the module (`toolchain go1.24.2`, satisfying
-`go 1.23.1`) [`go.mod:1-4`], so this is a **canonical, default-configuration** build (no fallback,
-no deviation).
+`go 1.24.2` is the canonical toolchain declared by the module (`toolchain go1.24.2` [`go.mod:5`],
+satisfying the module's `go 1.23.1` directive [`go.mod:3`]), so this is a **canonical,
+default-configuration** build (no fallback, no deviation).
 
 ```console
-$ CGO_ENABLED=0 go build -o /tmp/trufflehog .
-            # exit 0
+$ CGO_ENABLED=0 go build -o /tmp/trufflehog . ; echo "build_exit=$?"
+build_exit=0
 
 $ /tmp/trufflehog --version
 trufflehog dev
@@ -84,7 +91,7 @@ The runtime scan log confirms the same build identity (`"trufflehog_version":"de
 $ /tmp/trufflehog filesystem /tmp/th_investigation/caseD.txt \
       --results=verified,unknown,unverified --no-verification --no-update --json 2>&1 >/dev/null \
       | grep '"msg":"finished scanning"'
-{"level":"info-0","ts":"2026-07-08T05:02:27Z","logger":"trufflehog","msg":"finished scanning","chunks":1,"bytes":124,"verified_secrets":0,"unverified_secrets":2,"scan_duration":"4.857118ms","trufflehog_version":"dev","verification_caching":{"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
+{"level":"info-0","ts":"2026-07-08T06:00:53Z","logger":"trufflehog","msg":"finished scanning","chunks":1,"bytes":124,"verified_secrets":0,"unverified_secrets":2,"scan_duration":"5.33148ms","trufflehog_version":"dev","verification_caching":{"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
 ```
 
 ### 3.1 The test key (a public canary / example pair)
@@ -158,7 +165,7 @@ flowchart TD
     D --> E{"len(matchingDetectors) > 1<br/>&& !e.verificationOverlap ?<br/>engine.go:796 — OVERLAP GATE"}
     E -->|"yes (2+ different detectors)"| F["verificationOverlapChunksChan →<br/>verificationOverlapWorker (engine.go:924-1034)<br/>likelyDuplicate sim>0.9 (engine.go:887-922)<br/>→ SetVerificationError(errOverlap) (engine.go:988)"]
     E -->|"no (single detector)"| G["detectableChunksChan → detectorWorker"]
-    F --> H["processResult (engine.go:1152-1187)<br/>SetResultLineNumber (:1166)<br/>secret.DecoderType = data.decoder (:1178)"]
+    F --> H["processResult (engine.go:1152-1187)<br/>SetResultLineNumber called :1166 (defined :1321-1324)<br/>first occurrence: FragmentLineOffset bytes.Cut :1256-1261<br/>secret.DecoderType = data.decoder (:1178)"]
     G --> H
     H --> I["e.results channel"]
     I --> J{"notifierWorker LRU dedupe (engine.go:1189-1235)<br/>key = DetectorType + Raw + RawV2 + SourceMetadata (:1216)<br/>value = DecoderType (:1221)<br/>[key EXCLUDES decoder type, INCLUDES SourceMetadata/line]"}
@@ -188,16 +195,42 @@ each (stable), and the racy Case A was run 100× (plus 20× at `--concurrency=1`
 
 | Case | File structure | Total results | Observed decoder type(s) & line(s) |
 |------|----------------|---------------|------------------------------------|
-| A | plaintext L1 + base64(same) L2 | **always 1** | **RACE**: `BASE64` *or* `PLAIN` @ line 1 (100 runs → 80 `BASE64` / 20 `PLAIN`) |
+| A | plaintext L1 + base64(same) L2 | **always 1** | **RACE**: `BASE64` *or* `PLAIN` @ line 1 (this run set, 100 runs → 84 `BASE64` / 16 `PLAIN`) |
 | B | base64 only | 1 | `BASE64` @ line 1 (stable 3/3) |
 | C | plaintext only | 1 | `PLAIN` @ line 1 (stable 3/3) |
 | D | base64 L1 + plaintext L2 | 2 | `BASE64` @ line 1 **and** `PLAIN` @ line 2 (stable 3/3) |
 | E | escaped-unicode of pair | 1 | `ESCAPED_UNICODE` @ line 1 (stable 3/3) |
 
-The stability sweep (result count + surviving decoder(s) + line(s) per run):
+The stability sweep uses the script below, which runs each single-structure case 3× with the
+canonical command from §3.2 and parses each run's JSON for the result count, the surviving decoder
+type(s), and the line number(s):
 
 ```console
-$ run_case B/C/D/E (3× each, canonical command)
+$ cat /tmp/th_investigation/sweep.sh
+#!/usr/bin/env bash
+# Runs each single-structure case 3x and reports, per run:
+#   result count, surviving decoder types, and line numbers (parsed from JSON).
+TH=/tmp/trufflehog
+WORK=/tmp/th_investigation
+CMD="--results=verified,unknown,unverified --no-verification --no-update --json"
+run_case() {
+  local file="$1" label="$2"
+  echo "===== CASE $label ($(basename "$file")) — 3 runs ====="
+  for i in 1 2 3; do
+    out=$("$TH" filesystem "$file" $CMD 2>/dev/null)
+    n=$(printf '%s\n' "$out" | grep -c '"DecoderName"')
+    decs=$(printf '%s\n' "$out" | grep -o '"DecoderName":"[^"]*"' | sed 's/.*:"//;s/"$//' | paste -sd, -)
+    lines=$(printf '%s\n' "$out" | grep -o '"line":[0-9]*' | sed 's/.*://' | paste -sd, -)
+    echo "run $i: results=$n decoders=[$decs] lines=[$lines]"
+  done
+  echo
+}
+run_case "$WORK/caseB.txt" B
+run_case "$WORK/caseC.txt" C
+run_case "$WORK/caseD.txt" D
+run_case "$WORK/caseE.txt" E
+
+$ bash /tmp/th_investigation/sweep.sh
 ===== CASE B (caseB.txt) — 3 runs =====
 run 1: results=1 decoders=[BASE64] lines=[1]
 run 2: results=1 decoders=[BASE64] lines=[1]
@@ -209,8 +242,8 @@ run 2: results=1 decoders=[PLAIN] lines=[1]
 run 3: results=1 decoders=[PLAIN] lines=[1]
 
 ===== CASE D (caseD.txt) — 3 runs =====
-run 1: results=2 decoders=[PLAIN,BASE64] lines=[2,1]
-run 2: results=2 decoders=[BASE64,PLAIN] lines=[1,2]
+run 1: results=2 decoders=[BASE64,PLAIN] lines=[1,2]
+run 2: results=2 decoders=[PLAIN,BASE64] lines=[2,1]
 run 3: results=2 decoders=[BASE64,PLAIN] lines=[1,2]
 
 ===== CASE E (caseE.txt) — 3 runs =====
@@ -291,27 +324,52 @@ $ /tmp/trufflehog filesystem /tmp/th_investigation/caseE.txt --results=verified,
 ### 5.5 Case A — plaintext L1 + base64 L2 → always 1 result, **surviving decoder type is a race**
 
 This is the crux of the user's confusion. The result **count** is always 1, but **which decoder type
-survives is non-deterministic** — a genuine race in the concurrent pipeline. Over 100 identical runs:
+survives is non-deterministic** — a genuine race in the concurrent pipeline. The tally script runs
+Case A `$1` times (with optional extra flags in `$2`) and counts, per run, the result count and the
+single surviving decoder type:
 
 ```console
-$ # Case A, 100 runs, canonical command; tally result-count and surviving decoder
-===== RESULT-COUNT distribution (expect always 1) =====
+$ cat /tmp/th_investigation/caseA_race.sh
+#!/usr/bin/env bash
+# Case A (plaintext L1 + base64 L2): run N times, tally (a) result count per run
+# and (b) which single decoder type survives. Optional extra flags in $2.
+TH=/tmp/trufflehog
+WORK=/tmp/th_investigation
+CMD="--results=verified,unknown,unverified --no-verification --no-update --json"
+N="$1"; EXTRA="$2"
+counts=""; decoders=""
+for i in $(seq "$N"); do
+  out=$("$TH" filesystem "$WORK/caseA.txt" $CMD $EXTRA 2>/dev/null)
+  counts+="$(printf '%s\n' "$out" | grep -c '"DecoderName"')"$'\n'
+  decoders+="$(printf '%s\n' "$out" | grep -o '"DecoderName":"[^"]*"' | sed 's/.*:"//;s/"$//')"$'\n'
+done
+echo "===== result-count distribution over $N runs (count | value) ====="
+printf '%s' "$counts" | grep -v '^$' | sort | uniq -c
+echo "===== surviving-decoder distribution over $N runs (count | value) ====="
+printf '%s' "$decoders" | grep -v '^$' | sort | uniq -c
+```
+
+Over 100 identical runs (the count is always 1; both decoder types are observed as winners):
+
+```console
+$ bash /tmp/th_investigation/caseA_race.sh 100
+===== result-count distribution over 100 runs (count | value) =====
     100 1
-===== SURVIVING DECODER distribution over 100 runs =====
-     80 BASE64
-     20 PLAIN
+===== surviving-decoder distribution over 100 runs (count | value) =====
+     84 BASE64
+     16 PLAIN
 ```
 
 The race is **not** an artifact of multi-worker parallelism: it persists even at `--concurrency=1`
 (the scanner/detector/notifier remain separate goroutines), 20 runs:
 
 ```console
-$ # Case A, 20 runs with --concurrency=1
---- result-count distribution ---
+$ bash /tmp/th_investigation/caseA_race.sh 20 --concurrency=1
+===== result-count distribution over 20 runs (count | value) =====
      20 1
---- surviving decoder distribution (concurrency=1) ---
-      8 BASE64
-     12 PLAIN
+===== surviving-decoder distribution over 20 runs (count | value) =====
+      7 BASE64
+     13 PLAIN
 ```
 
 A representative single-result payload (this run: `BASE64`) — note **`line:1`** even though the
@@ -325,7 +383,7 @@ $ /tmp/trufflehog filesystem /tmp/th_investigation/caseA.txt --results=verified,
 
 > **Deviation note (observed vs prior planning):** an earlier planning table claimed Case A was
 > *deterministically* a single `BASE64` result. **The observed reality is a race.** The distribution
-> reported above (80/20 over 100 runs; 8/12 at `--concurrency=1`) is what *this* investigation
+> reported above (84/16 over 100 runs; 7/13 at `--concurrency=1`) is what *this* investigation
 > measured; exact ratios will differ run-to-run because it is a race — the invariant is "always 1
 > result, decoder type non-deterministic."
 
@@ -450,38 +508,82 @@ File: /tmp/th_investigation/vo_secrets.txt
 Line: 2
 ```
 
-In JSON the message surfaces as the `VerificationError` field:
+In JSON the message surfaces as the `VerificationError` field. Full unedited stdout of one run
+(3 JSON objects, one per line; `2>/dev/null` drops the stderr logs, `tee` also saves the raw JSON for
+the derivation that follows):
 
 ```console
-$ /tmp/trufflehog filesystem /tmp/th_investigation/vo_secrets.txt --config /tmp/th_investigation/vo_detectors.yaml --results=verified,unknown,unverified --no-verification --no-update --json  # (VerificationError field per result)
-Detector=CustomRegex  Name=detector2  VerificationError = More than one detector has found this result. For your safety, verification has been disabled.You can override this behavior by using the --allow-verification-overlap flag.
-Detector=Postman      Name=-          VerificationError = More than one detector has found this result. For your safety, verification has been disabled.You can override this behavior by using the --allow-verification-overlap flag.
-Detector=CustomRegex  Name=detector1  VerificationError (absent)
+$ /tmp/trufflehog filesystem /tmp/th_investigation/vo_secrets.txt --config /tmp/th_investigation/vo_detectors.yaml --results=verified,unknown,unverified --no-verification --no-update --json 2>/dev/null | tee /tmp/th_investigation/overlap.json
+{"SourceMetadata":{"Data":{"Filesystem":{"file":"/tmp/th_investigation/vo_secrets.txt","line":2}}},"SourceID":1,"SourceType":15,"SourceName":"trufflehog - filesystem","DetectorType":904,"DetectorName":"CustomRegex","DetectorDescription":"This is a user-defined detector with no description provided.","DecoderName":"PLAIN","Verified":false,"VerificationFromCache":false,"Raw":"PMAK-qnwfsLyRSyfCwfpHaQP1UzDhrgpWvHjbYzjpRCMshjt417zWcrzyHUArs7r","RawV2":"","Redacted":"","ExtraData":{"name":"detector1"},"StructuredData":null}
+{"SourceMetadata":{"Data":{"Filesystem":{"file":"/tmp/th_investigation/vo_secrets.txt","line":2}}},"SourceID":1,"SourceType":15,"SourceName":"trufflehog - filesystem","DetectorType":904,"DetectorName":"CustomRegex","DetectorDescription":"This is a user-defined detector with no description provided.","DecoderName":"PLAIN","Verified":false,"VerificationFromCache":false,"Raw":"qnwfsLyRSyfCwfpHaQP1UzDhrgpWvHjbYzjpRCMshjt417zWcrzyHUArs7r","RawV2":"","Redacted":"","ExtraData":{"name":"detector2"},"StructuredData":null}
+{"SourceMetadata":{"Data":{"Filesystem":{"file":"/tmp/th_investigation/vo_secrets.txt","line":2}}},"SourceID":1,"SourceType":15,"SourceName":"trufflehog - filesystem","DetectorType":118,"DetectorName":"Postman","DetectorDescription":"Postman is a collaboration platform for API development. Postman API keys can be used to access and modify collections, environments, and other resources.","DecoderName":"PLAIN","Verified":false,"VerificationError":"More than one detector has found this result. For your safety, verification has been disabled.You can override this behavior by using the --allow-verification-overlap flag.","VerificationFromCache":false,"Raw":"PMAK-qnwfsLyRSyfCwfpHaQP1UzDhrgpWvHjbYzjpRCMshjt417zWcrzyHUArs7r","RawV2":"","Redacted":"","ExtraData":null,"StructuredData":null}
+```
+
+The following per-result summary is **derived from the raw JSON saved above** (`overlap.json`), parsed
+with `python3` — in this particular run only the `Postman` result carries the `VerificationError`
+(which result carries it is a race; quantified next):
+
+```console
+$ python3 - /tmp/th_investigation/overlap.json <<'EOF'
+import json, sys
+for ln in open(sys.argv[1]):
+    ln = ln.strip()
+    if not ln:
+        continue
+    o = json.loads(ln)
+    ed = o.get("ExtraData") or {}
+    nm = ed.get("name", "-") if isinstance(ed, dict) else "-"
+    ve = o.get("VerificationError", "")
+    print(f'Detector={o["DetectorName"]:<11} Name={nm:<10} VerificationError={"<present>" if ve else "<absent>"}')
+EOF
+Detector=CustomRegex Name=detector1  VerificationError=<absent>
+Detector=CustomRegex Name=detector2  VerificationError=<absent>
+Detector=Postman     Name=-          VerificationError=<present>
 ```
 
 The message is a **verification** annotation, not a deduplication of the result count: all **3**
 results are still emitted every run; only *which* of them carries the error is non-deterministic
-(20 runs → 16× exactly one result carries it, 4× two results carry it):
+(quantified over 20 runs below → 14× exactly one result carries it, 6× two results carry it). The
+tally script runs the overlap fixture `$1` times (extra flags in `$2`) and, per run, counts total
+results and how many carry the `errOverlap` message:
 
 ```console
-$ # overlap fixture, 20 runs
---- total results per run ---
+$ cat /tmp/th_investigation/overlap_race.sh
+#!/usr/bin/env bash
+# Overlap fixture: run N times. Per run, count total results and how many carry
+# the errOverlap VerificationError. Optional extra flags in $2.
+TH=/tmp/trufflehog
+WORK=/tmp/th_investigation
+BASE="--config $WORK/vo_detectors.yaml --results=verified,unknown,unverified --no-verification --no-update --json"
+N="$1"; EXTRA="$2"
+totals=""; errs=""
+for i in $(seq "$N"); do
+  out=$("$TH" filesystem "$WORK/vo_secrets.txt" $BASE $EXTRA 2>/dev/null)
+  totals+="$(printf '%s\n' "$out" | grep -c '"DetectorName"')"$'\n'
+  errs+="$(printf '%s\n' "$out" | grep -c 'More than one detector')"$'\n'
+done
+echo "===== total results per run over $N runs (count | value) ====="
+printf '%s' "$totals" | grep -v '^$' | sort | uniq -c
+echo "===== results carrying errOverlap per run over $N runs (count | value) ====="
+printf '%s' "$errs" | grep -v '^$' | sort | uniq -c
+
+$ bash /tmp/th_investigation/overlap_race.sh 20
+===== total results per run over 20 runs (count | value) =====
      20 3
---- number of results carrying errOverlap per run (non-deterministic) ---
-     16 1
-      4 2
+===== results carrying errOverlap per run over 20 runs (count | value) =====
+     14 1
+      6 2
 ```
 
 `--allow-verification-overlap` [`main.go:65`] suppresses the annotation entirely (still 3 results,
 0 errors) across 5 runs:
 
 ```console
-$ # overlap fixture + --allow-verification-overlap, 5 runs
-run 1: total_results=3 errOverlap_count=0
-run 2: total_results=3 errOverlap_count=0
-run 3: total_results=3 errOverlap_count=0
-run 4: total_results=3 errOverlap_count=0
-run 5: total_results=3 errOverlap_count=0
+$ bash /tmp/th_investigation/overlap_race.sh 5 --allow-verification-overlap
+===== total results per run over 5 runs (count | value) =====
+      5 3
+===== results carrying errOverlap per run over 5 runs (count | value) =====
+      5 0
 ```
 
 ### 6.4 Deduplication effect on the final result count
@@ -528,8 +630,12 @@ its two encodings resolve to the **same line**:
 
 - **Same line → 1 result (Case A).** The plaintext ID sits on line 1; `Base64.FromChunk` rebuilds the
   chunk in place but retains the line-1 plaintext, so the base64-decoded copy's ID *also* first occurs
-  on line 1 (`SetResultLineNumber` uses the first occurrence [`engine.go:1166`]). Both matches
-  therefore share one dedupe key and collapse to 1. **Which decoder type survives is a race** — it is
+  on line 1. The line number is computed from that **first occurrence**: `FragmentLineOffset` splits
+  the chunk with `bytes.Cut(chunk.Data, result.Raw)` — which returns the bytes *before the first
+  match* — and counts the newlines in them [`engine.go:1256-1261`]; `SetResultLineNumber`
+  [`engine.go:1321-1324`] applies that offset to the result (invoked from `processResult` at
+  [`engine.go:1166`]). Both matches therefore share one dedupe key and collapse to 1. **Which decoder
+  type survives is a race** — it is
   whichever result reaches the shared LRU first among the concurrent detector/notifier goroutines
   (§5.5; the surviving `BASE64` payload still reports `line:1`, direct evidence both encodings resolve
   to line 1).
@@ -569,14 +675,19 @@ an error, exits with code **1**, and emits **zero** results. This is an easy way
 "found nothing." Observed:
 
 ```console
-$ /tmp/trufflehog filesystem /tmp/th_investigation/caseC.txt --results=all --no-verification --no-update --json; echo "exit code: $?"
-{"level":"error","ts":"2026-07-08T05:01:14Z","logger":"trufflehog","msg":"failed to configure results flag","error":"invalid value 'all', valid values are 'verified,unknown,unverified,filtered_unverified'"}
-exit code: 1
-            # 0 results emitted on stdout
+$ /tmp/trufflehog filesystem /tmp/th_investigation/caseC.txt --results=all --no-verification --no-update --json > /tmp/th_investigation/all.stdout 2> /tmp/th_investigation/all.stderr ; echo "exit=$?"
+exit=1
+
+$ cat /tmp/th_investigation/all.stderr
+{"level":"error","ts":"2026-07-08T05:52:22Z","logger":"trufflehog","msg":"failed to configure results flag","error":"invalid value 'all', valid values are 'verified,unknown,unverified,filtered_unverified'"}
+
+$ wc -c < /tmp/th_investigation/all.stdout
+0
 ```
 
-Always pass explicit valid values, e.g. `--results=verified,unknown,unverified` as used throughout
-this document.
+Redirecting stdout and stderr to separate files shows the flag error on **stderr**, an exit code of
+**1**, and a **0-byte stdout** — i.e. no result object is emitted at all. Always pass explicit valid
+values, e.g. `--results=verified,unknown,unverified` as used throughout this document.
 
 ---
 
@@ -616,22 +727,20 @@ apart recursively — only the first decode layer is applied per decoder.
 
 The investigation created **no** files inside the repository other than this document, and modified
 **no** existing source file. All crafted inputs, the compiled binary, and the copied fixtures lived
-under `/tmp/th_investigation/` and `/tmp/trufflehog` and were removed after the runs. After doc
-creation, `git status --porcelain` reports only the new untracked documentation path and **zero**
-modified or deleted tracked files:
+under `/tmp/th_investigation/` and `/tmp/trufflehog` (outside the repository) and were removed after
+the runs. Diffing the working tree against the pinned source HEAD confirms the **only** change is the
+addition of this documentation file, with **zero** tracked source files modified or deleted:
 
 ```console
-$ git status --porcelain
-?? blitzy/
+$ git diff --name-status e42153d44a5e5c37c1bd0c70e074781e9edcb760
+A	blitzy/documentation/trufflehog_e42153d44a5e.md
 
-$ git status --porcelain | grep -E '^[ ]?[MD]' | wc -l   # modified/deleted tracked files
-0
-
-$ git rev-parse HEAD
-e42153d44a5e5c37c1bd0c70e074781e9edcb760
+$ git status --porcelain -- ':(exclude)blitzy/'
 ```
 
-HEAD is unchanged; the only addition to the working tree is
+The single `A` entry is this document. The second command lists working-tree changes **outside**
+`blitzy/`; it prints nothing (empty output above), confirming no source, config, build, or test file
+was added, modified, or deleted. The only addition to the working tree is
 `blitzy/documentation/trufflehog_e42153d44a5e.md`.
 
 ---
@@ -659,8 +768,10 @@ observed evidence, and causal reason:
 - [x] **Dedup-vs-overlap ordering** — overlap in `scannerWorker`/`verificationOverlapWorker`
   [`engine.go:796`, `924-1034`] precedes `notifierWorker` dedupe [`engine.go:1189-1235`] ⇒ **dedupe
   after overlap** *(inferred from pipeline stage order; consistent with observation)* (§6.5).
-- [x] **One-vs-many variability** — same key; line number in the dedupe key decides: same line ⇒ 1
-  (Case A, surviving type is a race), different lines ⇒ 2 (Case D) [`engine.go:1216`, `1166`].
+- [x] **One-vs-many variability** — same key; line number in the dedupe key [`engine.go:1216`]
+  decides: same line ⇒ 1 (Case A, surviving type is a race), different lines ⇒ 2 (Case D). The line
+  number itself is taken from the **first occurrence** — `FragmentLineOffset` via
+  `bytes.Cut` [`engine.go:1256-1261`], applied by `SetResultLineNumber` [`engine.go:1321-1324`].
   *Evidence:* §5.3, §5.5, §6.6.
 - [x] **Read-only mandate honored** — no existing source file modified; only this document created
   (§10).
@@ -704,12 +815,13 @@ vo_secrets.txt:
   POSTMAN_API_KEY="PMAK-qnwfsLyRSyfCwfpHaQP1UzDhrgpWvHjbYzjpRCMshjt417zWcrzyHUArs7r"
 ```
 
-**Raw tallies observed in this investigation:**
+**Summary of observed tallies** (a recap; the exact scripts and their full captured output are in
+§5.5 and §6.3):
 
 ```text
-Case A (100 runs, canonical): result-count = { 1: 100 };  surviving decoder = { BASE64: 80, PLAIN: 20 }
-Case A (20 runs, --concurrency=1): result-count = { 1: 20 };  surviving decoder = { BASE64: 8, PLAIN: 12 }
-Overlap fixture (20 runs): total results/run = { 3: 20 };  results carrying errOverlap/run = { 1: 16, 2: 4 }
+Case A (100 runs, canonical): result-count = { 1: 100 };  surviving decoder = { BASE64: 84, PLAIN: 16 }
+Case A (20 runs, --concurrency=1): result-count = { 1: 20 };  surviving decoder = { BASE64: 7, PLAIN: 13 }
+Overlap fixture (20 runs): total results/run = { 3: 20 };  results carrying errOverlap/run = { 1: 14, 2: 6 }
 Overlap fixture + --allow-verification-overlap (5 runs): total = 3 each, errOverlap = 0 each
 ```
 
