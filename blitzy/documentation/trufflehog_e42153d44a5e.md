@@ -1025,7 +1025,11 @@ shows it in the clear:
 
 ```
 $ /tmp/trufflehog filesystem /tmp/thqa/fx/q1adjacent --no-verification --results=verified,unverified,unknown,filtered_unverified --filter-entropy=3.8
-2026-07-08T06:01:19Z	info-0	trufflehog	Filtered out result with low entropy	{"detector_worker_id": "efBko", "detector": {"type":"AWS"}, "timeout": 10, "result": {"DetectorType":2,"DetectorName":"","Verified":false,"VerificationFromCache":false,"Raw":"QUJJQVM5TDhNUzVJUEhUWlBQVVE=","RawV2":"QUJJQVM5TDhNUzVJUEhUWlBQVVE6djJRUEtIbDdMY2RWWXNqYVI0TGdRaVoxenczTUFuTXlpb25kWEM2Mw==","Redacted":"ABIAS9L8MS5IPHTZPPUQ","ExtraData":{"resource_type":"AWS STS service bearer token"},"StructuredData":null,"AnalysisInfo":null}}
+🐷🔑🐷  TruffleHog. Unearth your secrets. 🐷🔑🐷
+
+2026-07-08T07:49:14Z	info-0	trufflehog	running source	{"source_manager_worker_id": "tACLt", "with_units": true}
+2026-07-08T07:49:14Z	info-0	trufflehog	Filtered out result with low entropy	{"detector_worker_id": "FCubC", "detector": {"type":"AWS"}, "timeout": 10, "result": {"DetectorType":2,"DetectorName":"","Verified":false,"VerificationFromCache":false,"Raw":"QUJJQVM5TDhNUzVJUEhUWlBQVVE=","RawV2":"QUJJQVM5TDhNUzVJUEhUWlBQVVE6djJRUEtIbDdMY2RWWXNqYVI0TGdRaVoxenczTUFuTXlpb25kWEM2Mw==","Redacted":"ABIAS9L8MS5IPHTZPPUQ","ExtraData":{"resource_type":"AWS STS service bearer token"},"StructuredData":null,"AnalysisInfo":null}}
+2026-07-08T07:49:14Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 106, "verified_secrets": 0, "unverified_secrets": 0, "scan_duration": "4.485504ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
 ```
 
 This confirms `--filter-entropy` is a distinct, user-tunable engine gate layered on
@@ -1267,9 +1271,11 @@ Line: 1
 ```
 
 **Verification on** → same canary tagging; note the run attempts the canary's SNS
-path (verification-cache `"Misses": 1` and a ~167 ms duration versus ~5 ms offline)
-but does not falsely verify it. In this offline environment the result remains
-unverified; the `is_canary`/account/message metadata is identical to the
+path (verification-cache `"Misses": 1` and a ~167 ms duration versus ~5 ms with
+verification off) but does not falsely verify it: the `if verify && !isCanary` gate
+(`pkg/detectors/aws/access_keys/accesskey.go:L185`) routes the canary away from
+real-AWS verification, so the result stays unverified regardless of network
+reachability. The `is_canary`/account/message metadata is identical to the
 verification-off run:
 
 ```
@@ -1297,7 +1303,9 @@ The `--json` form makes the canary metadata explicit in `ExtraData`
 
 ```
 $ /tmp/trufflehog filesystem /tmp/thqa/fx/q5canary --no-verification --results=verified,unverified,unknown --json
+{"level":"info-0","ts":"2026-07-08T07:49:16Z","logger":"trufflehog","msg":"running source","source_manager_worker_id":"DgFiU","with_units":true}
 {"SourceMetadata":{"Data":{"Filesystem":{"file":"/tmp/thqa/fx/q5canary/creds.txt","line":1}}},"SourceID":1,"SourceType":15,"SourceName":"trufflehog - filesystem","DetectorType":2,"DetectorName":"AWS","DetectorDescription":"AWS (Amazon Web Services) is a comprehensive cloud computing platform offering a wide range of on-demand services like computing power, storage, databases. API keys for AWS can have varying amount of access to these services depending on the IAM policy attached.","DecoderName":"PLAIN","Verified":false,"VerificationFromCache":false,"Raw":"AKIASP2TPHJSQH3FJRUX","RawV2":"AKIASP2TPHJSQH3FJRUX:v2QPKHl7LcdVYsjaR4LgQiZ1zw3MAnMyiondXC63","Redacted":"AKIASP2TPHJSQH3FJRUX","ExtraData":{"account":"171436882533","is_canary":"true","message":"This is an AWS canary token generated at canarytokens.org.","resource_type":"Access key"},"StructuredData":null}
+{"level":"info-0","ts":"2026-07-08T07:49:16Z","logger":"trufflehog","msg":"finished scanning","chunks":1,"bytes":106,"verified_secrets":0,"unverified_secrets":1,"scan_duration":"4.456467ms","trufflehog_version":"dev","verification_caching":{"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
 ```
 
 *(Note on `Resource_type`: `AKIA`-prefixed keys — including this canary — report
