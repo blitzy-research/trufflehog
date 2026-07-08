@@ -261,7 +261,7 @@ main.go:311-314                 if l < -1 || l > 5 {
                                     fmt.Fprintf(os.Stderr, "invalid log level: %d\n", *logLevel)   // main.go:312
                                     os.Exit(1)                                                       // main.go:313
                                 }
-main.go:322                     ... log.SetLevel(l)
+main.go:321                     ... log.SetLevel(l)
 ```
 
 - The **range guard spans `main.go:311-314`**: the error print is at `main.go:312`
@@ -482,7 +482,7 @@ them. These are **`(inferred from source)`** — the engine's own
 pkg/engine/engine.go:515       detectableChunksChan          (buffer defaultChannelBuffer × 50)
 pkg/engine/engine.go:516-518   verificationOverlapChunksChan (buffer defaultChannelBuffer × 25)
 pkg/engine/engine.go:519       results                       (buffer defaultChannelBuffer × 50)
-pkg/engine/engine.go:520       ctx.Logger().V(4).Info("engine initialized")
+pkg/engine/engine.go:521       ctx.Logger().V(4).Info("engine initialized")
 pkg/engine/engine.go:627       defaultChannelBuffer = runtime.NumCPU()   // = 128 on this host
 ```
 
@@ -587,7 +587,7 @@ During engine initialization the detector set is wrapped in an Aho-Corasick
 
 ```text
 pkg/engine/engine.go:529   ctx.Logger().V(4).Info("setting up aho-corasick core")   // V(4): not visible at level 2
-pkg/engine/engine.go:530   e.ahoCorasickCore = ahocorasick.NewAhoCorasickCore(e.detectors, ...)
+pkg/engine/engine.go:530   e.AhoCorasickCore = ahocorasick.NewAhoCorasickCore(e.detectors, ...)
 pkg/engine/ahocorasick/ahocorasickcore.go:141   func NewAhoCorasickCore(allDetectors []detectors.Detector, opts ...CoreOption) *Core
 ```
 
