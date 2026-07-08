@@ -99,9 +99,10 @@ This confirms the full genuine path fires: the config loads, the scan matches, a
 
 ```go
 func ValidateVerifyEndpoint(endpoint string, unsafe bool) error {
-	if endpoint == "" {
+	if len(endpoint) == 0 {
 		return fmt.Errorf("no endpoint")
 	}
+
 	if strings.HasPrefix(endpoint, "http://") && !unsafe {
 		return fmt.Errorf("http endpoint must have unsafe=true")
 	}
@@ -109,7 +110,7 @@ func ValidateVerifyEndpoint(endpoint string, unsafe bool) error {
 }
 ```
 
-The request itself is built against the **raw** endpoint string in `CustomRegexWebhook.createResults` (`pkg/custom_detectors/custom_detectors.go:L228`): `req, err := http.NewRequestWithContext(ctx, "POST", verifyConfig.GetEndpoint(), bytes.NewReader(body))`. No host inspection happens anywhere between load and dial.
+The request itself is built against the **raw** endpoint string in `CustomRegexWebhook.createResults` (`pkg/custom_detectors/custom_detectors.go:L228`): `req, err := http.NewRequestWithContext(ctx, "POST", verifyConfig.GetEndpoint(), bytes.NewReader(jsonBody))`. No host inspection happens anywhere between load and dial.
 
 ### E1a — internal loopback with a metadata-style path
 
