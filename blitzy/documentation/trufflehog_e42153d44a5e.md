@@ -28,7 +28,7 @@ Ground rules honored throughout:
 
 1. **SSRF reachability — YES, unrestricted at the configuration layer.** The only endpoint guard, `ValidateVerifyEndpoint` [pkg/custom_detectors/validation.go:35-44], performs **no** host/IP allow- or deny-listing; its sole rule is that a plaintext `http://` endpoint must set `unsafe: true`. A webhook aimed at `http://169.254.169.254/latest/meta-data/iam/security-credentials/` is accepted and a secret-bearing `POST` is dispatched to it. **[OBSERVED]** (§3). What this proves is *request reachability + secret-bearing POST egress*, **not** cloud-credential retrieval (§3.5).
 2. **TLS / MITM — default strict verification applies.** Custom detectors use `common.SaneHttpClient()` [pkg/common/http.go:223-229], which sets **no** `TLSClientConfig`, so Go's default certificate + hostname verification governs HTTPS. An untrusted self-signed endpoint is **rejected before any application bytes are sent** (server sees 0 requests); trusting the same certificate lets the identical secret-bearing request through. **[OBSERVED]** (§4). A network MITM without a trusted certificate cannot silently intercept HTTPS verification traffic; plaintext `http://` (with `unsafe: true`) removes that protection entirely.
-3. **Amplification — one verification per match *permutation*, capped at 100 *per chunk*, not scan-wide.** `maxTotalMatches = 100` [pkg/custom_detectors/custom_detectors.go:20-23] bounds a single `FromData` chunk; a multi-chunk scan exceeds 100 in total, and request count is further multiplied by the number of configured verifiers and by any redirects. **[OBSERVED]** (§5).
+3. **Amplification — one verification per match *permutation*, capped at 100 *per keyword-match region* (per `FromData` invocation), not per chunk and not scan-wide.** `maxTotalMatches = 100` [pkg/custom_detectors/custom_detectors.go:23] bounds one `FromData` call, and the engine invokes `FromData` **once per merged keyword-match region** [pkg/engine/engine.go:1061-1070]; a single chunk that contains several non-merging regions therefore exceeds 100 (observed: one 8241-byte chunk → **120** verifications). The total is multiplied further by the number of chunks, the number of configured verifiers, and any redirects. **[OBSERVED]** (§5).
 4. **Data exfiltration — the matched secret is JSON-marshaled and POSTed with attacker-chosen headers, to every configured verifier, and replayed across redirects; the endpoint's 200 response is read back (first 200 bytes) into CLI output.** **[OBSERVED]** (§6).
 5. **ReDoS — not a concern for the matching engine.** Patterns compile with Go's `regexp` (RE2) [pkg/custom_detectors/validation.go:23-33], which guarantees linear-time matching; the classic catastrophic pattern does not blow up. **[OBSERVED]** + **[CORROBORATED]** (§8).
 6. **Threat model — the trust boundary is whoever supplies `--config`.** That party chooses the endpoint (SSRF egress + secret-bearing POST), the headers, the regex, and — via redirects — additional destinations, and can read back a bounded slice of each endpoint's response. **[OBSERVED/SOURCE-DERIVED]** (§9).
@@ -37,7 +37,7 @@ Ground rules honored throughout:
 
 - A TLS/transport failure yields status **`unverified`**, not `unknown`: the error is swallowed by `if err != nil { continue }` [custom_detectors.go:241-242] with no `SetVerificationError` (§4.4).
 - `successRanges` is a **runtime no-op** at this commit; only HTTP 200 marks a result verified [custom_detectors.go:249] (§6.6).
-- The 100 limit is **per-chunk**, not scan-wide (§5).
+- The 100 limit is **per keyword-match region** (per `FromData` invocation), not per chunk and not scan-wide — a single chunk containing two non-merging regions was observed issuing **120** verifications (§5).
 - The verification cache dedupes on `hash(Raw + RawV2 + DetectorType)` and only short-circuits when **every** result is a cache hit (§7).
 
 ---
@@ -600,25 +600,28 @@ $ grep -c "^REQUEST-LINE:" tls_untrusted_trace.log   # server-side requests rece
 
 ## 5. Verification amplification
 
-**Direct answer:** One verification request is dispatched **per match permutation**, and the cap is **per `FromData` chunk** (`maxTotalMatches = 100`), **not** scan-wide. A scan of many chunks therefore issues up to 100 verifications *per chunk*, so the total scales with the number of chunks (observed: two 150-match chunks → 200 POSTs). Amplification is further multiplied by **multiple verifiers** (each permutation is offered to every configured verifier until one returns 200) and by **HTTP redirects** (each followed hop is an additional request that replays the secret-bearing body).
+**Direct answer:** One verification request is dispatched **per match permutation**, and the cap `maxTotalMatches = 100` is applied **per keyword-match region** — i.e. per `FromData` invocation — **not** per engine chunk and **not** scan-wide. The engine calls `FromData` once for each merged keyword-match region in a chunk [pkg/engine/engine.go:1061-1070], and the 100 clamp bounds the permutations *within one such call*; a single chunk that contains several non-merging regions therefore issues **more than 100** verifications (observed: one 8241-byte chunk with two regions → **120** POSTs). The total scales further with the number of chunks (observed: two 150-match files → two chunks → 200 POSTs), and is multiplied by **multiple verifiers** (each permutation is offered to every configured verifier until one returns 200) and by **HTTP redirects** (each followed hop is an additional request that replays the secret-bearing body).
 
-### 5.1 Code path (per-chunk cap, per-permutation dispatch)
+### 5.1 Code path (per-region cap, per-permutation dispatch)
 
 **[SOURCE-DERIVED / INFERRED]**
-- `const maxTotalMatches = 100` [pkg/custom_detectors/custom_detectors.go:20-23]; the comment reads "maximum number of matches from one chunk", i.e. the bound is **per chunk**, applied inside a single `FromData` call.
-- `FromData` builds the cartesian product of per-regex matches via `permutateMatches` [custom_detectors.go:110]; the results channel is buffered at `maxTotalMatches` [custom_detectors.go:115]; `productIndices` clamps the permutation count with `if count > maxTotalMatches { count = maxTotalMatches }` [custom_detectors.go:295-296].
+- `const maxTotalMatches = 100` [pkg/custom_detectors/custom_detectors.go:23]; the doc-comment (lines 20-22) reads "maximum number of matches from one chunk", but at runtime the clamp is applied inside a single `FromData` call — see below — so it bounds one **keyword-match region**, not a whole engine chunk.
+- The engine drives detection **per region, not per chunk**: `detectChunk` reads `matches := data.detector.Matches()` and loops `for _, matchBytes := range matches`, calling `e.verificationCache.FromData(…, matchBytes)` **once for each element** [pkg/engine/engine.go:1061-1070]. Each element is one merged keyword-match region, so a chunk containing K non-merging regions results in K independent `FromData` calls.
+- Regions are formed by the Aho-Corasick core: each keyword hit yields a span `[kwIdx − 512, kwIdx + MaxSecretSize()]` (default offset radius 512 [pkg/engine/ahocorasick/ahocorasickcore.go:155]; `CustomRegexWebhook.MaxSecretSize()` returns 1000 [custom_detectors.go:180]), and `mergeMatches` merges only spans that overlap or are adjacent — `if d.matchSpans[i].startOffset <= current.endOffset` [pkg/engine/ahocorasick/ahocorasickcore.go:196-216]. Two keyword clusters separated by more than ~1512 bytes of keyword-free data therefore stay in **separate** regions inside the same chunk.
+- `FromData` builds the cartesian product of per-regex matches via `permutateMatches` [custom_detectors.go:110]; the results channel is buffered at `maxTotalMatches` [custom_detectors.go:115]; `productIndices` clamps the permutation count with `if count > maxTotalMatches { count = maxTotalMatches }` [custom_detectors.go:295-296] — i.e. the clamp bounds permutations **within one region**.
 - One goroutine per permutation is launched (`g.Go → createResults`) [custom_detectors.go:155-156].
 - Inside `createResults`, **every** configured verifier is tried in order — `for _, verifyConfig := range c.GetVerify()` [custom_detectors.go:223] — and the loop only `break`s after the **first** endpoint returns 200 [custom_detectors.go:268]; a non-200 falls through to the next verifier. There is no custom `CheckRedirect`, so `net/http`'s default redirect policy applies (see §10, corroborated).
 
-Because the cap lives inside `FromData` (one chunk), a scan that produces N chunks can issue up to `100 × N` verifications. This corrects the earlier framing that treated 100 as a scan-wide limit and "exactly one POST per permutation" as exact — the per-permutation dispatch is multiplied by verifiers and redirects.
+Because the clamp lives inside `FromData`, which the engine invokes **once per keyword-match region**, the real bound is `min(product_of_per-regex_match_counts, 100)` **per region**. A single chunk with R non-merging regions can therefore issue up to `100 × R` verifications, and a whole scan issues the sum of that across all chunks, further multiplied by the number of configured verifiers and by followed redirects. This corrects the earlier "100 per chunk / 100 × N chunks" framing (which had also treated the "exactly one POST per permutation" dispatch as the *complete* cap story — the per-permutation dispatch itself is accurate, but 100 bounds permutations **per region**, not per chunk): the datapoints below confirm a **single chunk exceeding 100**.
 
 ### 5.2 Scenario script (self-contained; sources `lib.sh` from §2.3)
 
 ```bash
 # ---- scripts/05_amplification.sh ----
 #!/usr/bin/env bash
-# Evidence: verification is dispatched PER MATCH PERMUTATION, capped PER CHUNK at
-# maxTotalMatches=100 (custom_detectors.go:22) — NOT scan-wide. Plus multi-verifier
+# Evidence: verification is dispatched PER MATCH PERMUTATION, capped PER KEYWORD-MATCH
+# REGION at maxTotalMatches=100 (custom_detectors.go:23) — NOT per chunk, NOT scan-wide
+# (a single chunk with multiple non-merging regions exceeds 100). Plus multi-verifier
 # fan-out, HTTP 308 redirect body-replay, and the successRanges no-op.
 source /tmp/th_harness/scripts/lib.sh
 read P Q R < <(pick_ports 3)
@@ -663,12 +666,45 @@ gen 150 > "$AMP/n150/data.txt"
 gen 150 > "$AMP/multi/fileA.txt"
 gen 150 > "$AMP/multi/fileB.txt"
 
-echo "################ AMPLIFICATION: POST count vs #matches (cap is PER CHUNK) ################"
+echo "################ AMPLIFICATION: POST count vs #matches (per-permutation dispatch; clamp per region) ################"
 run_amp n10_single       "$AMP/n10"
 run_amp n150_single_run1 "$AMP/n150"
 run_amp n150_single_run2 "$AMP/n150"
 run_amp multi_2x150      "$AMP/multi"
-echo "(n10 => 10 linear; n150 => 100 capped, stable; multi 2 chunks => 200 total > 100 => cap is per-chunk)"
+echo "(n10 => 10 linear; n150 => 100 = one dense region clamped; multi 2 files => 2 chunks => 200; single-chunk >100 shown in the REGION CAP block below)"
+
+# --- REGION cap: a SINGLE chunk with non-merging regions exceeds 100 ---
+# gen_split writes ONE file: an A-line cluster, GAP bytes of inert, keyword-free
+# filler (dots — NOT in [A-Za-z0-9+/], so they never match the token regex),
+# then a B-line cluster. Because the two keyword clusters are >1512 B apart,
+# their [kw-512, kw+1000] spans do NOT merge (ahocorasickcore.go:196-216), so the
+# engine emits TWO regions -> TWO FromData calls -> the 100 clamp applies to EACH.
+gen_split() {  # gen_split A GAP B FILE
+  python3 -c "
+import sys
+a,gap,b,path=int(sys.argv[1]),int(sys.argv[2]),int(sys.argv[3]),sys.argv[4]
+def L(i): return 'hog token: '+('%040d'%i)+'\n'
+with open(path,'w') as f:
+    i=0
+    for _ in range(a): f.write(L(i)); i+=1
+    f.write('.'*gap+'\n')            # inert, keyword-free gap (dots never match the token regex)
+    for _ in range(b): f.write(L(i)); i+=1
+" "$1" "$2" "$3" "$4"; }
+
+mkdir -p "$AMP/region"
+gen_split 60  2000 60 "$AMP/region/split_60_60.txt"   # two 60-token regions     -> 120
+gen_split 130 2000 20 "$AMP/region/a130_b20.txt"      # region A 130->100 + B 20  -> 120
+gen_split 101 2000  1 "$AMP/region/a101_b1.txt"       # region A 101->100 + B 1   -> 101
+gen 120             > "$AMP/region/merged_120.txt"    # control: 1 dense region   -> 100 (capped)
+
+echo ""
+echo "################ REGION CAP: ONE chunk, multiple non-merging regions (>100) ################"
+run_amp region_split_60_60       "$AMP/region/split_60_60.txt"
+run_amp region_a130_b20          "$AMP/region/a130_b20.txt"
+run_amp region_a101_b1           "$AMP/region/a101_b1.txt"
+run_amp region_merged_120_ctrl   "$AMP/region/merged_120.txt"
+run_amp region_split_60_60_rerun "$AMP/region/split_60_60.txt"
+echo "(split 60+60 => 120 in ONE chunk; a130_b20 => 100-clamped + 20 = 120; a101_b1 => 101; merged 120 gap0 => 100)"
 
 echo ""
 echo "################ MULTI-VERIFIER FAN-OUT: verify[0]=403 then verify[1]=200 ################"
@@ -745,7 +781,7 @@ stop_all
 ### 5.3 Complete, unedited output
 
 ```text
-################ AMPLIFICATION: POST count vs #matches (cap is PER CHUNK) ################
+################ AMPLIFICATION: POST count vs #matches (per-permutation dispatch; clamp per region) ################
 readiness: connect_ex=0 (listening)
 [n10_single] chunks=1 verified_secrets=10 SERVER_POSTS=10
 readiness: connect_ex=0 (listening)
@@ -754,7 +790,25 @@ readiness: connect_ex=0 (listening)
 [n150_single_run2] chunks=1 verified_secrets=100 SERVER_POSTS=100
 readiness: connect_ex=0 (listening)
 [multi_2x150] chunks=2 verified_secrets=200 SERVER_POSTS=200
-(n10 => 10 linear; n150 => 100 capped, stable; multi 2 chunks => 200 total > 100 => cap is per-chunk)
+(n10 => 10 linear; n150 => 100 = one dense region clamped; multi 2 files => 2 chunks => 200; single-chunk >100 shown in the REGION CAP block below)
+
+################ REGION CAP: ONE chunk, multiple non-merging regions (>100) ################
+readiness: connect_ex=0 (listening)
+[region_split_60_60] chunks=1 verified_secrets=120 SERVER_POSTS=120
+readiness: connect_ex=0 (listening)
+[region_a130_b20] chunks=1 verified_secrets=120 SERVER_POSTS=120
+readiness: connect_ex=0 (listening)
+[region_a101_b1] chunks=1 verified_secrets=101 SERVER_POSTS=101
+readiness: connect_ex=0 (listening)
+[region_merged_120_ctrl] chunks=1 verified_secrets=100 SERVER_POSTS=100
+readiness: connect_ex=0 (listening)
+[region_split_60_60_rerun] chunks=1 verified_secrets=120 SERVER_POSTS=120
+(split 60+60 => 120 in ONE chunk; a130_b20 => 100-clamped + 20 = 120; a101_b1 => 101; merged 120 gap0 => 100)
+
+################ DECISIVE: full "finished scanning" telemetry for split_60_60 (single chunk) ################
+readiness: connect_ex=0 (listening)
+2026-07-13T22:03:39Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 8241, "verified_secrets": 120, "unverified_secrets": 0, "scan_duration": "11.874525473s", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":4,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":12276}}
+SERVER_POSTS=120
 
 ################ MULTI-VERIFIER FAN-OUT: verify[0]=403 then verify[1]=200 ################
 readiness: connect_ex=0 (listening)
@@ -803,9 +857,10 @@ server posts=1 (403 returned; successRanges:['403'] configured but IGNORED by co
 
 ### 5.4 Interpretation (OBSERVED)
 
-- **Linear below the cap:** 10 matches in one chunk → `SERVER_POSTS=10`.
-- **Per-chunk cap at 100, stable:** 150 matches in one chunk → `SERVER_POSTS=100`, identical across two repeated runs (`n150_single_run1`, `n150_single_run2`). This is the `maxTotalMatches` clamp.
-- **Cap is per-chunk, not scan-wide:** two 150-match files (two chunks) → `chunks=2`, `SERVER_POSTS=200` — i.e. **200 > 100**, proving the bound is applied independently per chunk. This is the decisive correction to the earlier scan-wide framing.
+- **Linear below the cap:** 10 matches in one dense region → `SERVER_POSTS=10`.
+- **Per-region cap at 100, stable:** 150 matches in one dense region → `SERVER_POSTS=100`, identical across two repeated runs (`n150_single_run1`, `n150_single_run2`). This is the `maxTotalMatches` clamp applied to a single region.
+- **The cap is per keyword-match region, NOT per chunk (decisive):** a *single* file `split_60_60.txt` (8241 bytes < the 10 240-byte `ChunkSize`, so `chunks=1`) whose two 60-token clusters are separated by 2000 bytes of inert, keyword-free filler forms **two non-merging regions** and therefore issues `SERVER_POSTS=120` — i.e. **one chunk emitted 120 > 100 verifications**, stable across three fresh processes (`region_split_60_60`, `…_rerun`, and the standalone capture below whose `"chunks": 1 … "verified_secrets": 120` telemetry line is shown in full). The clamp applies to each region independently: `region_a130_b20` → `100` (region A of 130 clamped) `+ 20` (region B) `= 120`; the minimal over-cap case `region_a101_b1` → `100 + 1 = 101`; and the control `region_merged_120_ctrl` (120 tokens with **no** gap, hence a single merged region) → `100`. This is the decisive correction to the earlier "per chunk / scan-wide" framing.
+- **Multi-chunk is additive too:** two 150-match files → `chunks=2`, `SERVER_POSTS=200`, confirming the bound is not scan-wide across chunks either.
 - **Multi-verifier fan-out:** with two verifiers (`:…/first` returning 403, `:…/second` returning 200), the secret-bearing POST is delivered to **both** endpoints (`verifier[0] posts=1`, `verifier[1] posts=1`); verification succeeds from the second's 200. So one permutation can generate one request *per configured verifier* up to the first success.
 - **Redirect fan-out:** an HTTP `308` at hop1 causes `net/http` to follow to hop2, producing a **second** request; the redirect interpretation (body + `Authorization` replayed to the new destination) is detailed in §6.4.
 
@@ -1299,7 +1354,7 @@ Together these show TruffleHog's custom-detector regex path is linear-time (RE2)
 - **Exfiltrate every matched secret to an endpoint they choose.** The body is the matched secret material in cleartext (§6.1–§6.4); the destination is unrestricted at the config layer (§3). This is the core capability.
 - **Direct requests at internal / link-local / metadata addresses.** No allowlist/denylist exists (§3.1); the metadata address `169.254.169.254` is accepted and a secret-bearing `POST` is aimed at it (§3.3). **Precisely:** this is **request reachability plus secret-bearing `POST` egress**, *not* cloud-credential retrieval — the verifier only ever issues a `POST` with a JSON body, whereas IMDS credential retrieval is a `GET` (IMDSv2 additionally requires a `PUT` token) (§3.5, §10). Whether a given network actually routes to such a host is environment-dependent; TruffleHog itself imposes no destination restriction.
 - **Receive data back (bidirectional channel).** On a 200, up to 200 bytes of the endpoint's response are read into `ExtraData["response"]` and shown to the operator (§6.4). The endpoint author therefore controls a small return channel, not just a sink.
-- **Fan out and amplify.** Verification is dispatched per match permutation, capped at 100 **per chunk** (not scan-wide), and multiplied by the number of configured verifiers and by followed redirects (§5). A multi-chunk scan can exceed 100 total; each redirect hop replays the secret-bearing body (and leaks a `Referer`) to a new destination (§6.5).
+- **Fan out and amplify.** Verification is dispatched per match permutation, capped at 100 **per keyword-match region** (per `FromData` invocation) — not per chunk and not scan-wide — and multiplied by the number of configured verifiers and by followed redirects (§5). A single chunk with multiple non-merging regions can already exceed 100 (observed: **120** verifications in one chunk); the total grows further across chunks, verifiers, and each redirect hop, which replays the secret-bearing body (and leaks a `Referer`) to a new destination (§6.5).
 - **Choose cleartext.** Setting `unsafe: true` with an `http://` endpoint sends the identical secret body with **no** TLS protection (§3.4, §4.4).
 
 ### 9.2 What the system does constrain (qualified, not overstated)
@@ -1340,8 +1395,8 @@ Every named sub-question and mechanism from the prompt is addressed, with observ
 | `http://` without `unsafe`? / `https://` without `unsafe`? | §3.4 | `http` rejected at load; `https` accepted |
 | TLS/cert validation on HTTPS webhooks? MITM? | §4.1–§4.3 | Go default strict verification; untrusted cert ⇒ 0 requests, unverified |
 | Which client? (`SaneHttpClient`, no `TLSClientConfig`) | §4.1 [http.go:211-221, custom_detectors.go:62] | No `InsecureSkipVerify`, no pinning on this path |
-| Amplification: once or many times? any cap? | §5.3–§5.4 | Per-permutation; cap 100 **per chunk**, not scan-wide |
-| `permutateMatches` / `maxTotalMatches = 100` | §5.1 [custom_detectors.go:20-23,110,295-296] | Confirmed; multi-chunk 2×150 ⇒ 200 POSTs |
+| Amplification: once or many times? any cap? | §5.3–§5.4 | Per-permutation; cap 100 **per keyword-match region** (per `FromData`), not per chunk / scan-wide |
+| `permutateMatches` / `maxTotalMatches = 100` | §5.1 [custom_detectors.go:23,110,295-296; engine.go:1061-1070] | Confirmed per-region; one chunk ⇒ 120 POSTs; multi-file 2×150 ⇒ 200 |
 | Multiple verifiers / redirects amplify? | §5.4, §6.5 | Fan-out to every verifier; each redirect hop replays body |
 | Data surface: headers, body, secret material | §6.1–§6.4 [custom_detectors.go:214-238] | Exact JSON body + verbatim headers + `User-Agent: TruffleHog` |
 | Secret sent on non-200? | §6.3–§6.4 | Yes (403 case still receives the full request) |
