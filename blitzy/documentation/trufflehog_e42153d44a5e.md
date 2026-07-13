@@ -19,7 +19,7 @@ location it is written **INFERRED — source-confirmed**. These are the only two
 - **Commit under investigation (the source being described):**
   `e42153d44a5e5c37c1bd0c70e074781e9edcb760`.
 
-### Source commit vs. delivery commit (repository-state contract)
+## Source commit vs. delivery commit (repository-state contract)
 
 This answer document is itself a tracked file, so the branch HEAD that *carries* the document
 is necessarily a **child** of the commit under investigation. The two are distinct on purpose:
@@ -705,9 +705,15 @@ error key appears.
 
 **INFERRED — source-confirmed.** `SourceMetadata` is a `*source_metadatapb.MetaData`
 (`proto/source_metadata.proto`: `message MetaData` [`L367`]) whose `Data` is a oneof of
-source-specific messages — here `message Git` [`L94`] (fields `commit`, `file`, `email`,
-`timestamp`, `line`). A filesystem scan instead populates `message Filesystem` [`L87`]. So the
-"where" metadata is strongly typed per source, not a flat string.
+source-specific messages — here `message Git` [`L94`]. That message actually declares **six**
+fields — `commit` (1), `file` (2), `email` (3), `repository` (4), `timestamp` (5), `line` (6)
+[`proto/source_metadata.proto:L94-L100`]. The observed block above shows five of them; the one
+missing is `repository` (field 4), which is empty and therefore omitted (every field is
+`omitempty` in the generated `source_metadata.pb.go`) because this local `file://` fixture has no
+configured remote. That "no remote" condition was itself observed at `--log-level=5`: the same
+scan logged `"repo": "Could not get remote for repo"`. A filesystem scan instead populates
+`message Filesystem` [`L87`]. So the "where" metadata is strongly typed per source, not a flat
+string.
 
 ### (E) Confidence scores — absent
 
@@ -867,10 +873,30 @@ different mechanism from the loose-file content sniff.
 **OBSERVED + source-confirmed (git).** For a Git source (`pkg/sources/git/git.go`), a blob is first
 screened by its **filename** extension — `if common.SkipFile(path) {` [`L1244`] →
 `V(5) "file contains ignored extension"` [`L1245`] — where `path` is the blob path, *not* a content
-sniff. A companion git scan of the same fixture confirms this: `logo.png` is skipped with the
-git-specific message `file contains ignored extension` (`"path":"logo.png"`), distinct from the
-loose-file `skipping file: extension is ignored` message above. Path exclusion is also applied at
-the git-log level via exclude-globs [`L185-187`, `ScanOptionExcludeGlobs`], and binary blobs are
+sniff. A companion git scan of the same fixture confirms this directly. It scans the sibling
+`thog_testrepo` Git repository (built alongside `thog_files`; this corrective capture rebuilt the
+fixture in its own throwaway root, so its `mktemp` suffix differs from the filesystem run above — a
+fixture-specific value, not a content difference). `logo.png` is skipped with the git-specific
+message `file contains ignored extension`, while the loose-file `skipping file: extension is
+ignored` message (emitted by the default handler above) never appears under the git source:
+
+```text
+$ WORK=/tmp/thog_investigation.ZCrEoHBV      # companion git-source capture (its own throwaway fixture root)
+$ /tmp/trufflehog_bin git "file://$WORK/thog_testrepo" --no-verification --log-level=5 \
+      1>"$WORK/captures/q4_git_stdout.log" 2>"$WORK/captures/q4_git_trace.log"; echo "exit=$?"
+exit=0
+$ grep 'file contains ignored extension' "$WORK/captures/q4_git_trace.log"
+2026-07-13T23:10:15Z	info-5	trufflehog	file contains ignored extension	{"source_manager_worker_id": "P430h", "unit_kind": "dir", "unit": "/tmp/thog_investigation.ZCrEoHBV/thog_testrepo", "commit": "9f16472", "path": "logo.png"}
+$ grep -c 'skipping file: extension is ignored' "$WORK/captures/q4_git_trace.log"
+0
+```
+
+The two skip messages come from different code and use different keys: the git blob path logs
+`file contains ignored extension` (`git.go:L1245`, keyed on the blob **filename** via
+`common.SkipFile(path)` at `L1244`), whereas the loose-file/default handler logs `skipping file:
+extension is ignored` (`default.go`, keyed on the **content-sniffed** MIME's canonical extension) —
+which is why that second message's count is `0` under the git source. Path exclusion is also applied
+at the git-log level via exclude-globs [`L185-187`, `ScanOptionExcludeGlobs`], and binary blobs are
 detected with `diff.IsBinary` [`L644`, `L873`]; crucially the binary skip is **conditional**:
 `if s.skipBinaries || feature.ForceSkipBinaries.Load() {` [`L647`, `L876`] → `V(5) "skipping binary
 file"`. Absent the `--force-skip-binaries` flag, binary blobs are **scanned**, not skipped — so
@@ -1827,8 +1853,8 @@ document under `blitzy/documentation/`.
 - **Delivery commit (identified by role):** the branch-HEAD commit that adds/updates this Markdown
   file and **nothing else** — a document cannot embed its own commit hash, so it is named by role
   rather than by hash. The commit graph captured at delivery time shows the documentation commit
-  with the source commit `e42153d4` as its ancestor (this corrective revision adds one further
-  doc-only commit on top of the commit shown):
+  with the source commit `e42153d4` as its ancestor (later corrective revisions add further
+  doc-only commits on top of the commit shown):
 
 ```text
 $ git log --oneline -3
