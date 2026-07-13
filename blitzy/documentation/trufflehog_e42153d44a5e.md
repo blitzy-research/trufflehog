@@ -2,7 +2,7 @@
 
 > **What this document is.** A runtime walkthrough of what the `trufflehog` binary *does once it starts executing* during a minimal filesystem scan &mdash; **not** a file-by-file tour of the source tree. Every behavioral claim is backed by **actual, unedited log output** and the exact command that produced it; every code-level claim cites `file:line` at repository HEAD `e42153d44a5e5c37c1bd0c70e074781e9edcb760`. Three labels are used precisely throughout: **(observed)** = present in the captured log output (or an architect runtime measurement); **(derived)** = read directly from the cited source at this HEAD but **not** surfaced as a log line in this run; **(inferred)** = reasoned from the code path but neither logged nor a direct source quote. Anything not visible in the captured output is therefore marked **(derived)** or **(inferred)** &mdash; never **(observed)**.
 >
-> **How the evidence was produced.** The binary was built from source and run under `--trace` (and, for contrast, `--debug`) against a tiny throwaway directory outside the repository. The captured logs are reproduced verbatim below and are the basis for every answer: the `--debug` transcript is shown **complete** (all 15 lines), while the higher-volume `--trace` evidence is supplied as its **complete structural block**, **three exact scanner-worker samples**, the **exact scanner-line count**, and the **exact final summary line** &mdash; the 128 per-worker `finished scanning chunks` lines are byte-identical apart from a random ID, so three representative lines are shown rather than reproducing all 128.
+> **How the evidence was produced.** The binary was built from source and run under `--trace` (and, for contrast, `--debug`) against a tiny throwaway directory outside the repository. The captured logs are reproduced verbatim below and are the basis for every answer: the `--debug` transcript is shown **complete** for one representative 15-line run (an intermittent 16th overseer line, seen in a minority of runs, is documented in section 8.1), while the higher-volume `--trace` evidence is supplied as its **complete structural block**, **three exact scanner-worker samples**, the **exact scanner-line count**, and the **exact final summary line** &mdash; the 128 per-worker `finished scanning chunks` lines are byte-identical apart from a random ID, so three representative lines are shown rather than reproducing all 128.
 
 ## 1. Overview, Environment, and Exact Commands
 
@@ -12,9 +12,9 @@ Once the binary starts, a single filesystem scan moves through six stages. Stage
 
 1. **Parse CLI flags** and select the `filesystem` sub-command &mdash; *configuration* (section 2). **(derived)** &mdash; the parse itself emits no dedicated line, though the `trufflehog dev` version line (`info-2`) that follows it is **(observed)**.
 2. **Assemble an `engine.Config`** whose detector list is the built-in default set (section 2). **(derived, from [main.go:513-519])** &mdash; config assembly emits no log line of its own.
-3. **Construct the engine** &mdash; `NewEngine` then `setDefaults` then `initialize` &mdash; emitting `default engine options set` then `engine initialized` (section 3). **(observed)**
-4. **Build the Aho-Corasick keyword prefilter** over the default detectors &mdash; `setting up aho-corasick core` then `set up aho-corasick core` (section 4). **(observed)**
-5. **Start four worker pools** &mdash; scanner (128), detector (1024), verificationOverlap (128), notifier (128) &mdash; wired together by buffered channels (section 5). **(observed)**
+3. **Construct the engine** &mdash; emitting `default engine options set` then `engine initialized` **(observed)**; those two `info-4` lines bracket the `NewEngine` &rarr; `setDefaults` &rarr; `initialize` sequence, which is **(derived, from [engine.go:226,336,489])** since the individual function calls are not themselves logged (section 3).
+4. **Build the Aho-Corasick keyword prefilter** &mdash; emitting `setting up aho-corasick core` then `set up aho-corasick core` **(observed)**; that those two lines bracket the construction of a keyword prefilter over the default detectors is **(derived, from [engine.go:529-531] and [ahocorasickcore.go:141])**, not spelled out by the log (section 4).
+5. **Start four worker pools** &mdash; scanner (128), detector (1024), verificationOverlap (128), notifier (128) **(observed &mdash; the four `starting ... workers` count lines)**; that these pools are wired together by buffered channels is **(derived, from [engine.go:515-519,627])**, as the channel wiring emits no line of its own (section 5).
 6. **Stream the source through the pipeline** &mdash; `running source`, `enumerating source`, `chunking unit`, `scanning file` &mdash; then a final `finished scanning` summary is logged (section 5). **(observed)**
 
 The four subsystems the reader asked about map directly onto these stages and are answered, observation-first, in sections 2 through 5.
@@ -27,7 +27,7 @@ The four subsystems the reader asked about map directly onto these stages and ar
 | Platform | `linux/amd64` | |
 | `runtime.NumCPU()` | **128** | Go-runtime logical-CPU count on the investigation host &mdash; the **authoritative** value that **sizes every worker pool and channel buffer** below |
 | `nproc --all` | **128** | Full logical-CPU count on the investigation host, matching `runtime.NumCPU()`, `/proc/cpuinfo` (128 processors), and `Cpus_allowed_list=0-127`. **Plain `nproc` may report a smaller, cgroup-capped value** (e.g. `4` in a CPU-limited container) even though `nproc --all` / `runtime.NumCPU()` report **128**; the Go-runtime value &mdash; not plain `nproc` &mdash; governs the magnitudes below |
-| Go toolchain | **go1.24.2** | validated as a real, canonical release (2025-04-01); matches `toolchain go1.24.2` [go.mod:5]; the module `go` directive is `go 1.23.1` [go.mod:3] (line 4 is blank) |
+| Go toolchain | **go1.24.2** | validated as a real, canonical release &mdash; [go1.24.2, released 2025-04-01, per the official Go release history](https://go.dev/doc/devel/release); matches `toolchain go1.24.2` [go.mod:5]; the module `go` directive is `go 1.23.1` [go.mod:3] (line 4 is blank) |
 
 > **(observed)** `runtime.NumCPU() = 128` is not printed as a standalone line, but it is directly corroborated by the worker counts in section 1.6 &mdash; scanner `128`, detector `1024 = 128 x 8`, verificationOverlap `128`, notifier `128`. It is the single environment fact that makes every magnitude in this document reproducible.
 
@@ -58,12 +58,12 @@ Contrast run (used only to demonstrate log-level gating in section 6):
 ./trufflehog --debug --no-update filesystem /tmp/scan_target
 ```
 
-- `/tmp/scan_target` is a throwaway directory **outside the repository** holding two files: `a.txt` (41 bytes &mdash; it contains the well-known **AWS documentation example key** `AKIAIOSFODNN7EXAMPLE`, a public, non-functional placeholder that AWS publishes in its own documentation) and `b.txt` (39 bytes, benign). 41 + 39 = **80 bytes**, matching the final summary's `"bytes": 80`.
+- `/tmp/scan_target` is a throwaway directory **outside the repository** holding two files: `a.txt` (41 bytes &mdash; it contains the well-known **AWS documentation example key** `AKIAIOSFODNN7EXAMPLE`, a public, non-functional placeholder that AWS publishes in its own documentation &mdash; see the [AWS IAM User Guide, "Manage access keys for IAM users"](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_credentials_access-keys.html)) and `b.txt` (39 bytes, benign). 41 + 39 = **80 bytes**, matching the final summary's `"bytes": 80`.
 - `--no-update` disables **only** the self-updater's binary **download** &mdash; it is **not** an offline guarantee. Secret **verification remains enabled by default** in this run (`Verify: !*noVerification` [main.go:520], where the `--no-verification` flag defaults to false [main.go:59]), and filesystem chunks are a verifiable source (`fileSystemSource.Init(ctx, sourceName, jobID, sourceID, true, &conn, runtime.NumCPU())` [pkg/engine/filesystem.go:33]). This particular benign target simply never produced a live verification candidate (see section 1.5), and the exact updater mechanism is dissected in section 7. `filesystem` is the minimal source command that needs only a local path &mdash; `filesystemScan = cli.Command("filesystem", "Find credentials in a filesystem.")` [main.go:143].
 
 ### 1.5 Empty stdout is *expected*, not a failure (observed)
 
-**Observed:** `stdout` was **empty &mdash; zero findings.** **In this plain-output `filesystem` scan**, the only thing written to `stdout` is secret findings (other modes of the binary &mdash; e.g. `--version` or `--help` &mdash; print their output to **stderr**, not `stdout`, as observed: `--version` yields empty stdout with `trufflehog dev` on stderr, and `--help` yields empty stdout with 4976 bytes on stderr; but this run invoked neither). There were none here because `a.txt` holds an AWS access-key **ID** (`AKIAIOSFODNN7EXAMPLE`, matched by `idPat` [pkg/detectors/aws/access_keys/accesskey.go:65]) with **no accompanying 40-character secret**. The AWS detector appends a result &mdash; `results = append(results, s1)` [pkg/detectors/aws/access_keys/accesskey.go:207] &mdash; *only from inside* the `for secretMatch := range secretMatches` loop [accesskey.go:131], and `secretMatches` is built from `aws.SecretPat` [accesskey.go:115-116], which requires a 40-char `[A-Za-z0-9+/]` run [pkg/detectors/aws/common.go:10]. That run is absent from `a.txt`, so `secretMatches` is empty, the inner loop body never executes, and no `(id, secret)` verification candidate is ever formed **(derived)**. (The hash-shaped false-positive filter `FalsePositiveSecretPat` [pkg/detectors/aws/utils.go:47] is checked at [accesskey.go:202] *inside* that same loop and operates on a matched **secret**, so it is never reached for this input; and the literal `AKIAIOSFODNN7EXAMPLE` appears in **no** false-positive list anywhere in the tree at this HEAD &mdash; `git grep` returns no matches.) Do **not** misread empty stdout as a crash or a misconfiguration: the run succeeded, as the final summary confirms (`"verified_secrets": 0, "unverified_secrets": 0`). All of the runtime signal lives on **stderr** (the structured log), shown next.
+**Observed:** `stdout` was **empty &mdash; zero findings.** **In this plain-output `filesystem` scan**, the only thing written to `stdout` is secret findings (other modes of the binary &mdash; e.g. `--version` or `--help` &mdash; print their output to **stderr**, not `stdout`, as observed: `--version` yields empty stdout with `trufflehog dev` on stderr, and `--help` yields empty stdout with 4976 bytes on stderr; but this run invoked neither). There were none here because `a.txt` holds an AWS access-key **ID** (`AKIAIOSFODNN7EXAMPLE` &mdash; AWS's [published example key](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_credentials_access-keys.html); matched by `idPat` [pkg/detectors/aws/access_keys/accesskey.go:65]) with **no accompanying 40-character secret**. The AWS detector appends a result &mdash; `results = append(results, s1)` [pkg/detectors/aws/access_keys/accesskey.go:207] &mdash; *only from inside* the `for secretMatch := range secretMatches` loop [accesskey.go:131], and `secretMatches` is built from `aws.SecretPat` [accesskey.go:115-116], which requires a 40-char `[A-Za-z0-9+/]` run [pkg/detectors/aws/common.go:10]. That run is absent from `a.txt`, so `secretMatches` is empty, the inner loop body never executes, and no `(id, secret)` verification candidate is ever formed **(derived)**. (The hash-shaped false-positive filter `FalsePositiveSecretPat` [pkg/detectors/aws/utils.go:47] is checked at [accesskey.go:202] *inside* that same loop and operates on a matched **secret**, so it is never reached for this input; and the literal `AKIAIOSFODNN7EXAMPLE` appears in **no** false-positive list anywhere in the tree at this HEAD &mdash; `git grep` returns no matches.) Do **not** misread empty stdout as a crash or a misconfiguration: the run succeeded, as the final summary confirms (`"verified_secrets": 0, "unverified_secrets": 0`). All of the runtime signal lives on **stderr** (the structured log), shown next.
 
 > **Operational-safety nuance (derived, from [main.go:59], [main.go:520], [pkg/engine/filesystem.go:33], and [engine.go:1070-1113]).** Verification is on by default and runs *before* false-positive filtering &mdash; `e.verificationCache.FromData(ctx, data.detector.Detector, data.chunk.Verify, ...)` [engine.go:1070] executes ahead of `results = e.filterResults(ctx, data.detector, results)` [engine.go:1113]. So a real, unfiltered credential in a scan target *could* trigger a live provider request **even under `--no-update`**. The switch that actually guarantees provider-offline scanning is the separate `--no-verification` (which sets `Verify` to false); it was **not** used in the captured runs. `--no-update` and `--no-verification` are independent flags.
 
@@ -122,13 +122,13 @@ Immediately after, **exactly 128** identically-formatted lines follow &mdash; on
 - **Provenance (observed).** Every log block in this document was captured during the investigation run of the binary built at HEAD `e42153d44a5e5c37c1bd0c70e074781e9edcb760` on `linux/amd64` with go1.24.2, and is reproduced verbatim; no output was re-derived, re-formatted, or edited.
 - **Exit status (observed).** Both the `--trace` and the `--debug` invocations exited `0`.
 - **Cleanup and final clean state (observed).** The `/tmp/scan_target` directory and any temporary measurement harness were created **outside** the repository tree and removed after the investigation; the compiled `trufflehog` binary is git-ignored [.gitignore:7]. A final `git status --porcelain` was **empty** &mdash; the source tree was left byte-for-byte unchanged, as the read-only mandate requires.
-- **Detector-count methods (observed).** `len(DefaultDetectors())` = **831** was confirmed two independent ways plus a static cross-check; the methods are itemized in the section 8.2 note.
+- **Detector-count method (measured).** `len(DefaultDetectors())` = **831** (and `len(DefaultDecoders())` = **4**), measured by the reproducible harness embedded in the section 8.2 note &mdash; identical output across repeated runs under go1.24.2.
 - **Non-secret path note (observed).** The `/tmp/blitzy/trufflehog/trufflehog_e42153d44a5e_d5780a/trufflehog` path shown in the `--debug` transcript (section 6) is a volatile, environment-specific working-directory path printed by the overseer supervisor. It contains **no secret** and is expected to differ across environments and runs.
 
 
 ## 2. (a) How configuration is handled
 
-**Observed answer (lead):** Configuration is **CLI-flag-driven**. This run required **no config file**, and none was silently loaded &mdash; there is **no config-related log line** anywhere in section 1.6 because `--config` was not passed. The `filesystem` sub-command plus a directory path were the entire configuration.
+**Observed signal:** there is **no config-related log line** anywhere in section 1.6, and the invocation carried only the `filesystem` sub-command plus a directory path (no `--config`). **Derived from that absence plus the source:** configuration is **CLI-flag-driven** &mdash; no config file was loaded because `--config` was not passed, and even when it *is* supplied the optional YAML path only **appends** custom detectors on top of the built-in defaults (`config.Read` [pkg/config/config.go:18] &rarr; `NewYAML` [pkg/config/config.go:27]). The `filesystem` sub-command plus a directory path were the entire configuration.
 
 **Command (observed):**
 
@@ -159,7 +159,7 @@ Immediately after, **exactly 128** identically-formatted lines follow &mdash; on
 
 ## 3. (b) How the scanning engine initializes
 
-**Observed answer (lead):** Engine setup is bracketed by two `--trace` lines &mdash; `default engine options set` then `engine initialized` (both at `info-4`). Between filling in defaults and finishing initialization, the engine confirms its concurrency (already supplied as **128** by the CLI flag &mdash; see below), chooses its worker multipliers, allocates a small dedup cache, and creates the buffered channels that connect the pipeline.
+**Observed signal:** engine setup is bracketed by two `--trace` lines &mdash; `default engine options set` then `engine initialized` (both at `info-4`). **Derived from the cited source (none of the following steps emits its own log line):** between filling in defaults and finishing initialization, the engine confirms its concurrency (already supplied as **128** by the CLI flag &mdash; see below), chooses its worker multipliers, allocates a small dedup cache, and creates the buffered channels that connect the pipeline.
 
 **Command (observed):**
 
@@ -193,7 +193,7 @@ Immediately after, **exactly 128** identically-formatted lines follow &mdash; on
 
 ## 4. (c) How detectors prepare themselves
 
-**Observed answer (lead):** Detector preparation is the construction of an **Aho-Corasick keyword prefilter** over the default detector set. It is bracketed by two `--trace` lines &mdash; `setting up aho-corasick core` then `set up aho-corasick core` (both at `info-4`).
+**Observed signal:** detector preparation is bracketed by two `--trace` lines &mdash; `setting up aho-corasick core` then `set up aho-corasick core` (both at `info-4`). **Derived (the work between those two lines is not itself logged):** that bracket is the construction of an **Aho-Corasick keyword prefilter** over the default detector set.
 
 **Command (observed):**
 
@@ -212,7 +212,7 @@ Immediately after, **exactly 128** identically-formatted lines follow &mdash; on
 
 - `func NewAhoCorasickCore(allDetectors []detectors.Detector, opts ...CoreOption) *Core` [pkg/engine/ahocorasick/ahocorasickcore.go:141] builds two lookup maps &mdash; `keywordsToDetectors` and `detectorsByKey` (struct fields at [ahocorasickcore.go:133-134]) &mdash; by iterating each detector's `d.Keywords()` and lower-casing every keyword [ahocorasickcore.go:147-152].
 - It then constructs the **Aho-Corasick trie** used as the prefilter: `prefilter: *ahocorasick.NewTrieBuilder().AddStrings(keywords).Build()` [ahocorasickcore.go:159], backed by the third-party library imported as `ahocorasick "github.com/BobuSumisu/aho-corasick"` [ahocorasickcore.go:7].
-- The detectors passed in are the built-in default registry `func DefaultDetectors() []detectors.Detector` [pkg/engine/defaults/defaults.go:1704], assembled by `func buildDetectorList()` [pkg/engine/defaults/defaults.go:839-1702]. **Measured count: 831 default detectors** &mdash; a runtime measurement of `len(DefaultDetectors())`, confirmed two independent ways plus a static cross-check (see the note in section 8.2).
+- The detectors passed in are the built-in default registry `func DefaultDetectors() []detectors.Detector` [pkg/engine/defaults/defaults.go:1704], assembled by `func buildDetectorList()` [pkg/engine/defaults/defaults.go:839-1702]. **Measured count: 831 default detectors** &mdash; a runtime measurement of `len(DefaultDetectors())`; the reproducible harness (source, command, and verbatim `831`/`4` output) is embedded in the section 8.2 note.
 
 **Purpose (observed to inferred):**
 
@@ -220,7 +220,7 @@ Immediately after, **exactly 128** identically-formatted lines follow &mdash; on
 
 ## 5. (d) How the components communicate during a basic run
 
-**Observed answer (lead):** Four worker pools start up (observed &mdash; the four count lines below), then work flows over buffered channels. The common path is **source -> scanner -> detector -> notifier**; additionally the scanner has **two** outgoing paths (derived from the source and traced below &mdash; the single-file target here does not exercise the overlap branch): single-detector chunks go **directly** to the detector pool, while chunks matched by **multiple** detectors detour through the **verificationOverlap** pool first, which then feeds them back into the detector pool. The pool sizes are printed directly:
+**Observed answer (lead):** Four worker pools start up (observed &mdash; the four count lines below), then work flows over buffered channels. The common path is **source -> scanner -> detector -> notifier**; additionally the scanner has **two** outgoing paths (derived from the source and traced below &mdash; this benign two-file target does not exercise the overlap branch, because no chunk here matched more than one detector): single-detector chunks go **directly** to the detector pool, while chunks matched by **multiple** detectors detour through the **verificationOverlap** pool first, which then feeds them back into the detector pool. The pool sizes are printed directly:
 
 ```text
 2026-07-13T15:40:55Z	info-2	trufflehog	starting scanner workers	{"count": 128}
@@ -297,7 +297,7 @@ graph LR
 ./trufflehog --debug --no-update filesystem /tmp/scan_target
 ```
 
-**Complete, unedited `--debug` `stderr` (15 lines):**
+**Complete, unedited `--debug` `stderr` from one representative run (15 lines &mdash; an intermittent 16th overseer line appears in a minority of runs; see section 8.1):**
 
 ```text
 2026/07/13 15:41:20 [updater parent] run
@@ -349,11 +349,11 @@ Everything at `info-3` and above is exactly what `--debug` drops.
 
 ### 8.1 Stability across at least two runs (observed)
 
-- **Three** `--trace` runs each produced the **same 148-line structure** (the same events, in the same order, with the same line count); **two** `--debug` runs each produced the **same 15-line structure**. The runs are **not byte-identical** &mdash; only the volatile fields below differ &mdash; but the startup *structure* is deterministic.
+- **Trace (three runs):** each produced the **same 148-line startup skeleton** &mdash; the same set of events and the same line count. The **structural** lines (version, engine-init, aho-corasick, the four worker-pool counts, the source signals, the final summary) appear in the same order every time; the **only** ordering that varies is which of the two per-file `scanning file` lines prints first &mdash; a concurrency artifact detailed in the file-order note below. **Debug (twenty runs):** the core skeleton was **15 lines** in **16** of the 20 runs; the remaining **4** runs appended a **16th** line **after** `prog exited with 0` &mdash; a benign overseer-supervisor diagnostic, `[updater parent] signal (urgent I/O condition) failed (os: process already finished), assuming child process died unexpectedly` (the parent noticing its already-exited child; the scan itself still exited `0`). The runs are **not byte-identical** &mdash; only the volatile fields below, plus that intermittent trailing `--debug` line, differ &mdash; but the startup *structure* is deterministic.
 - Only volatile fields differ from run to run:
   - **Random worker IDs** &mdash; the `source_manager_worker_id` and the 128 `scanner_worker_id` values, from `common.RandomID(5)` [engine.go:667, source_manager.go:242].
   - **`scan_duration`** &mdash; observed `3.552437ms`, `3.710438ms`, and `3.533323ms`: each is **~3.5 ms**, and the run-to-run **spread is sub-millisecond** (`0.177115 ms` between the fastest and slowest of these three).
-  - **File processing order** &mdash; `a.txt` versus `b.txt` may be chunked / scanned in either order, a concurrency artifact of the worker pools.
+  - **File processing order** &mdash; **enumeration/chunking is deterministic, but scanning is not.** Across 20 `--trace` runs the `chunking unit` lines were emitted `a.txt` then `b.txt` in **all 20** (the source enumerates its units in a fixed order), whereas the **concurrent scanner pool** emitted the two `scanning file` lines `a.txt`-first in **19** runs and `b.txt`-first in **1** &mdash; i.e. the two files may be **scanned in either order**, a concurrency artifact of the worker pool. (An earlier 5-run sample saw `b.txt` scanned first in **2** of 5, confirming the scanning order is genuinely variable rather than fixed.)
 
 ### 8.2 Magnitudes and their provenance (host `runtime.NumCPU() = 128`)
 
@@ -365,13 +365,54 @@ The **Kind** column distinguishes an **observed** value (read straight from a ca
 | Detector workers | 1024 | observed value; multiplier derived | log line [engine.go:678]; `= e.concurrency x e.detectorWorkerMultiplier`, multiplier defaults to **8** [engine.go:345]; `numWorkers` [engine.go:676] (= 128 x 8). |
 | verificationOverlap workers | 128 | observed value; multiplier derived | log line [engine.go:693]; `= e.concurrency x e.verificationOverlapWorkerMultiplier` (multiplier = 1) [engine.go:353, 691]. |
 | Notifier workers | 128 | observed value; multiplier derived | log line [engine.go:708]; `= e.notificationWorkerMultiplier x e.concurrency` (multiplier = 1) [engine.go:349, 706]. |
-| Default detectors loaded | **831** | measured (not from this scan's log) | `len(DefaultDetectors())` [pkg/engine/defaults/defaults.go:1704] &mdash; established by two independent measurements plus a static cross-check (see note). |
-| Default decoders | 4 | derived / measured | `DefaultDecoders()` returns `UTF8, Base64, UTF16, EscapedUnicode` [pkg/decoders/decoders.go:8-15]; assigned in `setDefaults` [engine.go:358]. |
+| Default detectors loaded | **831** | measured (not from this scan's log) | `len(DefaultDetectors())` [pkg/engine/defaults/defaults.go:1704] &mdash; measured by the reproducible harness embedded in the note below (stable across repeated runs under go1.24.2). |
+| Default decoders | 4 | measured (not from this scan's log) | `len(DefaultDecoders())` = **4** by the same harness; `DefaultDecoders()` returns `UTF8, Base64, UTF16, EscapedUnicode` [pkg/decoders/decoders.go:8-15], assigned in `setDefaults` [engine.go:358]. |
 | chunks / bytes | 2 / 80 | observed | final `finished scanning` line. |
 | scan_duration | ~3.5 ms | observed | final line; varies run to run with a **sub-millisecond spread** (see section 8.1). |
 | verified / unverified secrets | 0 / 0 | observed | final line. Zero because `a.txt` holds an AWS access-key **ID** with no paired 40-char secret, so the detector forms no `(id, secret)` candidate and appends nothing [accesskey.go:131, 207] (see section 1.5) **(derived)**. |
 
-> **Detector-count note (measured).** The **831** loaded-default count was established by **two independent runtime measurements** of `len(DefaultDetectors())` [pkg/engine/defaults/defaults.go:1704] at this HEAD with go1.24.2 &mdash; (1) from an **external Go module** that imports the package through a local `replace` directive, and (2) from a **temporary in-module harness** run with `-mod=readonly` (removed afterward, leaving the source tree unchanged) &mdash; both returning 831. A **static** count of the detector entries assembled in `buildDetectorList()` [pkg/engine/defaults/defaults.go:839-1702] independently corroborates the same value. Report **831** as the authoritative *loaded-default* count; the broader "845+" figure that appears in project material is a **catalog** count, not the loaded-default count.
+> **Detector-count note (measured, reproducible).** The **831** loaded-default detector count and the **4** default-decoder count are runtime measurements of `len(DefaultDetectors())` [pkg/engine/defaults/defaults.go:1704] and `len(DefaultDecoders())` [pkg/decoders/decoders.go:8-15] taken at this HEAD with the canonical **go1.24.2** toolchain. `DefaultDetectors()` returns the list assembled by `buildDetectorList()` [pkg/engine/defaults/defaults.go:839-1702]. The measurement is produced by a tiny throwaway Go module created **outside the repository** that imports the two packages through a local `replace` directive pointed at this checkout; it was run repeatedly with **identical** output and then removed, leaving the source tree unchanged. Report **831** as the authoritative *loaded-default* count; the broader "845+" figure that appears in project material is a **catalog** count, not the loaded-default count.
+
+The harness is two files in a temporary directory (e.g. `/tmp/detcount`). The `go 1.23.1` directive (the repository minimum) keeps the module buildable under go1.24.2; `-mod=mod` lets the build resolver populate indirect requirements from the module cache **without** `go mod tidy` (which would raise the directive above 1.24 and break the canonical toolchain):
+
+```go
+// go.mod
+module detcount
+
+go 1.23.1
+
+require github.com/trufflesecurity/trufflehog/v3 v3.0.0
+
+// point the import at the local checkout at this HEAD:
+replace github.com/trufflesecurity/trufflehog/v3 => /abs/path/to/this/checkout
+```
+
+```go
+// main.go
+package main
+
+import (
+	"fmt"
+
+	"github.com/trufflesecurity/trufflehog/v3/pkg/decoders"
+	"github.com/trufflesecurity/trufflehog/v3/pkg/engine/defaults"
+)
+
+func main() {
+	fmt.Printf("default_detectors=%d\n", len(defaults.DefaultDetectors()))
+	fmt.Printf("default_decoders=%d\n", len(decoders.DefaultDecoders()))
+}
+```
+
+Running it (verbatim, unedited output):
+
+```bash
+$ GOTOOLCHAIN=local GOFLAGS=-mod=mod go run .
+default_detectors=831
+default_decoders=4
+```
+
+Repeated invocations print the identical two lines; `GOTOOLCHAIN=local go version` reports `go version go1.24.2 linux/amd64`, and the module's `go` directive remains `go 1.23.1` (not bumped by the resolver). These are the authoritative loaded-default magnitudes cited throughout this document.
 
 ## Appendix &mdash; Citation Index (pinned to HEAD `e42153d44a5e...`)
 
