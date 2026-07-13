@@ -113,10 +113,16 @@ $ go version -m /tmp/trufflehog_bin | grep -E '^\s+build\s+(vcs|-buildmode|CGO|G
 
    The embedded `vcs.revision=e42153d44a5e5c37c1bd0c70e074781e9edcb760` with
    `vcs.modified=false` is the runtime proof that this binary was compiled from the **exact,
-   unmodified source commit** under investigation. `CGO_ENABLED=0` and `-buildmode=exe` are also
-   recorded. This automatic metadata is orthogonal to the `dev` application version above: the
-   former is stamped by the toolchain regardless of ldflags; the latter is a plain package-level
-   constant.
+   unmodified source commit** under investigation. Note that `vcs.revision` and `vcs.time` are
+   **build-time stamps** — the Go toolchain records whichever commit is checked out at the moment
+   `go build` runs — so a reader who rebuilds from a *later* commit (for example, after this answer
+   document itself is committed) will see that later commit's hash and timestamp here instead; the
+   value shown above was captured when the tree was at `e42153d4…`. The invariant that actually
+   matters for the read-only claim is `vcs.modified=false`, which confirms the working tree carried
+   **no local source edits** at build time regardless of which commit is checked out. `CGO_ENABLED=0`
+   and `-buildmode=exe` are also recorded. This automatic metadata is orthogonal to the `dev`
+   application version above: the former is stamped by the toolchain regardless of ldflags; the
+   latter is a plain package-level constant.
 
 ### Static, single-file binary (no dynamic/plugin loading)
 
@@ -161,7 +167,7 @@ The channel of each key command was verified empirically:
 | `--version` | *(empty)* | `trufflehog dev` | 0 |
 | `--help` | *(empty)* | usage text (124 lines) | 0 |
 | `--help-long` | full usage (416 lines) | *(empty)* | 0 |
-| `git … --json` | JSON findings | banner + logs | 0 |
+| `git … --json` | JSON findings | logs (no banner — suppressed by `--json`) | 0 |
 | `git … ` (plain) | plain findings | banner + logs | 0 |
 | `filesystem … --log-level=5` | plain findings | banner + trace logs | 0 |
 
@@ -181,16 +187,27 @@ umask 077                                   # every artifact created owner-only 
 WORK="$(mktemp -d /tmp/thog_investigation.XXXXXXXX)"   # unique, outside the checkout
 trap 'rm -rf "$WORK"' EXIT                   # guaranteed cleanup on shell exit
 # ... validate $WORK is outside the checkout and not a symlink ...
-mkdir -p "$WORK/thog_testrepo" && cd "$WORK/thog_testrepo"
-# create fixture files (see provenance below) ...
+
+# (1) The mixed-type file set lives in a PLAIN (non-git) directory — this is the
+#     directory the Q4 `filesystem` scan targets ("$WORK/thog_files"):
+mkdir -p "$WORK/thog_files" && cd "$WORK/thog_files"
+# create fixture files here (see provenance below) ...
+
+# (2) A separate GIT repository holding the identical files — this is the
+#     directory the Q1/Q3 git-source scans target ("$WORK/thog_testrepo"):
+cp -a "$WORK/thog_files" "$WORK/thog_testrepo"
+cd "$WORK/thog_testrepo"
 git init -q
 git -c user.name='t' -c user.email='t@t.com' add -A
 git -c user.name='t' -c user.email='t@t.com' commit -q -m 'fixture'
 ```
 
-The mixed file set was chosen to hit every scan/skip branch exercised in Q4: a **text** secret
-file, additional **text** files, an **image** (PNG), a **video-named text** file (`.mp4`
-extension whose *content* is text), and a **gzip archive** containing one text member.
+Two sibling directories are therefore created under `$WORK`: **`thog_files`** — a plain,
+non-git directory that the Q4 `filesystem` scan targets — and **`thog_testrepo`** — a Git
+repository of the *identical* files that the Q1/Q3 git-source scans target. The mixed file set
+was chosen to hit every scan/skip branch exercised in Q4: a **text** secret file, additional
+**text** files, an **image** (PNG), a **video-named text** file (`.mp4` extension whose *content*
+is text), and a **gzip archive** containing one text member.
 
 ### Fixture provenance (exact bytes)
 
@@ -392,7 +409,7 @@ empirically across all three non-error modes:
 **OBSERVED — plain mode (banner present), first two stderr lines:**
 
 ```text
-$ /tmp/trufflehog_bin git file:///…/thog_testrepo --log-level=2 2>/tmp/q1_plain.err 1>/dev/null
+$ /tmp/trufflehog_bin git "file://$WORK/thog_testrepo" --log-level=2 2>/tmp/q1_plain.err 1>/dev/null
 $ sed -n '1,2p' /tmp/q1_plain.err
 2026-07-13T18:17:28Z	info-2	trufflehog	trufflehog dev
 🐷🔑🐷  TruffleHog. Unearth your secrets. 🐷🔑🐷
@@ -401,7 +418,7 @@ $ sed -n '1,2p' /tmp/q1_plain.err
 **OBSERVED — `--github-actions` mode (banner STILL present), first two stderr lines:**
 
 ```text
-$ /tmp/trufflehog_bin git file:///…/thog_testrepo --github-actions --log-level=2 2>/tmp/q1_gha.err 1>/dev/null
+$ /tmp/trufflehog_bin git "file://$WORK/thog_testrepo" --github-actions --log-level=2 2>/tmp/q1_gha.err 1>/dev/null
 $ sed -n '1,2p' /tmp/q1_gha.err
 2026-07-13T18:17:30Z	info-2	trufflehog	trufflehog dev
 🐷🔑🐷  TruffleHog. Unearth your secrets. 🐷🔑🐷
@@ -639,19 +656,19 @@ field, `VerificationError`, is `omitempty` and was absent here because there was
 
 | JSON key | Go field (json.go) | Type | Meaning |
 |---|---|---|---|
-| `SourceMetadata` | `SourceMetadata *source_metadatapb.MetaData` (L28) | object | Where the secret was found (source-specific) |
-| `SourceID` | `SourceID sources.SourceID` (L30) | int | Internal source id |
-| `SourceType` | `SourceType sourcespb.SourceType` (L32) | int enum | Source kind (16 = git) |
-| `SourceName` | `SourceName string` (L34) | string | e.g. `trufflehog - git` |
-| `DetectorType` | `DetectorType detectorspb.DetectorType` (L36) | int enum | Detector id (2 = AWS) |
-| `DetectorName` | `DetectorName string` = `r.DetectorType.String()` (L61) | string | e.g. `AWS` |
-| `DetectorDescription` | `DetectorDescription string` (L40) | string | Human description |
-| `DecoderName` | `DecoderName string` = `r.DecoderType.String()` (L63) | string | e.g. `PLAIN` |
-| `Verified` | `Verified bool` (L43) | bool | Live-verification result |
-| *(`VerificationError`)* | `VerificationError string` `json:",omitempty"` (L44) | string | Present only on error |
-| `VerificationFromCache` | `VerificationFromCache bool` (L45) | bool | Whether result came from cache |
-| `Raw` | `Raw string` (L47) | string | Raw matched secret |
-| `RawV2` | `RawV2 string` (L50) | string | Composed id:secret (multi-part secrets) |
+| `SourceMetadata` | `SourceMetadata *source_metadatapb.MetaData` (L29) | object | Where the secret was found (source-specific) |
+| `SourceID` | `SourceID sources.SourceID` (L31) | int | Internal source id |
+| `SourceType` | `SourceType sourcespb.SourceType` (L33) | int enum | Source kind (16 = git) |
+| `SourceName` | `SourceName string` (L35) | string | e.g. `trufflehog - git` |
+| `DetectorType` | `DetectorType detectorspb.DetectorType` (L37) | int enum | Detector id (2 = AWS) |
+| `DetectorName` | `DetectorName string` (L39; value `= r.DetectorType.String()` at L63) | string | e.g. `AWS` |
+| `DetectorDescription` | `DetectorDescription string` (L41) | string | Human description |
+| `DecoderName` | `DecoderName string` (L43; value `= r.DecoderType.String()` at L65) | string | e.g. `PLAIN` |
+| `Verified` | `Verified bool` (L44) | bool | Live-verification result |
+| *(`VerificationError`)* | `VerificationError string` `json:",omitempty"` (L45) | string | Present only on error |
+| `VerificationFromCache` | `VerificationFromCache bool` (L46) | bool | Whether result came from cache |
+| `Raw` | `Raw string` (L48) | string | Raw matched secret |
+| `RawV2` | `RawV2 string` (L51) | string | Composed id:secret (multi-part secrets) |
 | `Redacted` | `Redacted string` (L54) | string | Display-safe form |
 | `ExtraData` | `ExtraData map[string]string` (L55) | object | Detector-specific extras |
 | `StructuredData` | `StructuredData *detectorspb.StructuredData` (L56) | object/null | Optional structured payload |
@@ -670,9 +687,9 @@ Git keys= ['commit', 'file', 'email', 'timestamp', 'line']
 
 **OBSERVED.** In the captured finding: `"Verified": false` and `"VerificationFromCache": false`.
 **INFERRED — source-confirmed.** These come from `Verified`/`VerificationFromCache` (json.go
-L43/L45); a third field `VerificationError` (L44) is emitted **only** when verification actually
+L44/L46); a third field `VerificationError` (L45) is emitted **only** when verification actually
 errored (it uses `json:",omitempty"`, and the `Print` method computes it from
-`r.VerificationError()` at L20-L24). Here verification returned a clean "not live" result, so no
+`r.VerificationError()` at L20-L25). Here verification returned a clean "not live" result, so no
 error key appears.
 
 ### (D) "Where was it found" metadata — present and source-shaped
@@ -735,10 +752,14 @@ depending on how the content is reached, and they use **different keys**:
    an archive, each member is checked by its **archive filename**, its size against a 2 GB cap, and
    whether it is a directory/symlink — before (and independently of) any content sniff, and only up
    to a maximum nesting depth of 10.
-3. **Git source — path exclude-globs, plus a *conditional* binary skip.** A Git scan can exclude
-   paths by glob at the git-log level, and it detects binary blobs — but it only *skips* binaries
-   when `--no-binaries`/`skipBinaries` (or a force-skip feature flag) is set; otherwise binary blobs
-   are scanned.
+3. **Git source — a filename-based ignored-extension check, path exclude-globs, plus a
+   *conditional* binary skip.** A Git scan first drops any blob whose **filename** extension is in
+   the ignored set — `common.SkipFile(path)` keyed on the blob **path** (not a content sniff),
+   logging `file contains ignored extension` (this is what skips `logo.png` under the git source,
+   as opposed to the loose-file content-MIME path above). It can also exclude paths by glob at the
+   git-log level, and it detects binary blobs — but it only *skips* binaries when the
+   `--force-skip-binaries` flag (internally `skipBinaries` / `feature.ForceSkipBinaries`) is set;
+   otherwise binary blobs are scanned.
 
 ### The exact run (absolute paths, offline, trace verbosity)
 
@@ -843,13 +864,17 @@ filtered **before** content handling, by member metadata:
 That is why the observed archive descent stops at `depth: 2` and screens members by name/size — a
 different mechanism from the loose-file content sniff.
 
-**INFERRED — source-confirmed (git).** For a Git source (`pkg/sources/git/git.go`), path exclusion
-is applied at the git-log level via exclude-globs [`L185-187`, `ScanOptionExcludeGlobs`], and binary
-blobs are detected with `diff.IsBinary` [`L644`, `L873`]; crucially the skip is **conditional**:
+**OBSERVED + source-confirmed (git).** For a Git source (`pkg/sources/git/git.go`), a blob is first
+screened by its **filename** extension — `if common.SkipFile(path) {` [`L1244`] →
+`V(5) "file contains ignored extension"` [`L1245`] — where `path` is the blob path, *not* a content
+sniff. A companion git scan of the same fixture confirms this: `logo.png` is skipped with the
+git-specific message `file contains ignored extension` (`"path":"logo.png"`), distinct from the
+loose-file `skipping file: extension is ignored` message above. Path exclusion is also applied at
+the git-log level via exclude-globs [`L185-187`, `ScanOptionExcludeGlobs`], and binary blobs are
+detected with `diff.IsBinary` [`L644`, `L873`]; crucially the binary skip is **conditional**:
 `if s.skipBinaries || feature.ForceSkipBinaries.Load() {` [`L647`, `L876`] → `V(5) "skipping binary
-file"`. Absent those flags, binary blobs are **scanned**, not skipped — so "binary ⇒ skipped" is not
-universally true for the Git source. (This run used the `filesystem` source, so the git path is
-source-confirmed rather than exercised here.)
+file"`. Absent the `--force-skip-binaries` flag, binary blobs are **scanned**, not skipped — so
+"binary ⇒ skipped" is not universally true for the Git source.
 
 ### (D) Complete, unedited trace (172 lines)
 
@@ -1683,12 +1708,13 @@ analyze
 ### (F) Scannable source commands (from `--help-long`)
 
 **OBSERVED — the source/sub-command lines extracted from the long help** (with their line numbers
-in the 416-line output). Note `analyze` (L412) is included — an earlier grep that appended a
-trailing space to its pattern missed this bare, flagless command; the corrected extraction
-(`( |$)`) captures it:
+in the 416-line output). Two details make this extraction exact: the command-name character class
+includes a digit range (`[a-z0-9-]+`) so the numeric command `s3` (L194) is captured — a plain
+`[a-z-]+` class would drop it — and the trailing alternation (`( |$)`) matches the bare, flagless
+`analyze` command (L412) that a trailing-space-only pattern would miss:
 
 ```text
-$ grep -nE '^[a-z]' helplong_stdout.txt | grep -E '^[0-9]+:[a-z-]+( |$)'
+$ grep -nE '^[a-z]' helplong_stdout.txt | grep -E '^[0-9]+:[a-z0-9-]+( |$)'
 71:help [<command>...]
 75:git [<flags>] <uri>
 98:github [<flags>]
