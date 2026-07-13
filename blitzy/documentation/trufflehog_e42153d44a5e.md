@@ -2,7 +2,7 @@
 
 > **Scope note.** This is a **read-only, explain-only** investigation. No source, test, configuration, or build file was modified; the only file this investigation writes is **this document** (under `blitzy/`). The read-only guarantee is proven durably in §10: the tree is identical to the pinned source commit `e42153d44a5e5c37c1bd0c70e074781e9edcb760` (dated 2025-05-05) except for this `blitzy/` document.
 >
-> **What "observed" means here.** A claim is **observed** only when it is a value the program *emitted* and I captured verbatim: result **counts**, `DecoderName` strings, `line` numbers, `VerificationError` text, log lines, and process **exit statuses**. Everything that reasons about *why* the program produced those values from its internal structure — the dedupe-vs-overlap **ordering** (§6.5), the **cause** of the surviving-decoder race and why it persists at `--concurrency=1` (§5.5/§6.6/F9), and which result **carries** the overlap annotation (§5.10) — is grounded in `file:line` source and labeled **(inferred / source-derived)**. Every console block below is **complete and unedited** and shows **both stdout and stderr** (volatile values — timestamps, `scan_duration`, per-run worker IDs — are shown exactly as observed). All investigation artifacts (the built binary, crafted inputs, copied fixtures, scripts) lived **outside** the repository tree under `/tmp` and were removed on completion (§10).
+> **What "observed" means here.** A claim is **observed** only when it is a value the program *emitted* and I captured verbatim: result **counts**, `DecoderName` strings, `line` numbers, `VerificationError` text, log lines, and process **exit statuses**. Everything that reasons about *why* the program produced those values from its internal structure — the dedupe-vs-overlap **ordering** (§6.5), the **cause** of the surviving-decoder race and why it persists at `--concurrency=1` (§5.5/§6.6/§12.3), and which result **carries** the overlap annotation (§5.10) — is grounded in `file:line` source and labeled **(inferred / source-derived)**. Every console block below is **complete and unedited** and shows **both stdout and stderr** (volatile values — timestamps, `scan_duration`, per-run worker IDs — are shown exactly as observed). All investigation artifacts (the built binary, crafted inputs, copied fixtures, scripts) lived **outside** the repository tree under `/tmp` and were removed on completion (§10).
 
 ---
 
@@ -19,7 +19,7 @@
 - **Q3 — Overlap detection.** It occurs **only when two or more *different* detectors match the same chunk** and `--allow-verification-overlap` is off [`pkg/engine/engine.go:796`]. It **never fired for the lone AWS key** — grep count `0` across **all eight** single-key cases A–H (§5.10). Driving a two-detector config reproduces it: the offending result carries the verification error `errOverlap` [`pkg/engine/engine.go:39`, set at `:988`].
 - **Q4 — Deduplication effect.** A 512-entry LRU in `notifierWorker` collapses **same-key / different-decoder** repeats [`pkg/engine/engine.go:1216-1221`]. The key is `DetectorType + Raw + RawV2 + SourceMetadata` (it **includes the computed line number** and **excludes** the decoder type). Equal computed lines → one result; different computed lines → both survive. It does **not** change the count of the overlap case (that is a separate annotation).
 - **Q5 — Ordering.** **Deduplication happens *after* overlap detection.** Overlap routing/annotation is a Stage-3 pass in `scannerWorker`/`verificationOverlapWorker`; the LRU dedupe is a later Stage-4 pass in `notifierWorker` consuming `e.results` [`pkg/engine/engine.go:1186` → `:1190`]. **(inferred / source-derived** from the channel producer→consumer stage order; consistent with every observation and the `docs/concurrency.md` worker order.**)**
-- **Q6 — One-vs-many variability.** The dedupe key includes the **computed line number** but **not** the decoder type, so collapse-vs-survive depends on whether the two encodings resolve to the **same computed first-occurrence line** — which is **not** the same as their physical placement. Because `Base64` rebuilds the chunk *in place* keeping the surrounding plaintext, within one chunk the `PLAIN` and `BASE64` views both report the **plaintext's** line (the first `Raw` occurrence). So raw-then-Base64 layouts (Cases A, G, H) **collapse to 1** and *which decoder type survives is a genuine race*; a Base64-**before**-plaintext layout (Case D) keeps two distinct lines and **survives as 2**; and encodings split across **different chunks** (Case F) get distinct lines and survive (**3** results). The surviving-decoder race **persists even at `--concurrency=1`** (§5.5, §6.6, F9).
+- **Q6 — One-vs-many variability.** The dedupe key includes the **computed line number** but **not** the decoder type, so collapse-vs-survive depends on whether the two encodings resolve to the **same computed first-occurrence line** — which is **not** the same as their physical placement. Because `Base64` rebuilds the chunk *in place* keeping the surrounding plaintext, within one chunk the `PLAIN` and `BASE64` views both report the **plaintext's** line (the first `Raw` occurrence). So raw-then-Base64 layouts (Cases A, G, H) **collapse to 1** and *which decoder type survives is a genuine race*; a Base64-**before**-plaintext layout (Case D) keeps two distinct lines and **survives as 2**; and encodings split across **different chunks** (Case F) get distinct lines and survive (**3** results). The surviving-decoder race **persists even at `--concurrency=1`** (§5.5, §6.6, §12.3).
 
 ---
 
@@ -634,7 +634,7 @@ $ grep -rin 'MaxDecodeDepth' pkg/ | wc -l
 0
 ```
 
-`DefaultDecoders()` returns exactly four decoders and the scanner loops over them once per chunk (no re-feeding of decoder output) [`pkg/decoders/decoders.go:8-16`, `pkg/engine/engine.go:784-786`]. The HEAD commit `e42153d44a5e…` is dated 2025-05-05, predating those newer features.
+`DefaultDecoders()` returns exactly four decoders and the scanner loops over them once per chunk (no re-feeding of decoder output) [`pkg/decoders/decoders.go:8-16`, `pkg/engine/engine.go:784-786`]. The pinned source commit `e42153d44a5e…` is dated 2025-05-05, predating those newer features.
 
 ---
 
@@ -649,7 +649,15 @@ absent: /tmp/th
 absent: /tmp/th_investigation
 absent: /tmp/th_probe
 absent: /tmp/th_evidence
+# Durable read-only proof (reproduces at any time): NO source/test/config/build file differs
+# from the pinned source commit — the source-excluded diff prints nothing.
 $ git -C /tmp/blitzy/trufflehog/blitzy-d46ccd01-34ea-4c14-ab97-a0973ab3aa05_051aa8 diff --stat e42153d44a5e5c37c1bd0c70e074781e9edcb760 -- ':(exclude)blitzy/'
+# Committed-form proof (reproduces after this document is committed): the ONLY path that
+# differs from the pinned source commit is this document.
+$ git -C /tmp/blitzy/trufflehog/blitzy-d46ccd01-34ea-4c14-ab97-a0973ab3aa05_051aa8 diff --name-only e42153d44a5e5c37c1bd0c70e074781e9edcb760 HEAD
+blitzy/documentation/trufflehog_e42153d44a5e.md
+# Authoring-time (pre-commit) working-tree snapshot: while this document was being written it
+# showed as one unstaged modification; once it is committed this command prints nothing.
 $ git -C /tmp/blitzy/trufflehog/blitzy-d46ccd01-34ea-4c14-ab97-a0973ab3aa05_051aa8 status --porcelain
  M blitzy/documentation/trufflehog_e42153d44a5e.md
 ```
@@ -657,7 +665,7 @@ $ git -C /tmp/blitzy/trufflehog/blitzy-d46ccd01-34ea-4c14-ab97-a0973ab3aa05_051a
 Notes:
 
 - The overlap fixtures were **copied** (never moved or modified) from `pkg/engine/testdata/`; the source tree diff stayed empty throughout (§3).
-- The empty `git diff --stat … -- ':(exclude)blitzy/'` is the durable read-only proof: **no** source/test/config/build file differs from the pinned commit. The only working-tree change is this document (`M blitzy/documentation/trufflehog_e42153d44a5e.md`).
+- Two of the proofs above **reproduce at any time** and are the durable read-only guarantee: the empty `git diff --stat … -- ':(exclude)blitzy/'` (**no** source/test/config/build file differs from the pinned commit) and the committed-form `git diff --name-only … HEAD` (the **only** path that differs from the pinned commit is this document). The final `git status --porcelain` line is the **authoring-time (pre-commit)** working-tree snapshot — it showed this document as one unstaged modification while it was being written, and prints nothing once the document is committed.
 - The Go build/module caches used to compile the binary live **outside** both the repository and `/tmp` — `GOCACHE=/root/.cache/go-build`, `GOMODCACHE=/root/go/pkg/mod`, `GOPATH=/root/go` — and are shared, pre-warmed toolchain state; they were read during `go build` but not created or modified by this investigation, and are intentionally left untouched.
 - The `/app` directory was never inspected.
 
