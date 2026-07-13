@@ -447,7 +447,7 @@ Line: 1
 2026-07-13T18:52:53Z	info-0	trufflehog	finished scanning	{"chunks": 1, "bytes": 235, "verified_secrets": 0, "unverified_secrets": 1, "scan_duration": "5.71502ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
 ```
 
-**Observed:** the `Detector Type` is now `AWSSessionKey` (not `AWS`), with `Raw result: ASIAZ3JQK7X1YWVUT5RQ`. **Inferred:** `ASIA` is handled by a **separate** detector whose id regex `idPat = \b((?:ASIA)[A-Z0-9]{16})\b` `[pkg/detectors/aws/session_keys/sessionkey.go:L61]` and single keyword `"ASIA"` `[pkg/detectors/aws/session_keys/sessionkey.go:L67]` differ from the access-key detector; its `Result.Raw` is the id `[pkg/detectors/aws/session_keys/sessionkey.go:L115-L119]` (`Raw` at `[pkg/detectors/aws/session_keys/sessionkey.go:L116]`). The session detector imposes **two additional gates** the access-key detector does not: (a) a session-token entropy floor `< 4.5` `[pkg/detectors/aws/session_keys/sessionkey.go:L108]`, and (b) `checkSessionToken` `[pkg/detectors/aws/session_keys/sessionkey.go:L291-L297]`, which **rejects** the token unless it contains the marker `"YXdz"` **or** `"Jb3JpZ2luX2Vj"` **and** does **not** contain the secret. The fixture's token begins with `YXdz` precisely to pass gate (b). This is why an `ASIA` credential is *reported differently* (as `AWSSessionKey`), and why an `ASIA` id lacking a qualifying session token would be missed by this detector.
+**Observed:** the `Detector Type` is now `AWSSessionKey` (not `AWS`), with `Raw result: ASIAZ3JQK7X1YWVUT5RQ`. **Inferred:** `ASIA` is handled by a **separate** detector whose id regex `idPat = \b((?:ASIA)[A-Z0-9]{16})\b` `[pkg/detectors/aws/session_keys/sessionkey.go:L61]` and single keyword `"ASIA"` `[pkg/detectors/aws/session_keys/sessionkey.go:L67-L69]` differ from the access-key detector; its `Result.Raw` is the id `[pkg/detectors/aws/session_keys/sessionkey.go:L115-L119]` (`Raw` at `[pkg/detectors/aws/session_keys/sessionkey.go:L117]`). The session detector imposes **two additional gates** the access-key detector does not: (a) a session-token entropy floor `< 4.5` `[pkg/detectors/aws/session_keys/sessionkey.go:L108]`, and (b) `checkSessionToken` `[pkg/detectors/aws/session_keys/sessionkey.go:L291-L297]`, which **rejects** the token unless it contains the marker `"YXdz"` **or** `"Jb3JpZ2luX2Vj"` **and** does **not** contain the secret. The fixture's token begins with `YXdz` precisely to pass gate (b). This is why an `ASIA` credential is *reported differently* (as `AWSSessionKey`), and why an `ASIA` id lacking a qualifying session token would be missed by this detector.
 
 ## Section 3 — Q2: Does encoding a secret before committing fool the scanner?
 
@@ -725,7 +725,7 @@ $ ... hash_secret (filtered_unverified) ->  0
 
 **Inferred (source-derived) — the overlap gate.** In the decoder loop, `matchingDetectors := e.AhoCorasickCore.FindDetectorMatches(decoded.Chunk.Data)` `[pkg/engine/engine.go:L795]` is followed by the gate `if len(matchingDetectors) > 1 && !e.verificationOverlap {` `[pkg/engine/engine.go:L796]`, whose body routes the results to `verificationOverlapWorker` `[pkg/engine/engine.go:L924]`. There, when a result is judged a `likelyDuplicate` `[pkg/engine/engine.go:L887]` — i.e. their `similarity` is **strictly greater than** the `similarityThreshold` of `0.9`: `if similarity > similarityThreshold` `[pkg/engine/engine.go:L914]` (threshold at `[pkg/engine/engine.go:L888]`) — the engine calls `res.SetVerificationError(errOverlap)` `[pkg/engine/engine.go:L988]`. That is a **single positional argument** (`errOverlap`); the method signature is `func (r *Result) SetVerificationError(err error, secrets ...string)` `[pkg/detectors/detectors.go:L126]`, whose variadic `secrets` is unused at this call site. The warning text is `errOverlap` `[pkg/engine/engine.go:L39-L42]`, and the printer renders it via `Verification issue: %s` `[pkg/output/plain.go:L57]`.
 
-**The two overlapping detectors (Inferred).** `ShodanKey` uses `keyPat = PrefixRegex(["shodan"]) + \b([a-zA-Z0-9]{32})\b` `[pkg/detectors/shodankey/shodankey.go:L25]` with keyword `"shodan"` `[pkg/detectors/shodankey/shodankey.go:L30]` and `Raw` = the 32-char match `[pkg/detectors/shodankey/shodankey.go:L45]`; `TomorrowIO` uses `keyPat = PrefixRegex(["tomorrow"]) + \b([a-zA-Z0-9]{32})\b` `[pkg/detectors/tomorrowio/tomorrowio.go:L24]` with keyword `"tomorrow"` `[pkg/detectors/tomorrowio/tomorrowio.go:L29]` and `Raw` = the 32-char match `[pkg/detectors/tomorrowio/tomorrowio.go:L44]`. Both share the identical `[a-zA-Z0-9]{32}` shape, so the single token matches both and produces two results with the **same** `Raw` — the overlap condition.
+**The two overlapping detectors (Inferred).** `ShodanKey` uses `keyPat = PrefixRegex(["shodan"]) + \b([a-zA-Z0-9]{32})\b` `[pkg/detectors/shodankey/shodankey.go:L25]` with keyword `"shodan"` `[pkg/detectors/shodankey/shodankey.go:L30-L32]` and `Raw` = the 32-char match `[pkg/detectors/shodankey/shodankey.go:L45]`; `TomorrowIO` uses `keyPat = PrefixRegex(["tomorrow"]) + \b([a-zA-Z0-9]{32})\b` `[pkg/detectors/tomorrowio/tomorrowio.go:L24]` with keyword `"tomorrow"` `[pkg/detectors/tomorrowio/tomorrowio.go:L29-L31]` and `Raw` = the 32-char match `[pkg/detectors/tomorrowio/tomorrowio.go:L44]`. Both share the identical `[a-zA-Z0-9]{32}` shape, so the single token matches both and produces two results with the **same** `Raw` — the overlap condition.
 
 ### Q4-A — Default: overlap disables verification and attaches the warning
 
@@ -844,9 +844,9 @@ Every mechanism, function, flag, file, and named example referenced by the four 
 | `GetAccountNumFromID` (account decode) | `pkg/detectors/aws/utils.go:L49` | Q1-G |
 | Session-key id regex `idPat` (ASIA) | `pkg/detectors/aws/session_keys/sessionkey.go:L61` | Q1-H |
 | Session-key `sessionPat` | `pkg/detectors/aws/session_keys/sessionkey.go:L62` | Q1-H |
-| Session-key `Keywords()` (ASIA) | `pkg/detectors/aws/session_keys/sessionkey.go:L67` | Q1-H |
+| Session-key `Keywords()` (ASIA) | `pkg/detectors/aws/session_keys/sessionkey.go:L67-L69` | Q1-H |
 | Session-token entropy floor (< 4.5) | `pkg/detectors/aws/session_keys/sessionkey.go:L108` | Q1-H |
-| Session-key `Result.Raw = idMatch` | `pkg/detectors/aws/session_keys/sessionkey.go:L115-L119` (`Raw` `:L116`) | Q1-H |
+| Session-key `Result.Raw = idMatch` | `pkg/detectors/aws/session_keys/sessionkey.go:L115-L119` (`Raw` `:L117`) | Q1-H |
 | `checkSessionToken` (marker OR-gate + secret-containment reject) | `pkg/detectors/aws/session_keys/sessionkey.go:L291-L297` | Q1-H |
 
 **Q2 — decoder pipeline, base64 internals, gzip archive layer, version divergence**
@@ -897,8 +897,8 @@ Every mechanism, function, flag, file, and named example referenced by the four 
 | `SetVerificationError(errOverlap)` (single arg) | `pkg/engine/engine.go:L988` | Q4 intro |
 | `SetVerificationError` signature (variadic unused) | `pkg/detectors/detectors.go:L126` | Q4 intro |
 | `PrefixRegex` helper | `pkg/detectors/detectors.go:L230` | Q4 intro |
-| ShodanKey `keyPat` / `Keywords` / `Raw` | `pkg/detectors/shodankey/shodankey.go:L25`, `:L30`, `:L45` | Q4 intro |
-| TomorrowIO `keyPat` / `Keywords` / `Raw` | `pkg/detectors/tomorrowio/tomorrowio.go:L24`, `:L29`, `:L44` | Q4 intro |
+| ShodanKey `keyPat` / `Keywords` / `Raw` | `pkg/detectors/shodankey/shodankey.go:L25`, `:L30-L32`, `:L45` | Q4 intro |
+| TomorrowIO `keyPat` / `Keywords` / `Raw` | `pkg/detectors/tomorrowio/tomorrowio.go:L24`, `:L29-L31`, `:L44` | Q4 intro |
 
 **Default printer (`pkg/output/plain.go`) — output fields quoted throughout**
 
