@@ -48,10 +48,11 @@ detector regex to exponential time.
 **But the answer is not a flat "no," and three qualifications matter for a CI gate:**
 
 1. **A crafted file inflates scan time by a large, bounded factor.** At an identical 10,485,760-byte
-   (10 MiB) size, a keyword-fan-out file scanned in **~10.70 s median** versus **~0.153 s** for
-   equivalent-size normal prose — a **~69.8× slowdown on this host** **[observed, §6]**. Scaled up,
-   a 40 MiB crafted file took **~44.3 s** **[observed, §7]**. That is finite and linear, but tens of
-   seconds for one file is easily enough to blow an external per-step CI wall-clock budget.
+   (10 MiB) size, a keyword-fan-out file scanned in **~9.82 s median** versus **~0.15 s** for
+   equivalent-size normal prose — a **~64× slowdown on this host** (observed **52–74×** across runs;
+   the sub-200 ms baseline is the noisy denominator) **[observed, §6]**. Scaled up, a 40 MiB crafted
+   file took **~44 s** **[observed, §7]**. That is finite and linear, but tens of seconds for one file
+   is easily enough to blow an external per-step CI wall-clock budget.
 
 2. **The relevant timeout is not the one you would configure, and it does not preempt work.** By
    default, any chunk that matches **more than one** detector is routed to a first stage,
@@ -72,7 +73,7 @@ detector regex to exponential time.
 
 **Bottom line for the CI decision.** TruffleHog will not *hang forever* on a crafted single file,
 and it cannot be driven to exponential blow-up through its detector patterns. It **can** be made to
-spend tens of seconds on a single small file — a bounded, linear amplification (~70× at 10 MiB on
+spend tens of seconds on a single small file — a bounded, linear amplification (~64× at 10 MiB on
 this host) that a hostile committer could stack across many files and that is **not** cut short by
 the per-detector timeouts. Treat TruffleHog's internal controls as insufficient on their own for a
 hard CI time budget; wrap the scan in an **external** wall-clock/CPU/memory limit and constrain what
@@ -85,7 +86,7 @@ gets scanned (file-size/type filters, archive/history controls). See §9.
 | Q1 | Can a crafted file hang / time out / block the scan? | **No unbounded hang; yes to a bounded multi-second-to-multi-tens-of-seconds inflation that can exceed an external CI budget. Per-detector timeouts do not preempt.** | §3 (two-stage path, 866 non-preemptive watchdog fires) |
 | Q2 | Is pattern matching vulnerable to computational-complexity attacks? | **Not to exponential/catastrophic ReDoS** (RE2-class linear engines); **yes to bounded linear amplification** via fan-out/decoders. | §4 (engine survey, classic payload at baseline speed) |
 | Q3 | Which detector patterns, if any, are exploitable? | **None to exponential time.** Permissive patterns exist (`.*`, wide bounded quantifiers) but stay linear; keyword *fan-out* (many detectors firing per chunk) is the real amplifier, not any one regex. | §5 (AST survey + valid JDBC/Docker/GitHub firing) |
-| Q4 | How much slower than normal files of equal size? | **~69.8× at 10 MiB** (keyword fan-out); ~55.5× (Base64), ~4.5× (quantifier), all vs equal-size prose. Linear in input size. | §6 (equal-size distributions, linearity) |
+| Q4 | How much slower than normal files of equal size? | **~64× at 10 MiB** (keyword fan-out; 52–74× across runs); **~27×** (Base64); a keyword-bearing quantifier only **~2.6×**, and keyword-free quantifier stress is **0.53× — *faster* than prose**. Linear in input size. | §6 (equal-size distributions, linearity) |
 | Q5 | Timing + CPU-profiling evidence? | Provided: `scan_duration` telemetry + concurrent pprof (on-CPU) and fgprof (off-CPU) profiles; RE2 via WASM dominates on-CPU; `regexp2` never executes. | §7 (profiles, dependency closure) |
 
 ---
@@ -447,7 +448,7 @@ detectors therefore fans out to hundreds of `FromData` calls per chunk. The §7 
 this signature: the CPU peek under `verificationOverlapWorker` spreads across dozens of small
 detectors (`mapbox` 3.72 %, `snowflake` 2.31 %, `couchbase` 2.04 %, `azure_cosmosdb` 1.23 %, `jdbc`
 0.6 %, `mailgun` 0.6 %, `boxoauth` 0.36 %, …) rather than concentrating in one **[observed, §7]**.
-This is linear in (chunks × firing-detectors) and is the mechanism behind the ~70× slowdown in §6.
+This is linear in (chunks × firing-detectors) and is the mechanism behind the ~64× slowdown in §6.
 
 ### 5.3 The permissive patterns, inspected
 
@@ -461,9 +462,13 @@ under RE2/stdlib:
 | GitHub (github_old.go:30) | `(?i)(?:github\|gh\|pat\|token)[^\.].{0,40}[ =:'"]+([a-f0-9]{40})\b` | `.{0,40}` wide bounded gap | Bounded (≤40); linear |
 
 **[observed]** Driving long adversarial strings through these via the real scan path produced the
-timings in §6 (e.g. the "quantifier stress" file — a worst-case shape for wide bounded quantifiers —
-came in at **~0.69 s / 4.5×**, far below the keyword-fan-out file). No pattern exhibited super-linear
-growth. **[inferred]** The "worst offender" for *processing time* is therefore not a single regex but
+timings in §6. A *keyword-free* pure-`A` quantifier-stress file (the classic "wide bounded quantifier"
+shape) actually scanned **~0.08 s — 0.53×, i.e. FASTER than prose**: with no detector keyword present
+it clears the Aho-Corasick prefilter almost immediately and triggers virtually no fan-out. Attaching a
+real keyword (`jdbc:mysql://` + a 4096-char unbroken `A` run) raised it only to **~0.40 s / ~2.6×** —
+still far below the keyword-fan-out file, and that increase is fan-out, **not** quantifier
+backtracking. No pattern exhibited super-linear growth. **[inferred]** The "worst offender" for
+*processing time* is therefore not a single regex but
 the **aggregate fan-out**; if one must be named, the keyword-rich detectors that fire on generic
 tokens (e.g. `mapbox`, per the profile) dominate the per-chunk cost, but each remains linear.
 
@@ -476,10 +481,14 @@ tokens (e.g. `mapbox`, per the profile) dominate the per-chunk cost, but each re
 normal files of equivalent size?"*
 
 **Direct answer (this host).** At an identical **10,485,760-byte (10 MiB)** size, the worst crafted
-file (keyword fan-out) scanned **~69.8× slower** than equivalent-size normal prose; Base64
-amplification **~55.5×**; quantifier stress **~4.5×**. The amplification is **bounded and linear** in
-input size (§6.3) — there is no super-linear cliff. These are measurements on this 4-CPU host, not
-universal constants; the *ratio* is the transferable quantity, the absolute seconds are host-specific.
+file (keyword fan-out) scanned **~64× slower** than equivalent-size normal prose (observed **52–74×**
+across runs — the sub-200 ms baseline is the noisy denominator, so the ratio wobbles run-to-run while
+the crafted-file absolute time is stable). Base64 amplification is **~27×**; a *keyword-bearing*
+quantifier-stress file only **~2.6×**. Pure quantifier stress with **no** keyword is actually
+**~0.5× — i.e. FASTER than the baseline** (§6.2), because a keyword-free file triggers almost no
+detector fan-out. The amplification is **bounded and linear** in input size (§6.3) — there is no
+super-linear cliff. These are measurements on this 4-CPU host, not universal constants; the *ratio*
+is the transferable quantity, the absolute seconds are host-specific.
 
 ### 6.1 Inputs — generators, exact sizes, and hashes
 
@@ -488,14 +497,14 @@ not size. Each was produced by a deterministic generator (full script in the App
 
 | File | Bytes | SHA-256 | Shape |
 |------|-------|---------|-------|
-| `baseline_prose_10mib.txt` | 10,485,760 | `4eb3be58e78fc099417f5bbe3dd687c4bdd11fc6f376507068221765b2e64d87` | Natural-language prose (normal file) |
-| `crafted_keywords_10mib.txt` | 10,485,760 | `046139ddb36a3dd83fb92afa5f1a0b8b7f6950193be4050e8dfaac1562149ced` | 908 detector keywords repeated (max fan-out) |
-| `crafted_base64_10mib.txt` | 10,485,760 | `bad8f118f38c14ab04f6109f5ad60ed131c7f9dcab6193231d32d976a4d2dc6f` | Valid Base64 of keyword blocks (decoder re-scan) |
-| `crafted_quantifier_10mib.txt` | 10,485,760 | `501e1c03fd2ef62482289fd7d3948d2ab403252da4637a3065829683580ab7d6` | Long runs stressing wide bounded quantifiers |
-| `crafted_keywords_40mib.txt` | 41,943,040 | `6c3ed13a079c214d5a33e7b434934477e9d2f20c5daf4bdcb0856ada0aab2672` | 40 MiB keyword file (profiling scale, §7) |
+| `baseline_prose_10mib.txt` | 10,485,760 | `d1bf8b3541370cea6dff8ace8b369b2eab73fba2eab18fe8f02a3daba6efe320` | Natural-language prose (normal file) |
+| `crafted_keywords_10mib.txt` | 10,485,760 | `3b0d41593566dad38a86b8cd75ac62a0cc3ea1f4f4bc7430f24d8fc783a89ff9` | 938 detector keywords repeated (max fan-out) |
+| `crafted_base64_10mib.txt` | 10,485,760 | `d0f5da299086cfc76417f631b16331ce4884fc90010238be9ee2b801e32e3a82` | Valid Base64 of the keyword blob (decoder re-scan) |
+| `crafted_quantifier_10mib.txt` | 10,485,760 | `5215fda3ea1fa03199357342502d7c19fbe78a89cfbc5b00e15e3e588a5664bc` | `jdbc:mysql://` + 4096-char unbroken `A` run (bounded-quantifier stress, keyword-routed) |
+| `crafted_keywords_40mib.txt` | 41,943,040 | `e5bc8b2845e507cc7c078a853d838cad59b992989701eadfd415b74298476588` | 40 MiB keyword file (profiling scale, §7) |
 
-The keyword pool used is **908** distinct detector keywords (harvested from detectors' own
-`Keywords()`), not a round number — stated exactly to be reproducible.
+The keyword pool used is **938** distinct detector keywords (harvested from detectors' own
+`Keywords()` method bodies), not a round number — stated exactly to be reproducible.
 
 ### 6.2 Equal-size timing distributions (≥3 runs each)
 
@@ -508,19 +517,27 @@ Command (per file), run 3× on the unchanged input:
 
 | File | Run 1 | Run 2 | Run 3 | Min | **Median** | Max | chunks / bytes | **Ratio (median/baseline)** |
 |------|-------|-------|-------|-----|-----------|-----|----------------|-----------------------------|
-| baseline_prose | 153.348 ms | 145.691 ms | 154.865 ms | 145.7 ms | **153.3 ms** | 154.9 ms | 1024 / 13,628,416 | **1.0×** |
-| crafted_keywords | 10.6999 s | 9.8568 s | 10.7843 s | 9.86 s | **10.700 s** | 10.78 s | 1024 / 13,628,416 | **69.8×** |
-| crafted_base64 | 8.0270 s | 8.9378 s | 8.5040 s | 8.03 s | **8.504 s** | 8.94 s | 1024 / 10,221,312 | **55.5×** |
-| crafted_quantifier | 663.06 ms | 692.58 ms | 761.38 ms | 663.1 ms | **692.6 ms** | 761.4 ms | 1024 / 13,628,416 | **4.5×** |
+| baseline_prose | 148.2 ms | 164.2 ms | 152.5 ms | 148.2 ms | **152.5 ms** | 164.2 ms | 1024 / 13,628,416 | **1.0×** |
+| crafted_keywords | 9.817 s | 8.473 s | 10.524 s | 8.47 s | **9.817 s** | 10.52 s | 1024 / 13,628,416 | **~64×** |
+| crafted_base64 | 4.092 s | 4.198 s | 3.787 s | 3.79 s | **4.092 s** | 4.20 s | 1024 / 12,065,764 | **~27×** |
+| crafted_quantifier (keyword-bearing) | 407.9 ms | 392.3 ms | 395.2 ms | 392.3 ms | **395.2 ms** | 407.9 ms | 1024 / 2,519,655 | **~2.6×** |
+| crafted_quantifier_nokw (pure `A`, control) | 81.5 ms | 83.4 ms | 80.8 ms | 80.8 ms | **81.5 ms** | 83.4 ms | 1024 / 5,163,388 | **0.53× (FASTER)** |
 
-**Stability.** Every value above is a median of 3 unchanged runs and the spread is tight (worst-case
-run-to-run variation ≈ ±9 % for the keyword file), so the ratios are stable, not one-off spikes.
-Ordering is consistent across runs: **keyword > base64 > quantifier > baseline**.
+**Stability.** Each median is over 3 unchanged runs. The crafted-file *absolute* times are tight
+(Base64 3.79–4.20 s; keyword-bearing quantifier 392–408 ms; pure-`A` 80.8–83.4 ms). The **keyword
+ratio is the one noisy figure**: because the baseline denominator is only ~150 ms, small host-load
+wobble moves the ratio between **~52× and ~74×** across runs (keyword absolute 8.47–10.52 s in this
+session; an earlier, less-loaded session held the baseline at ~143 ms and the ratio near ~74×). This
+is the run-to-run distribution the timing rule asks for — the crafted-file work is stable; the *ratio*
+breathes only because its sub-200 ms denominator does. Ordering is consistent every run:
+**keyword ≫ base64 ≫ keyword-bearing quantifier > baseline > keyword-free quantifier**.
 
-**Note on `bytes`.** `BytesScanned` (engine.go:835, summed as `len(chunk.Data)` per chunk) reports
-**13,628,416** for a 10,485,760-byte file because each 10 KiB chunk carries a 3 KiB peek overlap
-(chunker.go:14-18) — the ~1.3× inflation is the peek accounting, not extra input **[source]**. The
-Base64 file reports fewer bytes (10,221,312) because its decoded content re-chunks differently.
+**Note on `bytes`.** The logged `bytes` is `BytesScanned` (engine.go:819,835), the running sum of
+`len(chunk.Data)` over scanned source chunks. For the prose and keyword files it is **13,628,416** —
+the ~1.3× peek-overlap inflation of the 10,485,760-byte input, since each 10 KiB chunk carries a
+3 KiB peek (chunker.go:14-18). The Base64 and quantifier rows log smaller, content-dependent totals
+(e.g. 12,065,764 for Base64); this byte figure is incidental to the timing ratios and is shown only
+for completeness.
 
 ### 6.3 Linearity in input size (default concurrency, ≥3 runs)
 
@@ -528,21 +545,22 @@ Same crafted keyword shape, increasing size, default concurrency:
 
 | Size | Median `scan_duration` | chunks | ms/chunk | Ratio vs 1 MiB (data ratio) |
 |------|------------------------|--------|----------|------------------------------|
-| 1 MiB | 1.150 s | 103 | 11.2 | 1.00× (1×) |
-| 2 MiB | 2.223 s | 205 | 10.8 | 1.93× (2×) |
-| 4 MiB | 4.478 s | 410 | 10.9 | 3.90× (4×) |
-| 8 MiB | 8.494 s | 820 | 10.4 | 7.39× (8×) |
+| 1 MiB | 1.136 s | 103 | 11.0 | 1.00× (1×) |
+| 2 MiB | 2.309 s | 205 | 11.3 | 2.03× (2×) |
+| 4 MiB | 4.196 s | 410 | 10.2 | 3.69× (4×) |
+| 8 MiB | 7.914 s | 820 | 9.7 | 6.97× (8×) |
 
 Per-chunk cost is **constant (~10–11 ms/chunk)** and total time tracks input size **linearly**
-(8× data → 7.39× time). A super-linear vulnerability would show ms/chunk rising with size; it does
-not. This is the empirical counterpart to the RE2 linearity guarantee (§4).
+(8× data → 6.97× time — the slight sub-linearity is fixed per-scan startup amortizing over more
+chunks, the opposite of a super-linear attack). A super-linear vulnerability would show ms/chunk
+*rising* with size; it does not. This is the empirical counterpart to the RE2 linearity guarantee (§4).
 
 ### 6.4 Controls (labeled non-default)
 
 - **`--concurrency=1` control** (non-default; still 8 detector workers via the ×8 multiplier):
-  1 MiB 1.798 s / 2 MiB 3.515 s / 4 MiB 7.055 s — **~17 ms/chunk constant**, 4× data → **3.92×** time.
+  1 MiB 1.869 s / 2 MiB 3.758 s / 4 MiB 7.063 s — **~17–18 ms/chunk constant**, 4× data → **3.78×** time.
   Still perfectly linear; the higher per-chunk cost just reflects one scanner worker. Confirms the
-  linear result is not an artifact of the default 128-way concurrency.
+  linear result is not an artifact of the default concurrency.
 - **True-default control** (no isolation flags: verification ON, default concurrency/timeouts,
   bounded to 180 s): crafted-keyword 10 MiB scanned in **10.937 s / 10.245 s** — essentially the same
   as the `--no-verification` figure, confirming the isolation flags in §6.2 did not distort the
@@ -551,7 +569,8 @@ not. This is the empirical counterpart to the RE2 linearity guarantee (§4).
 ### 6.5 Interpreting "how much slower"
 
 **[observed]** On this host the maximum equal-size amplification a single crafted file achieved was
-**~70×** (keyword fan-out at 10 MiB). **[inferred]** Because the mechanism is linear fan-out (§5.2),
+**~64×** (keyword fan-out at 10 MiB; observed 52–74× across runs as the sub-200 ms baseline denominator
+fluctuates). **[inferred]** Because the mechanism is linear fan-out (§5.2),
 the ceiling on a *single* file is set by file size × per-chunk fan-out cost, both finite; there is no
 input that turns this into exponential time. **[inferred]** The practical DoS lever for an attacker is
 thus *volume* (many crafted files, large files, deep history) against an external time budget — not a
@@ -583,7 +602,8 @@ go tool pprof  -seconds 20 http://localhost:18066/debug/fgprof          -> prof/
 Because the scan ran **44.251 s** (4096 chunks, 54,522,880 bytes) **[observed, scan.log]**, both 20 s
 windows fit **inside a single scan, at the same time** — not sequentially. (An earlier draft implied a
 sequential "25 s CPU then 20 s fgprof" capture, which could not fit; corrected: concurrent, 20 s + 20 s
-inside one 44 s scan.) A Base64 run (34.134 s, 4096 chunks) was profiled the same way.
+inside one 44 s scan.) A Base64 40 MiB run (**~14.9 s median**, 4096 chunks, 48,285,212 bytes) was
+profiled the same way, with a shorter 8 s CPU window that fits inside its runtime (§7.5).
 
 ### 7.2 On-CPU profile (pprof) — where CPU time is actually spent
 
@@ -689,19 +709,23 @@ never invoked on scanned content, it cannot be a complexity-attack vector (the p
 
 ### 7.5 Base64 path profile — RE2 re-scan of decoded content dominates
 
-CPU profile of the Base64 file (raw head):
+CPU profile of the Base64 40 MiB file (raw `go tool pprof -top` head; scan_duration ~14.9 s):
 
 ```
-Duration: 18.18s, Total samples = 70.78s (389.37%)
-     26.72s 37.75%  runtime._ExternalCode     # RE2 re-scanning the DECODED content
-      1.03s  1.46%  (*Trie).Walk               # aho-corasick on decoded content
-      base64 decoder frames: 1 row               # DECODING itself is cheap
-      regexp2: 0 samples
+Duration: 8.12s, Total samples = 31.60s (389.14%)
+      flat  flat%     cum   cum%
+    12.64s 40.00%  12.64s 40.00%  runtime._ExternalCode                    # RE2 re-scanning DECODED content
+     0.09s  0.28%   5.87s 18.58%  go-re2 (*Regexp).FindAllStringSubmatch   # detector regex on decoded copy
+     0.86s  2.72%   1.07s  3.39%  aho-corasick (*Trie).Walk                # prefilter on decoded content
+             —     <0.2s     —    base64 / EscapedUnicode decoder frames   # DECODING itself is cheap
+             —      0s      0%    dlclark/regexp2                          # never executes (grep -c = 0)
 ```
 
 **[observed]** The Base64 amplification cost is **not** in decoding — it is in **re-scanning the
-decoded copy with RE2** (`_ExternalCode` 37.75 %). This is the profiler-level confirmation of the
-decoder re-scan mechanism (§8.2): a Base64 file is effectively scanned twice.
+decoded copy with RE2** (`runtime._ExternalCode` **40.00 %** flat, with go-re2's
+`FindAllStringSubmatch` **18.58 %** cumulative; the base64/unicode decoder frames themselves are below
+the 0.2 s reporting floor). This is the profiler-level confirmation of the decoder re-scan mechanism
+(§8.2): a Base64 file is effectively scanned twice, and `dlclark/regexp2` records **zero** samples.
 
 ---
 
@@ -835,8 +859,8 @@ disabling verification does not reduce a *pattern-matching* DoS and in fact remo
 | Q2 which engine | go-re2 v1.9.0 (RE2/WASM) + stdlib regexp; regexp2 transitive-only | §4.1-4.2, §7.4 | go.mod:100,187; `go mod why`; nm 211 vs 149 |
 | Q3 which patterns exploitable | None to super-linear; permissive `.*`/wide `{0,N}` inspected & linear; fan-out is the amplifier | §5 | AST survey; JDBC/Docker/GitHub firing |
 | Q3 named worst offender | Aggregate keyword fan-out (e.g. mapbox/snowflake/… per profile), each linear | §5.2-5.3, §7.2 | pprof peek fan-out |
-| Q4 slowdown vs equal size | keyword **69.8×**, base64 **55.5×**, quantifier **4.5×** at 10 MiB | §6.2 | equal-size medians + SHA-256 |
-| Q4 linear or super-linear | Linear (constant ms/chunk; 8× data → 7.39× time) | §6.3-6.4 | linearity tables |
+| Q4 slowdown vs equal size | keyword **~64×** (52–74× across runs), base64 **~27×**, keyword-bearing quantifier **~2.6×**, keyword-free quantifier **0.53× (faster)** at 10 MiB | §6.2 | equal-size medians + SHA-256 |
+| Q4 linear or super-linear | Linear (constant ms/chunk; 8× data → 6.97× time) | §6.3-6.4 | linearity tables |
 | Q5 timing measurements | scan_duration distributions, ≥3 runs, stable | §3, §6 | finished-scanning lines |
 | Q5 CPU profiling | Concurrent pprof (on-CPU: RE2/WASM 34–38 %) + fgprof (off-CPU: parked) | §7 | raw top/peek; regexp2=0 |
 | Named: keyword fan-out | Primary amplifier | §5.2, §7.2 | — |
@@ -907,28 +931,52 @@ export PATH="$PATH:/usr/local/go/bin:/root/go/bin"
 ( cd "$REPO" && CGO_ENABLED=0 go build -o "$BIN" . )
 "$BIN" --version   # -> trufflehog dev
 
-# 2) Deterministic generators, all EXACTLY 10,485,760 bytes
-python3 - "$WORK" <<'PY'
-import sys, os, base64
-W = sys.argv[1]; SIZE = 10*1024*1024
-# keyword pool harvested from detector Keywords() (908 entries), one per line
-kw = [l.strip() for l in open(os.path.join(W,"keywords_clean.txt")) if l.strip()]
-def fill(path, unit):
-    with open(path,"wb") as f:
-        buf=b""
-        while len(buf) < SIZE: buf += unit
-        f.write(buf[:SIZE])
-fill(os.path.join(W,"baseline_prose_10mib.txt"),
-     b"the quick brown fox jumps over the lazy dog. ")
-fill(os.path.join(W,"crafted_keywords_10mib.txt"),
-     (" ".join(kw)+" ").encode())
-fill(os.path.join(W,"crafted_base64_10mib.txt"),
-     base64.b64encode((" ".join(kw)).encode())+b"\n")
-fill(os.path.join(W,"crafted_quantifier_10mib.txt"),
-     b"A"*4096+b"! ")
+# 2) Deterministic keyword harvest + input generators (fully self-contained).
+#    Harvests the keyword pool from EVERY detector Keywords() method body, writes
+#    keywords_clean.txt in-script (no pre-existing file assumed), then streams each
+#    input to exactly its target size while hashing in a single pass.
+python3 - "$REPO" "$WORK" <<'PY' | tee "$EV/hashes.txt"
+import sys, os, re, glob, base64, hashlib
+REPO, W = sys.argv[1], sys.argv[2]
+SIZE, SIZE40 = 10*1024*1024, 40*1024*1024                 # 10,485,760 / 41,943,040 bytes
+
+# --- Deterministic harvest from every `func (...) Keywords() []string { ... }` body ---
+kw_re  = re.compile(r"func\s*\([^)]*\)\s*Keywords\(\)\s*\[\]string\s*\{(.*?)\n\}", re.DOTALL)
+lit_re = re.compile(r"\[\]string\{(.*?)\}", re.DOTALL)
+tok_re = re.compile(r'"((?:[^"\\]|\\.)*)"')
+pool = set()
+for fp in sorted(glob.glob(os.path.join(REPO, "pkg", "detectors", "**", "*.go"), recursive=True)):
+    src = open(fp, encoding="utf-8", errors="replace").read()
+    for body in kw_re.findall(src):                        # each Keywords() body
+        for lit in lit_re.findall(body):                   # each []string{...} literal in it
+            for t in tok_re.findall(lit):                  # each quoted token
+                t = t.replace('\\"', '"').replace('\\\\', '\\')
+                if 2 <= len(t) <= 32 and not re.search(r"\s", t):
+                    pool.add(t)
+kw = sorted(pool)                                          # deterministic: 938 tokens on this tree
+open(os.path.join(W, "keywords_clean.txt"), "w").write("\n".join(kw) + "\n")
+print("harvested_keywords=%d" % len(kw))
+
+def fill(name, unit, size=SIZE):                           # stream-tile to exact size, hash one pass
+    if isinstance(unit, str): unit = unit.encode()
+    n = len(unit); h = hashlib.sha256(); w = 0
+    with open(os.path.join(W, name), "wb") as f:
+        while w < size:
+            b = unit if w + n <= size else unit[:size - w]
+            f.write(b); h.update(b); w += len(b)
+    print("%s  %d  %s" % (h.hexdigest(), w, name))
+
+kwline = (" ".join(kw) + " ").encode()
+b64    = base64.b64encode(" ".join(kw).encode()) + b"\n"
+fill("baseline_prose_10mib.txt",          b"the quick brown fox jumps over the lazy dog. ")
+fill("crafted_keywords_10mib.txt",        kwline)                              # max keyword fan-out
+fill("crafted_base64_10mib.txt",          b64)                                 # single-blob base64
+fill("crafted_quantifier_10mib.txt",      b"jdbc:mysql://" + b"A"*4096 + b" ") # keyword-bearing quantifier
+fill("crafted_quantifier_nokw_10mib.txt", b"A"*4096 + b"! ")                   # pure-'A' NEGATIVE CONTROL
+fill("crafted_keywords_40mib.txt",        kwline, SIZE40)                      # 40 MiB profiling scale (§7)
+fill("crafted_base64_40mib.txt",          b64,    SIZE40)                      # 40 MiB base64 scale (§7.5)
 PY
-sha256sum "$WORK"/baseline_prose_10mib.txt "$WORK"/crafted_*_10mib.txt | tee "$EV/hashes.txt"
-stat -c '%s %n' "$WORK"/baseline_prose_10mib.txt "$WORK"/crafted_*_10mib.txt
+stat -c '%s %n' "$WORK"/baseline_prose_10mib.txt "$WORK"/crafted_*_10mib.txt "$WORK"/crafted_*_40mib.txt
 
 # 3) Equal-size timing, 3 runs each
 run() { for i in 1 2 3; do
