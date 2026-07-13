@@ -4,7 +4,7 @@ This document answers, from **observed runtime behavior**, four questions about 
 
 - **Module under test:** `github.com/trufflesecurity/trufflehog/v3` `[go.mod:L1]`.
 - **Language / toolchain:** language floor `go 1.23.1`, pinned `toolchain go1.24.2` `[go.mod:L3-L5]`; all builds and runs used `go1.24.2` with `GOTOOLCHAIN=local` — the project's own documented toolchain (evidence in Section 1).
-- **Source baseline commit:** `e42153d44a5e` is the **TruffleHog source tree under investigation**. It is the **parent** of this documentation commit, i.e. the *source baseline* — **not** the current repository `HEAD`. `git rev-parse --short HEAD^` resolves to `e42153d4` (shown in Section 7). The only change layered on top of that baseline is this single document.
+- **Source baseline commit:** `e42153d44a5e` is the **TruffleHog source tree under investigation**, i.e. the *source baseline* — **not** the current repository `HEAD`. `git rev-parse --short e42153d44a5e` resolves to `e42153d4` (shown in Section 7). The only change to the repository relative to that baseline is this single documentation file, regardless of how many documentation commits refine it: `git diff --name-only e42153d4..HEAD` lists exactly that one file.
 
 ## Methodology
 
@@ -922,17 +922,17 @@ Every mechanism, function, flag, file, and named example referenced by the four 
 
 ## Section 7 — Repository State & Cleanup
 
-**Repository state (Observed).** Commit `e42153d44a5e` is the **TruffleHog source baseline** and the **parent** of this documentation commit — it is *not* the current `HEAD`. The working tree is clean and the only change relative to the baseline is this single documentation file:
+**Repository state (Observed).** Commit `e42153d44a5e` is the **TruffleHog source baseline** — it is *not* the current `HEAD`. The working tree is clean and the only change relative to the baseline is this single documentation file:
 
 ```
-$ git rev-parse --short HEAD^        # parent = TruffleHog source baseline (commit e42153d44a5e)
+$ git rev-parse --short e42153d44a5e   # TruffleHog source baseline
 e42153d4
 $ git status --porcelain            # (no output below = clean working tree)
 $ git diff --name-only e42153d4..HEAD
 blitzy/documentation/trufflehog_e42153d44a5e.md
 ```
 
-This confirms the read-only scope: **no existing TruffleHog source file was modified**, and the sole addition to the repository is `blitzy/documentation/trufflehog_e42153d44a5e.md`. (The full `HEAD` hash and insertion count are intentionally not quoted here, as they change when this document is finalized; the stable facts above — parent `e42153d4`, empty status, single-file name-only diff — are what establish the governance claim.)
+This confirms the read-only scope: **no existing TruffleHog source file was modified**, and the sole addition to the repository is `blitzy/documentation/trufflehog_e42153d44a5e.md`. (The full `HEAD` hash and insertion count are intentionally not quoted here, as they change when this document is finalized; the stable facts above — source baseline `e42153d4`, empty status, single-file name-only diff — are what establish the governance claim.)
 
 **Cleanup (Observed).** Every temporary artifact used for the investigation lived under `/tmp` (outside the source tree): the compiled binary `/tmp/trufflehog_bin`, the crafted fixtures `/tmp/thq1`–`/tmp/thq4`, and the generator/driver scripts. All were removed, leaving the repository unchanged:
 
