@@ -557,7 +557,7 @@ run 5: total_results=3 errOverlap_count=0
 
 - `notifierWorker` holds `dedupeCache *lru.Cache[string, detectorspb.DecoderType]` [`pkg/engine/engine.go:209`], sized `const cacheSize = 512` [`engine.go:491`].
 - The key is `key := fmt.Sprintf("%s%s%s%+v", result.DetectorType.String(), result.Raw, result.RawV2, result.SourceMetadata)` [`pkg/engine/engine.go:1216`] — it **includes `SourceMetadata` (which contains the line number)** and **excludes the decoder type**; the decoder type is stored as the cache **value**.
-- The skip rule: `if val, ok := e.dedupeCache.Get(key); ok && (val != result.DecoderType || result.SourceType == sourcespb.SourceType_SOURCE_TYPE_POSTMAN) { continue }` else `e.dedupeCache.Add(key, result.DecoderType)` [`engine.go:1217-1221`]. So a second result with the **same key but a different decoder type** is dropped. (The Postman clause dedupes Postman results regardless of decoder type — a deliberate special case noted in the code comment [`engine.go:1207-1214`].)
+- The skip rule: `if val, ok := e.dedupeCache.Get(key); ok && (val != result.DecoderType || result.SourceType == sourcespb.SourceType_SOURCE_TYPE_POSTMAN) { continue }` else `e.dedupeCache.Add(key, result.DecoderType)` [`engine.go:1217-1221`]. So a second result with the **same key but a different decoder type** is dropped. (The Postman clause dedupes Postman results regardless of decoder type — a deliberate special case noted in the code comment [`engine.go:1210-1215`].)
 
 **Observed:** Cases A/G/H → 1 result (the two decoder-typed matches share one key); Case D → 2 and Case F → 3 (different lines → different keys). The overlap fixture's count (3) is **unaffected** by this dedupe (different `DetectorType`/`Raw` per detector → distinct keys).
 
