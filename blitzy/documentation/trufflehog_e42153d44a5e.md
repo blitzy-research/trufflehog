@@ -481,7 +481,29 @@ count metrics** (`Hits:0, Misses:3, HitsWasted:0, AttemptsSaved:0` both times); 
 invocations — it is in-memory / in-process, constructed fresh each run.
 
 **Fixture.** Three distinct URI credentials (`a.txt`, `b.txt`, `c.txt`) → three distinct
-verification-cache misses, with no intra-run duplicates (so `Hits` stays 0).
+verification-cache misses, with no intra-run duplicates (so `Hits` stays 0). The three files are
+created in a temporary directory **outside** the repository; together they total exactly **130
+bytes** (this is the `bytes` value in every run below), and because each small file is scanned as a
+single chunk the report shows `chunks: 3`:
+
+```bash
+mkdir -p /tmp/thog_obs_q3
+printf 'https://alice:secretpw1111@api1.example.com\n' > /tmp/thog_obs_q3/a.txt
+printf 'https://bob:secretpw2222@api2.example.com\n'   > /tmp/thog_obs_q3/b.txt
+printf 'https://carol:secretpw3333@api3.example.com\n' > /tmp/thog_obs_q3/c.txt
+```
+
+The fixture byte counts, as `wc -c` (44 + 42 + 44 = **130** total, trailing newlines included — this
+is exactly the `bytes` figure reported in the transcripts below, so every value shown is
+independently reproducible):
+
+```
+$ wc -c /tmp/thog_obs_q3/a.txt /tmp/thog_obs_q3/b.txt /tmp/thog_obs_q3/c.txt
+ 44 /tmp/thog_obs_q3/a.txt
+ 42 /tmp/thog_obs_q3/b.txt
+ 44 /tmp/thog_obs_q3/c.txt
+130 total
+```
 
 **Exact command** (verification is ON by default — no `--no-verification`; the directory is passed as
 a positional argument), run twice back-to-back:
@@ -494,14 +516,14 @@ a positional argument), run twice back-to-back:
 
 ```
 RUN 1:
-2026-07-13T18:18:14Z	info-0	trufflehog	finished scanning	{"chunks": 3, "bytes": 130, "verified_secrets": 0, "unverified_secrets": 3, "scan_duration": "45.769862ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":3,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":97}}
+2026-07-13T23:26:03Z	info-0	trufflehog	finished scanning	{"chunks": 3, "bytes": 130, "verified_secrets": 0, "unverified_secrets": 3, "scan_duration": "46.224684ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":3,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":103}}
 
 RUN 2 (identical input, immediately after):
-2026-07-13T18:18:16Z	info-0	trufflehog	finished scanning	{"chunks": 3, "bytes": 130, "verified_secrets": 0, "unverified_secrets": 3, "scan_duration": "41.589547ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":3,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":73}}
+2026-07-13T23:26:05Z	info-0	trufflehog	finished scanning	{"chunks": 3, "bytes": 130, "verified_secrets": 0, "unverified_secrets": 3, "scan_duration": "34.088598ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":3,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":81}}
 ```
 
 The **count** fields are identical across the two runs (`Hits:0, Misses:3, HitsWasted:0,
-AttemptsSaved:0`); only `VerificationTimeSpentMS` changed (97 → 73). If the cache persisted across
+AttemptsSaved:0`); only `VerificationTimeSpentMS` changed (103 → 81). If the cache persisted across
 invocations, RUN 2 would show `Hits:3` instead of `Misses:3`. It does not → **no cross-invocation
 persistence**.
 
@@ -512,11 +534,11 @@ persistence**.
 ```
 
 ```
-2026-07-13T18:18:30Z	info-0	trufflehog	finished scanning	{"chunks": 3, "bytes": 130, "verified_secrets": 0, "unverified_secrets": 3, "scan_duration": "32.696472ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":65}}
+2026-07-13T23:26:07Z	info-0	trufflehog	finished scanning	{"chunks": 3, "bytes": 130, "verified_secrets": 0, "unverified_secrets": 3, "scan_duration": "35.704612ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":81}}
 ```
 
 With the result cache disabled the counts are all **0** (the cache lookup path is never exercised),
-yet verification still runs, so `VerificationTimeSpentMS` is non-zero (65).
+yet verification still runs, so `VerificationTimeSpentMS` is non-zero (81).
 
 **Edge case — verification disabled** (`--no-verification`, for contrast). Exact command:
 
@@ -525,7 +547,7 @@ yet verification still runs, so `VerificationTimeSpentMS` is non-zero (65).
 ```
 
 ```
-2026-07-13T18:18:32Z	info-0	trufflehog	finished scanning	{"chunks": 3, "bytes": 130, "verified_secrets": 0, "unverified_secrets": 3, "scan_duration": "5.647872ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
+2026-07-13T23:26:08Z	info-0	trufflehog	finished scanning	{"chunks": 3, "bytes": 130, "verified_secrets": 0, "unverified_secrets": 3, "scan_duration": "5.231266ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
 ```
 
 With verification off, everything is **0**, including `VerificationTimeSpentMS` — verification never
