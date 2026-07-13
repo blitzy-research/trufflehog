@@ -61,7 +61,8 @@ detector regex to exponential time.
    `--detector-timeout` (which governs only the second-stage `detectChunk`, engine.go:1066)
    **[source]**. Critically, **neither timeout preempts a running match**: with
    `--detector-timeout=1ns` (plus `--allow-verification-overlap` to force work onto the second-stage
-   path) the watchdog log `"a detector ignored the context timeout"` fired **866 times**, yet every
+   path) the watchdog log `"a detector ignored the context timeout"` fired **many times** (a
+   load-variable count — see §3.2), yet every
    detector call still ran to completion and the scan was actually *slower* (15.5 s) **[observed,
    §3]**. The safety that does exist comes from RE2 linearity and the bounded chunk size, **not** from
    the timeouts.
@@ -83,7 +84,7 @@ gets scanned (file-size/type filters, archive/history controls). See §9.
 
 | # | Question | Verdict (this host) | Key evidence |
 |---|----------|---------------------|--------------|
-| Q1 | Can a crafted file hang / time out / block the scan? | **No unbounded hang; yes to a bounded multi-second-to-multi-tens-of-seconds inflation that can exceed an external CI budget. Per-detector timeouts do not preempt.** | §3 (two-stage path, 866 non-preemptive watchdog fires) |
+| Q1 | Can a crafted file hang / time out / block the scan? | **No unbounded hang; yes to a bounded multi-second-to-multi-tens-of-seconds inflation that can exceed an external CI budget. Per-detector timeouts do not preempt.** | §3 (two-stage path, many non-preemptive watchdog fires) |
 | Q2 | Is pattern matching vulnerable to computational-complexity attacks? | **Not to exponential/catastrophic ReDoS** (RE2-class linear engines); **yes to bounded linear amplification** via fan-out/decoders. | §4 (engine survey, classic payload at baseline speed) |
 | Q3 | Which detector patterns, if any, are exploitable? | **None to exponential time.** Permissive patterns exist (`.*`, wide bounded quantifiers) but stay linear; keyword *fan-out* (many detectors firing per chunk) is the real amplifier, not any one regex. | §5 (AST survey + valid JDBC/Docker/GitHub firing) |
 | Q4 | How much slower than normal files of equal size? | **~64× at 10 MiB** (keyword fan-out; 52–74× across runs); **~27×** (Base64); a keyword-bearing quantifier only **~2.6×**, and keyword-free quantifier stress is **0.53× — *faster* than prose**. Linear in input size. | §6 (equal-size distributions, linearity) |
@@ -111,11 +112,14 @@ counts:
 **Why this matters (F-worker-count).** `--concurrency` defaults to `runtime.NumCPU()` = **128**
 (main.go:58) **[source]**, and the detector-worker pool is `concurrency * detectorWorkerMultiplier`
 with a default multiplier of **8** (engine.go:676, engine.go:345) **[source]**. At startup the binary
-logs, at verbosity `-v`:
+logs these worker counts at log-verbosity 2 (`V(2)`, engine.go:678,693), surfaced with
+`--log-level=2` (equivalently `--debug`); there is **no** `-v` short flag (the only verbosity flag is
+`--log-level`, main.go:50). Running `trufflehog filesystem <file> --no-verification --log-level=2`
+prints **[observed]**:
 
 ```
-starting detector workers {"count": 1024}
-starting verificationOverlap workers {"count": 128}
+2026-07-13T22:29:25Z	info-2	trufflehog	starting detector workers	{"count": 1024}
+2026-07-13T22:29:25Z	info-2	trufflehog	starting verificationOverlap workers	{"count": 128}
 ```
 **[observed]** — i.e. **1024** detector workers and **128** verification-overlap workers, even though
 only **4** CPUs are actually schedulable (GOMAXPROCS clamped to 4). This heavy oversubscription is
@@ -142,14 +146,14 @@ non-default behavior is silently presented as canonical.
 | Flag | Default? | Effect | Why used here |
 |------|----------|--------|---------------|
 | `filesystem <path>` | — | Canonical file scan entry point | The real path under test |
-| `--results=verified,unknown` | **non-default** (adds `unknown`) | Controls which result classes print | Surface unverified detector hits for reachability proof (§5) |
+| `--results=verified,unknown,unverified` (add `filtered_unverified` for GitHub) | **non-default** | Selects which result classes print. The four classes are `verified` / `unverified` / `unknown` / `filtered_unverified` (main.go:61,985) | Surface **unverified** detector hits for the reachability proof (§5). Under `--no-verification` a hit is classed **`unverified`** — the else-branch of `notifierWorker`, gated by `notifyUnverifiedResults` (engine.go:1199) — which is a **distinct** class from **`unknown`** (produced only for `VerificationError` results, engine.go:1194). So `unknown` alone surfaces nothing here; `unverified` must be included. Some detectors (e.g. GitHub) additionally mark hits `filtered_unverified`, requiring that token too |
 | `--no-verification` | **non-default** | Skips network verification | Isolates *pattern-matching* CPU from network latency for timing (§6). This is a **measurement isolation** flag, not a security mitigation (§9) |
 | `--json` | **non-default** | Emits results as JSON on **stdout** | Detector-firing evidence prints to stdout, not the stderr summary (§5) |
 | `--detector-timeout=<dur>` | **non-default** | Overrides stage-2 `detectChunk` timeout only (main.go:471-472 → engine.go:1066) | Probe timeout enforcement (§3) |
 | `--allow-verification-overlap` | **non-default** | Disables the stage-1 overlap routing, sending multi-detector chunks straight to stage-2 (engine.go:796) | Expose the stage-1 (2 s) vs stage-2 (10 s) split (§3) |
 | `--profile` | **non-default** | Starts a pprof+fgprof HTTP server on `:18066` (main.go:53,426-435) | CPU/wall profiling (§7). **Security note §9/§2.4** |
 | `--concurrency=1` | **non-default** (default = `NumCPU()`=128) | One scanner worker | Labeled control for the linearity study (§6) |
-| `-v` / `--log-level` | **non-default** | Raises log verbosity | Surface the worker-count and watchdog log lines |
+| `--log-level=<int>` (or `--debug`) | **non-default** (default `0`) | Raises log verbosity (main.go:50); there is **no** `-v` short flag | Surface the worker-count log lines, which are emitted at `V(2)` (engine.go:678,693). (The watchdog line is logged at `Error` level and appears regardless of `--log-level`.) |
 
 A **true-default control** (no isolation flags: verification left ON, default concurrency, default
 timeouts) is reported in §6.4 to confirm the isolation flags did not distort the headline result.
@@ -249,9 +253,20 @@ varies only the flags. Watchdog count = number of `"a detector ignored the conte
 | **A** | (default) | **9.964 s** | **0** | Dominant work is stage-1 (2 s ctx); no watchdog because that is a different code path |
 | **B** | `--detector-timeout=1ns` | **10.860 s** | **0** | `1ns` set (`Setting detector timeout {1ns}` logged) but has **no effect** by default — work never reaches stage-2 |
 | **C** | `--allow-verification-overlap` | **11.900 s** | **0** | Overlap disabled → chunks go to stage-2, but with default 10 s timeout nothing exceeds it |
-| **D** | `--allow-verification-overlap --detector-timeout=1ns` | **15.465 s** | **866** | Now on stage-2 with a 1 ns budget: watchdog fires **866 times**, yet the scan **completes and is slower** |
+| **D** | `--allow-verification-overlap --detector-timeout=1ns` | **~13–15.5 s** | **many (load-variable; see caveat)** | Now on stage-2 with a 1 ns budget: the watchdog fires **many times**, yet **every** call completes and the scan is **slower than Case A** |
 
-Sample stage-2 watchdog line from Case D **[observed]**:
+> **Watchdog-count caveat [observed].** The *number* of watchdog fires in Case D is **not** a stable
+> constant — it depends heavily on host load and goroutine scheduling. Re-running the identical input
+> (`3b0d4159…`, 1024 chunks) on this host produced **68, 148, and 221** fires across three consecutive
+> runs (`scan_duration` 12.8–13.1 s); an earlier, more heavily-loaded session recorded **866** fires
+> (`scan_duration` 15.465 s). What is **stable and reproducible** every run is the *qualitative*
+> result — the watchdog fires **many** times (tens to hundreds) yet **every** detector call still runs
+> to completion and the scan is **slower** than Case A. Treat the specific fire count as illustrative,
+> not reproducible; the **non-preemption** is the reproducible finding.
+
+Sample stage-2 watchdog line from Case D **[observed]** (the specific `detector.type` and
+`detector_worker_id` that get caught vary run-to-run — e.g. `MapBox` in one session, `Checkvist` in
+another):
 
 ```
 error  trufflehog  a detector ignored the context timeout  {"detector_worker_id":"fzgg6","detector":{"type":"MapBox"},"timeout":0.000000001}
@@ -261,8 +276,10 @@ error  trufflehog  a detector ignored the context timeout  {"detector_worker_id"
 - **[observed]** `--detector-timeout` governs **only** the stage-2 `detectChunk` path (Cases B vs D).
   On the default path (stage 1) it is inert — the relevant bound there is the hardcoded 2 s.
 - **[observed]** The timeout is **non-preemptive**. In Case D the deadline was 1 ns and the watchdog
-  fired 866 times, but **every** detector call still ran to completion — indeed the scan got *slower*
-  (15.5 s vs 9.96 s), because the watchdog/timeout bookkeeping is pure overhead layered on top of
+  fired **many times** (a load-variable count — 68–221 on re-runs here, 866 in an earlier session; see
+  the caveat above), but **every** detector call still ran to completion — indeed the scan got
+  *slower* (~13–15.5 s vs ~9 s for Case A), because the watchdog/timeout bookkeeping is pure overhead
+  layered on top of
   work that runs regardless. Go's `context` deadline is cooperative; a synchronous RE2/WASM call does
   not observe it mid-match. The `AfterFunc` (engine.go:1067) only **logs**; it cannot interrupt the
   regex.
@@ -417,25 +434,32 @@ fan out to many detector regexes — which is a linear multiplier, not a per-pat
 
 To make the pattern analysis canonical, three representative detectors were driven with
 **syntactically valid** inputs and confirmed to fire through the real CLI. **Detector results print
-as JSON on stdout** (the stderr `finished scanning` summary can show `unverified_secrets: 0` due to
-result-class filtering), so firing was captured with `--json` on stdout:
+as JSON on stdout**, so firing was captured with `--json` on stdout. **Crucially, the result-class
+filter must include `unverified`:** under `--no-verification` a hit is classed `unverified`
+(engine.go:1199), **not** `unknown`, so `--results=verified,unknown` alone surfaces **nothing** — a
+run with that flag emits zero detector JSON objects for all three inputs **[observed]**. The correct
+command adds `unverified` (and `filtered_unverified` for GitHub, whose hits are marked filtered):
 
 ```
-<workdir>/trufflehog_bin filesystem <input> --no-verification --results=verified,unknown --json
+# JDBC and Docker:
+<workdir>/trufflehog_bin filesystem <input> --no-verification --results=verified,unknown,unverified --json
+# GitHub additionally needs filtered_unverified:
+<workdir>/trufflehog_bin filesystem <input> --no-verification --results=verified,unknown,unverified,filtered_unverified --json
 ```
 
 | Detector | Engine / pattern | Fired? | Decoder(s) | Evidence (from stdout JSON) |
 |----------|------------------|--------|-----------|------------------------------|
-| **JDBC** | stdlib `regexp`; `keyPat` jdbc.go:53 | **Yes** | **BASE64** and **PLAIN** | `DetectorName=JDBC` twice; `Redacted":"jdbc:postgresql:password=****..."` — proves the **redaction** path `tryRedactAnonymousJDBC` (jdbc.go:118) → `tryRedactRegex` (jdbc.go:191) was reached |
+| **JDBC** | stdlib `regexp`; `keyPat` jdbc.go:53 | **Yes** | **BASE64** and **PLAIN** | `DetectorName=JDBC` twice; `Redacted":"jdbc:postgresql:password=****..."` — proves the **redaction** path `tryRedactAnonymousJDBC` (jdbc.go:118) → `tryRedactRegex` (jdbc.go:191, whose redaction regex is compiled at jdbc.go:192) was reached |
 | **Docker** | go-re2; `keyPat` docker_auth_config.go:51 | **Yes** | PLAIN | `DetectorName=Docker`, `Raw=dXNlcjpzM2NyZXRwYXNz` (valid non-example registry; the example-registry input is correctly dropped by the `exampleRegistries` FP map, docker_auth_config.go:61,104) |
-| **GitHub** | go-re2; `keyPat` github_old.go:30 | **Yes** | PLAIN | `DetectorName=Github` |
+| **GitHub** | go-re2; `keyPat` github_old.go:30 | **Yes** | PLAIN | `DetectorName=Github` (surfaced only when `filtered_unverified` is added to `--results`, as GitHub marks the hit filtered) |
 
 Two findings from this exercise, both corrected from the earlier draft:
 - **[observed]** The JDBC firing via the **BASE64** decoder confirms the decoder re-scan path (§8):
   the same secret is found once in the plaintext and again after Base64-decoding a Base64-encoded
   copy, i.e. the content is scanned twice.
 - **[observed]** The redaction fields prove the JDBC input actually reached `tryRedactRegex`
-  (jdbc.go:191), which the earlier draft's adversarial JDBC string (a long run of `A` with no
+  (jdbc.go:191; its redaction regex `regexp.MustCompile(`(?i)pass.*?=(.+?)\b`)` is at jdbc.go:192),
+  which the earlier draft's adversarial JDBC string (a long run of `A` with no
   `jdbc:<subprotocol>:` prefix) never did — that string failed `keyPat` (jdbc.go:53) and so exercised
   no JDBC code at all.
 
@@ -457,7 +481,7 @@ under RE2/stdlib:
 
 | Detector | Pattern (as compiled) | Why permissive | Behavior on adversarial input |
 |----------|------------------------|----------------|-------------------------------|
-| JDBC (jdbc.go:53) | `(?i)jdbc:[\w]{3,10}:[^\s"']{0,512}` | `[^\s"']{0,512}` accepts up to 512 non-space chars | Bounded (≤512); linear. Redaction helper `(?i)pass.*?=(.+?)\b` (jdbc.go:191) uses **lazy** `.*?`/`.+?` — still linear under RE2/stdlib |
+| JDBC (jdbc.go:53) | `(?i)jdbc:[\w]{3,10}:[^\s"']{0,512}` | `[^\s"']{0,512}` accepts up to 512 non-space chars | Bounded (≤512); linear. Redaction helper `(?i)pass.*?=(.+?)\b` (jdbc.go:192) uses **lazy** `.*?`/`.+?` — still linear under RE2/stdlib |
 | Docker (docker_auth_config.go:51) | `{…\\*".*\\*"…}` (JSON `auths` block) | contains `.*` | Anchored by surrounding literal JSON structure and capped by `MaxSecretSize()=4096` (docker_auth_config.go:46); linear |
 | GitHub (github_old.go:30) | `(?i)(?:github\|gh\|pat\|token)[^\.].{0,40}[ =:'"]+([a-f0-9]{40})\b` | `.{0,40}` wide bounded gap | Bounded (≤40); linear |
 
@@ -687,7 +711,7 @@ this host, not spinning on regex.
 ```
 $ go mod why github.com/dlclark/regexp2
 # github.com/dlclark/regexp2
-github.com/trufflesecurity/trufflehog/v3/pkg/tui/...
+github.com/trufflesecurity/trufflehog/v3/pkg/tui/common
 github.com/charmbracelet/glamour/ansi
 github.com/alecthomas/chroma/v2
 github.com/dlclark/regexp2
@@ -791,7 +815,7 @@ flowchart TD
     E -->|"--allow-verification-overlap OR single detector"| F2["STAGE 2: detectChunk<br/>context.WithTimeout(ctx, detectionTimeout=10s) (engine.go:1066)<br/>+ AfterFunc(+1s) watchdog log (engine.go:1067)"]
     F1 --> G["detector.FromData on matched spans (RE2 / stdlib, linear)"]
     F2 --> G
-    G -.->|"NEITHER context preempts a running RE2 match<br/>(866 watchdog fires, all calls complete — §3.2)"| G
+    G -.->|"NEITHER context preempts a running RE2 match<br/>(many watchdog fires, all calls complete — §3.2)"| G
     G --> H["scan_duration telemetry (main.go:566-571)<br/>+ pprof/fgprof via --profile :18066 (main.go:426-435)"]
 ```
 
@@ -820,7 +844,7 @@ CPU-pattern controls or are measurement-isolation flags.
 
 | Control | Why it is not a reliable CPU bound |
 |---------|-------------------------------------|
-| **Stage-2 `--detector-timeout` (10 s default)** (engine.go:1066) | Governs **only** stage-2; the **default** multi-detector path is stage-1's **hardcoded 2 s** (engine.go:939). And **neither preempts** — §3.2 showed 866 watchdog fires with every call still completing. It caps *nothing* for a synchronous RE2 call already in flight |
+| **Stage-2 `--detector-timeout` (10 s default)** (engine.go:1066) | Governs **only** stage-2; the **default** multi-detector path is stage-1's **hardcoded 2 s** (engine.go:939). And **neither preempts** — §3.2 showed many (load-variable) watchdog fires with every call still completing. It caps *nothing* for a synchronous RE2 call already in flight |
 | **Stage-1 hardcoded 2 s** (engine.go:939) | Same non-preemption; it is a deadline the running call does not check |
 
 **[inferred]** Treat both timeouts as *best-effort logging/scheduling hints*, not hard CPU ceilings.
@@ -853,7 +877,7 @@ disabling verification does not reduce a *pattern-matching* DoS and in fact remo
 | Item asked | Answer (this host) | Where | Concrete evidence |
 |------------|--------------------|-------|-------------------|
 | Q1 hang? | No unbounded hang; finite ~10.7 s@10 MiB, ~44 s@40 MiB | §3, §6, §7 | scan_duration; Cases A–D |
-| Q1 time out / block CI? | Not internally; can exceed an **external** budget; internal timeouts non-preemptive | §3.2, §9 | 866 watchdog fires, all complete |
+| Q1 time out / block CI? | Not internally; can exceed an **external** budget; internal timeouts non-preemptive | §3.2, §9 | many (load-variable) watchdog fires, all complete |
 | Q1 timeout default value & enforcement | Stage-1 2 s hardcoded (engine.go:939); stage-2 10 s configurable (http.go:18, engine.go:1066); neither preempts | §3.1-3.2 | source + Cases A–D |
 | Q2 complexity vulnerability? | No exponential ReDoS (RE2 linear); yes bounded linear amplification | §4, §6.3 | classic payload 93.6 ms; linear ms/chunk |
 | Q2 which engine | go-re2 v1.9.0 (RE2/WASM) + stdlib regexp; regexp2 transitive-only | §4.1-4.2, §7.4 | go.mod:100,187; `go mod why`; nm 211 vs 149 |
@@ -873,7 +897,7 @@ disabling verification does not reduce a *pattern-matching* DoS and in fact remo
 ## 11. Observed vs. source vs. external vs. inferred — and tested vs. untested
 
 **Observed (this host, captured at runtime):** all `scan_duration` values and distributions (§3, §6);
-the Case A–D watchdog counts including the 866 fires (§3.2); detector firing for JDBC/Docker/GitHub
+the Case A–D watchdog counts including the many, load-variable Case-D fires (§3.2); detector firing for JDBC/Docker/GitHub
 (§5.1); all pprof/fgprof output and symbol counts (§7); the linearity tables (§6.3-6.4); the classic
 payload timing (§4.4.1); the environment values in §2.1.
 
