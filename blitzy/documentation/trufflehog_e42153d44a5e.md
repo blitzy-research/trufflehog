@@ -11,8 +11,8 @@ location it is written **INFERRED — source-confirmed**. These are the only two
 
 > **A note on embedded output (what is verbatim, what varies per run).** Every output block below
 > is the real, unedited output of the command shown immediately above it, with exactly the
-> following disclosed exceptions — no values, counts, field sets, message text, or ordering are
-> otherwise changed:
+> following disclosed exceptions; apart from the plain-printer field ordering disclosed in item 4,
+> no values, counts, field sets, message text, or line ordering are otherwise changed:
 >
 > 1. **The throwaway fixture path is rendered as the literal `$WORK`.** The runbook creates the
 >    fixture under a unique `mktemp -d` directory, so a live run prints an absolute path such as
@@ -29,6 +29,17 @@ location it is written **INFERRED — source-confirmed**. These are the only two
 >    of some `--help`/`--help-long` flag lines are trimmed so the committed document carries no
 >    trailing whitespace; no visible characters, ordering, or values change, and internal tab
 >    separators inside log lines are preserved verbatim.
+> 4. **The plain (non-JSON) printer's `ExtraData` field lines appear in a per-run order.** The
+>    human-readable printer emits a finding's detector-specific `ExtraData` by iterating a Go map
+>    **without sorting** (`pkg/output/plain.go:L67`; contrast the `sort.Strings` at `L99` that the
+>    same function applies to the aggregate source-metadata keys such as `File`/`Line`), and Go
+>    randomizes map-iteration order, so the four `ExtraData` lines (`Message`, `Is_canary`,
+>    `Resource_type`, `Account`) come out in a different order on each run. The single plain-output
+>    finding block shown in Q4 is therefore one representative capture of those four lines; only
+>    their relative order varies — the four keys, their values, and every other line (including the
+>    sorted trailing `File`/`Line`) are unchanged. **The JSON output is unaffected**, because
+>    `encoding/json` marshals map keys in sorted order — which is why the Q3 JSON shows the stable
+>    `account, is_canary, message, resource_type` sequence.
 >
 > Where a listing would otherwise embed a non-reproducible column (for example `ls -l`'s owner and
 > timestamp), a deterministic equivalent is used instead and is called out at that block.
@@ -72,8 +83,10 @@ exit, error, or interrupt:
 ```bash
 set -o pipefail            # a failing stage in a pipeline fails the whole pipeline, so a broken
                            # `… | wc -l` cannot silently print 0 and mask the failure. (-e is
-                           # deliberately NOT set: TruffleHog exits 183 when it finds a secret,
-                           # and `ldd`/`grep` exit non-zero by design below — none are errors.)
+                           # deliberately NOT set: `ldd`/`grep` exit non-zero by design below, and
+                           # TruffleHog exits 183 only when it finds results *and* `--fail` is set;
+                           # this runbook never passes `--fail`, so its finding-scans exit 0 (see
+                           # the exit=0 captures in Q1/Q4) — none of these are errors.)
 
 REPO_ROOT="$(git rev-parse --show-toplevel)"   # the source checkout — kept strictly READ-ONLY
 BIN=/tmp/trufflehog_bin                          # canonical binary (built below, outside checkout)
@@ -122,11 +135,16 @@ once from the checkout root at the source commit:
 $ CGO_ENABLED=0 go build -o $BIN .
 ```
 
-**OBSERVED (artifact identity).** The resulting file and its self-reported version:
+**OBSERVED (artifact identity).** The resulting file and its self-reported version. As with the
+fixture listing further below, `stat` is used so the output is fully deterministic — it prints
+exactly perms, size, and name and omits `ls -l`'s per-run link-count/owner/group/mtime columns; the
+owner-only permissions (`-rwx------`, i.e. `700`) follow directly from the `umask 077` set in the
+setup preamble, because `go build` honors the umask when it creates the output file (a build under
+the default `umask 022` would instead show `-rwxr-xr-x`):
 
 ```text
-$ ls -l $BIN
--rwxr-xr-x 1 root root 194311322 Jul 13 16:47 /tmp/trufflehog_bin
+$ stat -c '%A %s %n' $BIN     # perms, size, name (deterministic)
+-rwx------ 194311322 /tmp/trufflehog_bin
 ```
 
 ```text
@@ -911,6 +929,13 @@ File: $WORK/thog_files/aws_creds.ini
 Line: 2
 
 ```
+
+> **Per-run field order (see disclosed exception 4 in the preamble).** The four `ExtraData` lines
+> above (`Resource_type`, `Account`, `Message`, `Is_canary`) are emitted by an unsorted map
+> iteration (`pkg/output/plain.go:L67`), so their relative order differs on each run; the block
+> above is one representative capture. Their keys and values — and the sorted trailing `File`/`Line`
+> lines — do not change, and the JSON form in Q3 is fully deterministic (`account, is_canary,
+> message, resource_type`).
 
 ### (A) The decisive trace lines (annotated)
 
