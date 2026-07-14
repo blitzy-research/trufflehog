@@ -17,9 +17,9 @@
 - **Q1 — Multi-encoding handling.** The pipeline runs an **ordered, single-pass** decoder chain `[UTF8, Base64, UTF16, EscapedUnicode]` over each chunk [`pkg/decoders/decoders.go:8-16`]. UTF8 always yields a `PLAIN` view; `Base64` **rebuilds the chunk data in place**, substituting decoded bytes where the encoded run was [`pkg/decoders/base64.go:67`]; `EscapedUnicode` **clones** the chunk and returns a new one [`pkg/decoders/escaped_unicode.go:39`]. Because the Base64 pass leaves the surrounding plaintext intact, a file holding both the raw key and its Base64 form is matched **twice** (once as `PLAIN`, once as `BASE64`). A decoder's output is **not re-fed** through the chain (single pass).
 - **Q2 — Reported decoder types.** The enum is `UNKNOWN=0, PLAIN=1, BASE64=2, UTF16=3, ESCAPED_UNICODE=4` [`proto/detectors.proto:7-13`]. Observed: raw plaintext → **`PLAIN`** (Case C), Base64 → **`BASE64`** (Case B), escaped-Unicode → **`ESCAPED_UNICODE`** (Case E). `UTF16` is the fourth type but the ASCII inputs do not exercise it; `UNKNOWN=0` is the zero value, never produced by a successful decode.
 - **Q3 — Overlap detection.** It occurs **only when two or more *different* detectors match the same chunk** and `--allow-verification-overlap` is off [`pkg/engine/engine.go:796`]. It **never fired for the lone AWS key** — grep count `0` across **all eight** single-key cases A–H (§5.10). Driving a two-detector config reproduces it: the offending result carries the verification error `errOverlap` [`pkg/engine/engine.go:39`, set at `:988`].
-- **Q4 — Deduplication effect.** A 512-entry LRU in `notifierWorker` collapses **same-key / different-decoder** repeats [`pkg/engine/engine.go:1216-1221`]. The key is `DetectorType + Raw + RawV2 + SourceMetadata` (it **includes the computed line number** and **excludes** the decoder type). Equal computed lines → one result; different computed lines → both survive. It does **not** change the count of the overlap case (that is a separate annotation).
+- **Q4 — Deduplication effect.** A 512-entry LRU in `notifierWorker` suppresses a repeat **only when its dedupe key is already cached *and* its decoder type differs** from the cached one [`pkg/engine/engine.go:1216-1221`]; same-key repeats that carry the **same** decoder type are deliberately **retained** — the code comment is explicit that "duplicate results with the same decoder type SHOULD have their own entry in the results list" [`pkg/engine/engine.go:1210-1214`]. The key is `DetectorType + Raw + RawV2 + SourceMetadata` (it **includes the computed line number** and **excludes** the decoder type). So two encodings that resolve to the same computed line collapse to one result **only when they carry different decoder types** (one `PLAIN` + one `BASE64` — Cases A/G/H → 1); different computed lines always survive as distinct keys (D → 2, F → 3); and — the subtlety the simple line-rule misses — the **same** computed line can still yield **multiple** results when the *same* decoder matches more than once (a Base64 form on a `ChunkSize` boundary produces three identical `BASE64@1` results that all survive — §5.11). It does **not** change the count of the overlap case (that is a separate annotation).
 - **Q5 — Ordering.** **Deduplication happens *after* overlap detection.** Overlap routing/annotation is a Stage-3 pass in `scannerWorker`/`verificationOverlapWorker`; the LRU dedupe is a later Stage-4 pass in `notifierWorker` consuming `e.results` [`pkg/engine/engine.go:1186` → `:1190`]. **(inferred / source-derived** from the channel producer→consumer stage order; consistent with every observation and the `docs/concurrency.md` worker order.**)**
-- **Q6 — One-vs-many variability.** The dedupe key includes the **computed line number** but **not** the decoder type, so collapse-vs-survive depends on whether the two encodings resolve to the **same computed first-occurrence line** — which is **not** the same as their physical placement. Because `Base64` rebuilds the chunk *in place* keeping the surrounding plaintext, within one chunk the `PLAIN` and `BASE64` views both report the **plaintext's** line (the first `Raw` occurrence). So raw-then-Base64 layouts (Cases A, G, H) **collapse to 1** and *which decoder type survives is a genuine race*; a Base64-**before**-plaintext layout (Case D) keeps two distinct lines and **survives as 2**; and encodings split across **different chunks** (Case F) get distinct lines and survive (**3** results). The surviving-decoder race **persists even at `--concurrency=1`** (§5.5, §6.6, §12.3).
+- **Q6 — One-vs-many variability.** Two forces decide the count, not one. **(1) Different-decoder repeats** — the dedupe key includes the **computed first-occurrence line** but **not** the decoder type, so the `PLAIN` view of the raw key and the `BASE64` view of its encoded form collapse to one result when they resolve to the **same computed line** and survive as two when they resolve to different lines. Because `Base64` rebuilds the chunk *in place* keeping the surrounding plaintext, that computed line is **not** the same as physical placement. **(2) Same-decoder repeats** — a repeat carrying the **same** decoder type is **retained**, not collapsed [`pkg/engine/engine.go:1210-1214`], so the **same** computed line can still yield **multiple** results whenever one decoder matches more than once (e.g. a Base64 run straddling a `ChunkSize` boundary is processed in two overlapping chunks, `chunker.go:119-126`). Concretely: raw-then-Base64 layouts (Cases A, G, H) **collapse to 1** (a genuine `PLAIN`/`BASE64` race for the single shared key); a Base64-**before**-plaintext layout (Case D) keeps two distinct lines → **2**; encodings split across **different chunks** (Case F) get distinct lines → **3**; and a Base64 form landing exactly on a `ChunkSize` boundary (§5.11) races between **1** (`PLAIN@1`) and **3** (three identical `BASE64@1`, all on the *same* line 1) on the **same unchanged input**. The surviving-decoder race **persists even at `--concurrency=1`** (§5.5, §5.11, §6.6, §12.3).
 
 ---
 
@@ -519,6 +519,90 @@ run 5: total_results=3 errOverlap_count=0
 
 ---
 
+### §5.11 Case I — Base64 form on a `ChunkSize` boundary → **1 ↔ 3** on the *same* line (run-to-run)
+
+This case is the direct counterexample to any "equal computed lines → one result" reading of Q4/Q6, and it reproduces the **run-to-run inconsistency** the user reported. The **same unchanged input** — a raw AWS key on line 1 and its Base64 form beginning **exactly at byte offset `ChunkSize` = 10 × 1024 = 10240** [`pkg/sources/chunker.go:14`] — alternates between **1** result (`PLAIN@1`) and **3** results (three byte-identical `BASE64@1`), *all on the same computed line 1*.
+
+**Input construction** (generator in §12.4; created under `/tmp`, outside the repo):
+
+- Line 1 is `AKIASP2TPHJSQH3FJRUX wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY` — the same public, non-live canary key used throughout (§3.1).
+- Filler bytes pad the file so the Base64 encoding of the `id secret` string begins at **byte offset 10240**.
+- Total size **10325 bytes**; the Base64 run occupies the chunk boundary.
+
+```console
+$ wc -c /tmp/th_investigation/boundary_10240.txt
+10325 /tmp/th_investigation/boundary_10240.txt
+$ sha256sum /tmp/th_investigation/boundary_10240.txt
+d1d00e1472f49913f1fa8dfb0ec05ff3ba4dfbb4f01da5d2b224e288218ce287  /tmp/th_investigation/boundary_10240.txt
+$ tail -c +10241 /tmp/th_investigation/boundary_10240.txt | head -c 84; echo
+QUtJQVNQMlRQSEpTUUgzRkpSVVggd0phbHJYVXRuRkVNSS9LN01ERU5HL2JQeFJmaUNZRVhBTVBMRUtFWQ==
+```
+
+**Observed distribution (same input, N = 100 each).** The result count is genuinely non-deterministic at **both** concurrency settings:
+
+```console
+$ bash /tmp/th_investigation/boundary_tally.sh /tmp/th_investigation/boundary_10240.txt 100
+  count distribution:
+    count=1 : 42
+    count=3 : 58
+  decoder-signature distribution:
+    [BASE64,BASE64,BASE64,] : 58
+    [PLAIN,] : 42
+
+$ bash /tmp/th_investigation/boundary_tally.sh /tmp/th_investigation/boundary_10240.txt 100 --concurrency=1
+  count distribution:
+    count=1 : 70
+    count=3 : 30
+  decoder-signature distribution:
+    [BASE64,BASE64,BASE64,] : 30
+    [PLAIN,] : 70
+```
+
+The exact split shifts from sweep to sweep — that is the point. The invariant is that **both** the `1` and the `3` outcome appear at **both** concurrency settings; `--concurrency=1` only biases the ratio toward `PLAIN`, it does **not** stabilise the count.
+
+**Complete `count=1` run** — full stdout (one JSON object) followed by the `finished scanning` banner:
+
+```json
+{"SourceMetadata":{"Data":{"Filesystem":{"file":"boundary_10240.txt","line":1}}},"SourceID":1,"SourceType":15,"SourceName":"trufflehog - filesystem","DetectorType":2,"DetectorName":"AWS","DetectorDescription":"AWS (Amazon Web Services) is a comprehensive cloud computing platform offering a wide range of on-demand services like computing power, storage, databases. API keys for AWS can have varying amount of access to these services depending on the IAM policy attached.","DecoderName":"PLAIN","Verified":false,"VerificationFromCache":false,"Raw":"AKIASP2TPHJSQH3FJRUX","RawV2":"AKIASP2TPHJSQH3FJRUX:wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY","Redacted":"AKIASP2TPHJSQH3FJRUX","ExtraData":{"account":"171436882533","is_canary":"true","message":"This is an AWS canary token generated at canarytokens.org.","resource_type":"Access key"},"StructuredData":null}
+```
+
+```console
+{"level":"info-0","ts":"2026-07-14T01:53:52Z","logger":"trufflehog","msg":"finished scanning","chunks":2,"bytes":10364,"verified_secrets":0,"unverified_secrets":1,"scan_duration":"5.761804ms","trufflehog_version":"dev","verification_caching":{"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
+```
+
+**Complete `count=3` run** — full stdout (three JSON objects) followed by the banner:
+
+```json
+{"SourceMetadata":{"Data":{"Filesystem":{"file":"boundary_10240.txt","line":1}}},"SourceID":1,"SourceType":15,"SourceName":"trufflehog - filesystem","DetectorType":2,"DetectorName":"AWS","DetectorDescription":"AWS (Amazon Web Services) is a comprehensive cloud computing platform offering a wide range of on-demand services like computing power, storage, databases. API keys for AWS can have varying amount of access to these services depending on the IAM policy attached.","DecoderName":"BASE64","Verified":false,"VerificationFromCache":false,"Raw":"AKIASP2TPHJSQH3FJRUX","RawV2":"AKIASP2TPHJSQH3FJRUX:wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY","Redacted":"AKIASP2TPHJSQH3FJRUX","ExtraData":{"account":"171436882533","is_canary":"true","message":"This is an AWS canary token generated at canarytokens.org.","resource_type":"Access key"},"StructuredData":null}
+{"SourceMetadata":{"Data":{"Filesystem":{"file":"boundary_10240.txt","line":1}}},"SourceID":1,"SourceType":15,"SourceName":"trufflehog - filesystem","DetectorType":2,"DetectorName":"AWS","DetectorDescription":"AWS (Amazon Web Services) is a comprehensive cloud computing platform offering a wide range of on-demand services like computing power, storage, databases. API keys for AWS can have varying amount of access to these services depending on the IAM policy attached.","DecoderName":"BASE64","Verified":false,"VerificationFromCache":false,"Raw":"AKIASP2TPHJSQH3FJRUX","RawV2":"AKIASP2TPHJSQH3FJRUX:wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY","Redacted":"AKIASP2TPHJSQH3FJRUX","ExtraData":{"account":"171436882533","is_canary":"true","message":"This is an AWS canary token generated at canarytokens.org.","resource_type":"Access key"},"StructuredData":null}
+{"SourceMetadata":{"Data":{"Filesystem":{"file":"boundary_10240.txt","line":1}}},"SourceID":1,"SourceType":15,"SourceName":"trufflehog - filesystem","DetectorType":2,"DetectorName":"AWS","DetectorDescription":"AWS (Amazon Web Services) is a comprehensive cloud computing platform offering a wide range of on-demand services like computing power, storage, databases. API keys for AWS can have varying amount of access to these services depending on the IAM policy attached.","DecoderName":"BASE64","Verified":false,"VerificationFromCache":false,"Raw":"AKIASP2TPHJSQH3FJRUX","RawV2":"AKIASP2TPHJSQH3FJRUX:wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY","Redacted":"AKIASP2TPHJSQH3FJRUX","ExtraData":{"account":"171436882533","is_canary":"true","message":"This is an AWS canary token generated at canarytokens.org.","resource_type":"Access key"},"StructuredData":null}
+```
+
+```console
+{"level":"info-0","ts":"2026-07-14T01:53:45Z","logger":"trufflehog","msg":"finished scanning","chunks":2,"bytes":10364,"verified_secrets":0,"unverified_secrets":3,"scan_duration":"4.72829ms","trufflehog_version":"dev","verification_caching":{"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
+```
+
+All three `count=3` objects are **byte-identical**: `DetectorName":"AWS"`, `DecoderName":"BASE64"`, `line":1`, `Raw":"AKIASP2TPHJSQH3FJRUX"`, and the same `RawV2`. They are **not** collapsed, because the skip rule deliberately spares same-decoder repeats [`pkg/engine/engine.go:1210-1214`].
+
+**Input immutability** — the hash is identical before and after both N = 100 sweeps:
+
+```console
+$ sha256sum /tmp/th_investigation/boundary_10240.txt   # measured before and after every sweep
+d1d00e1472f49913f1fa8dfb0ec05ff3ba4dfbb4f01da5d2b224e288218ce287  /tmp/th_investigation/boundary_10240.txt
+```
+
+**Root cause.**
+
+- **Observed anchors.** Every run reports `chunks":2` (banners above); each `count=3` run emits **three** `BASE64` results all at `line":1`; each `count=1` run emits **one** `PLAIN` at `line":1`; the input hash is constant.
+- **Chunk overlap (source-derived).** `ChunkSize = 10240`, `PeekSize = 3072`, `TotalChunkSize = 13312` [`pkg/sources/chunker.go:14-18`]; each chunk is `chunkSize` fresh bytes followed by a `Peek` into the next chunk [`chunker.go:119-126`]. Because the Base64 run begins exactly at offset 10240, it appears in **both** chunk 1's peek region *and* chunk 2's fresh region — so two chunks each decode it.
+- **Per-match-span dispatch (source-derived; the 2-plus-1 split is inferred).** `Base64.FromChunk` rebuilds the chunk **in place**, leaving the untouched line-1 plaintext key alongside the decoded run [`pkg/decoders/base64.go:34-72`]. In chunk 1 the two `AKIA…` occurrences (plaintext at offset 0, decoded near offset 10240) are **more than 512 bytes apart**, so the Aho-Corasick core (`defaultOffsetRadius = 512` [`pkg/engine/ahocorasick/ahocorasickcore.go:155`]) keeps them as **two un-merged match spans** (`mergeMatches` merges only overlapping/adjacent spans [`ahocorasickcore.go:194-217`]); `detectChunk` then dispatches **one `FromData` call per span** [`pkg/engine/engine.go:1061-1075`] → two `BASE64` results, with chunk 2 contributing the third. The exact split into two-from-chunk-1 plus one-from-chunk-2 is **inferred** from the observed `chunks:2` and `count=3`; what is directly **observed** is three `BASE64@1` results. Each result's line is computed by `FragmentLineOffset` as the **first** `Raw` occurrence [`pkg/engine/engine.go:1256-1261`], which is the line-1 plaintext — so all three report `line":1`.
+- **Same-decoder retention (source-grounded).** All three `BASE64` results share an identical dedupe key (same `DetectorType` + `Raw` + `RawV2` + `SourceMetadata`, including `line":1`) **and** the same decoder type, so the guard `val != result.DecoderType` is false for each — none is dropped [`pkg/engine/engine.go:1216-1221`, comment `:1210-1214`].
+- **The 1 ↔ 3 race.** The lone `PLAIN` result carries the **same key but a different decoder**, so `PLAIN` and the `BASE64` trio compete for the single LRU slot: if `PLAIN` `Add`s first, the three `BASE64` results are dropped as different-decoder duplicates → **count 1**; if a `BASE64` `Add`s first, all three same-decoder `BASE64` results survive and the later `PLAIN` is dropped → **count 3**. Eight detector workers run even at `--concurrency=1` (§5.5), so the race **persists** at `--concurrency=1` (30 of 100 above).
+
+**Bearing on Q4/Q6.** This is precisely why "equal computed lines → one result" is **not** universally true: here **every** match computes the **same** line 1, yet the count is **1 or 3**, never fixed. The count depends jointly on (a) the computed-line key component, (b) whether same-key duplicates share a decoder type (same-decoder → retained; different-decoder → collapsed), and (c) which decoder wins the shared-key race.
+
+---
+
 ## §6 Per-question answers (by name)
 
 ### §6.1 Q1 — Multi-encoding handling
@@ -553,13 +637,14 @@ run 5: total_results=3 errOverlap_count=0
 
 ### §6.4 Q4 — Deduplication effect on the final result count
 
-**Direct answer:** deduplication is an LRU pass in `notifierWorker` that **collapses same-secret repeats whose decoder type differs but whose key otherwise matches** — so the raw-then-Base64 layouts (A/G/H) collapse to **1**, while different-line layouts (D→2, F→3) all survive.
+**Direct answer:** deduplication is an LRU pass in `notifierWorker` that **collapses same-secret repeats whose decoder type differs but whose key otherwise matches** — so the raw-then-Base64 layouts (A/G/H) collapse to **1**, while different-line layouts (D→2, F→3) all survive. Crucially, it does **not** collapse repeats that share the **same** decoder type: those are retained by design, so one logical secret can still produce **2–3 results on the same computed line** when a single decoder matches it more than once (§5.11).
 
 - `notifierWorker` holds `dedupeCache *lru.Cache[string, detectorspb.DecoderType]` [`pkg/engine/engine.go:209`], sized `const cacheSize = 512` [`engine.go:491`].
 - The key is `key := fmt.Sprintf("%s%s%s%+v", result.DetectorType.String(), result.Raw, result.RawV2, result.SourceMetadata)` [`pkg/engine/engine.go:1216`] — it **includes `SourceMetadata` (which contains the line number)** and **excludes the decoder type**; the decoder type is stored as the cache **value**.
 - The skip rule: `if val, ok := e.dedupeCache.Get(key); ok && (val != result.DecoderType || result.SourceType == sourcespb.SourceType_SOURCE_TYPE_POSTMAN) { continue }` else `e.dedupeCache.Add(key, result.DecoderType)` [`engine.go:1217-1221`]. So a second result with the **same key but a different decoder type** is dropped. (The Postman clause dedupes Postman results regardless of decoder type — a deliberate special case noted in the code comment [`engine.go:1210-1215`].)
+- **Same-decoder duplicates are retained, not collapsed.** The skip fires *only* when the cached decoder type **differs**; a repeat with the **same** decoder type falls through the `Get` guard and is emitted again. The comment is explicit: TruffleHog wants to "include duplicate results with the same decoder type" because those "SHOULD have their own entry in the results list, this would happen if the same secret is found multiple times" [`pkg/engine/engine.go:1210-1214`]. So the dedupe reduces the count **only for different-decoder repeats of one key**; **same-decoder** repeats of one key all survive. This is the mechanism behind §5.11, where a Base64 form on a `ChunkSize` boundary yields **three** identical `BASE64` results on the **same line 1** that all survive.
 
-**Observed:** Cases A/G/H → 1 result (the two decoder-typed matches share one key); Case D → 2 and Case F → 3 (different lines → different keys). The overlap fixture's count (3) is **unaffected** by this dedupe (different `DetectorType`/`Raw` per detector → distinct keys).
+**Observed:** Cases A/G/H → 1 result (the two *different*-decoder matches share one key; one is dropped); Case D → 2 and Case F → 3 (different computed lines → different keys). The chunk-boundary case (§5.11) → **1 ↔ 3 on the same computed line 1** (three *same*-decoder `BASE64` duplicates are retained, racing against the lone `PLAIN`). The overlap fixture's count (3) is **unaffected** by this dedupe (different `DetectorType`/`Raw` per detector → distinct keys).
 
 ### §6.5 Q5 — Dedupe-vs-overlap ordering
 
@@ -573,17 +658,18 @@ This is labeled **(inferred / source-derived)** because the two mechanisms are n
 
 ### §6.6 Q6 — One-vs-many variability
 
-**Direct answer:** the same logical secret yields **one** result when both encodings resolve to the **same computed first-occurrence line** (identical dedupe key → collapse) and **multiple** results when they resolve to **different computed lines** (distinct keys → both survive). The discriminator is the *computed* `SourceMetadata` line — **not** the physical placement of the encodings. When it collapses to one, *which decoder type survives is a genuine race*, so the reported `DecoderName` flips run-to-run.
+**Direct answer:** the count is governed by **two** things, not one. **(1) Different-decoder repeats:** for the `PLAIN` view of the raw key vs the `BASE64` view of its encoded form, the dedupe key's **computed first-occurrence line** decides collapse-vs-survive — same computed line → identical key → one of the two is dropped as a *different*-decoder duplicate (and *which* one survives is a genuine race, so the reported `DecoderName` flips run-to-run); different computed lines → distinct keys → both survive. The discriminator here is the *computed* `SourceMetadata` line, **not** the physical placement of the encodings. **(2) Same-decoder repeats:** a repeat carrying the **same** decoder type is **retained** [`engine.go:1210-1214`], so when one decoder matches the secret **more than once**, the **same** computed line yields **multiple** results — and the one-vs-many outcome then becomes a race over whether the lone `PLAIN` or the several duplicate `BASE64` results claim the shared key first (§5.11).
 
 - The dedupe key includes the line number (via `SourceMetadata`) but **not** the decoder type [`engine.go:1216`]. The line number is the **first-occurrence** line: `FragmentLineOffset` does `before, after, found := bytes.Cut(chunk.Data, result.Raw)` and counts newlines in `before` [`pkg/engine/engine.go:1256-1261`]; `SetResultLineNumber` applies it [`engine.go:1321-1324`], invoked from `processResult` [`engine.go:1166`].
 - **Physical placement ≠ computed line.** Because `Base64` rebuilds the chunk *in place* and keeps the surrounding plaintext, within one chunk the rebuilt data contains the key at **both** the plaintext position and the decoded position; `bytes.Cut` finds the **earlier** (plaintext) one. So for any layout where the **plaintext precedes the Base64 form in one chunk**, both the `PLAIN` and `BASE64` views compute the **same** line — even though the Base64 bytes physically sit on a later line. This is why:
   - **Case A** (plaintext L1, Base64 L2, adjacent) → both compute line 1 → **collapse to 1**.
   - **Case G** (both on the same physical line 1) → both compute line 1 → **collapse to 1**.
   - **Case H** (plaintext L1, Base64 L10, filler between, one chunk) → both compute line 1 → **collapse to 1**.
-  All three collapse *despite different physical arrangements*, confirming the discriminator is the computed line.
+  All three collapse *despite different physical arrangements*, confirming that — for these **different-decoder** repeats (one `PLAIN`, one `BASE64`) — the discriminator is the computed line, not the physical arrangement. (Same-decoder multiplicity on a single line is a separate mechanism — §5.11.)
 - **Raw→Base64 collapses; Base64→raw survives (asymmetry).** In **Case D** the Base64 form is on line 1 and the plaintext on line 2. The `BASE64` view's first `AKIA…` occurrence is the decoded line-1 run (line 1); the `PLAIN` view's first occurrence is the line-2 plaintext (line 2). The two computed lines **differ** → two distinct keys → **both survive (2)**. So an otherwise-identical file **collapses** when the plaintext comes first (A/G/H) but **survives as two** when the Base64 comes first (D).
-- **Different chunks always survive.** **Case F** splits the encodings across chunks; the `PLAIN` match (line 1) and the two `BASE64` matches (lines 9 and 157, from the `PeekSize` chunk overlap, §5.8) have three distinct lines → **3 results**.
-- **Which decoder survives on collapse is a race (source-derived).** The `PLAIN` and `BASE64` results are produced by concurrent detector workers (8 of them even at `--concurrency=1`, §5.5) and delivered to the shared LRU; whichever `Add`s its key first wins the slot, and the later one is dropped as a "different decoder type" duplicate [`engine.go:1217`]. Measured: BASE64:79 / PLAIN:21 (Case A, default); BASE64:15 / PLAIN:35 (Case A, `--concurrency=1`) — the race **persists** at `--concurrency=1`, only shifting toward PLAIN.
+- **Different chunks → different lines → survive (usually).** **Case F** splits the encodings across chunks; the `PLAIN` match (line 1) and the two `BASE64` matches (lines 9 and 157, from the `PeekSize` chunk overlap, §5.8) have three distinct computed lines → **3 results**. Chunk overlap does **not** always produce *different* lines, however: when the Base64 run sits exactly on a `ChunkSize` boundary, the duplicate `BASE64` matches land on the **same** computed line 1 and survive as *same*-decoder duplicates (§5.11).
+- **Same-decoder duplicates survive on the *same* line.** When one decoder matches the secret more than once — because a Base64 run straddles a `ChunkSize` boundary and is therefore processed in **two overlapping chunks** [`pkg/sources/chunker.go:14-18`, peek assembly `:119-126`], and/or because a far-separated plaintext+decoded pair inside the rebuilt Base64 view occupies two Aho-Corasick match spans that are **not** merged (`defaultOffsetRadius = 512` [`pkg/engine/ahocorasick/ahocorasickcore.go:155`]; `mergeMatches` merges only overlapping/adjacent spans [`ahocorasickcore.go:194-217`]) and each span is dispatched to the detector separately [`pkg/engine/engine.go:1061-1075`] — the resulting `BASE64` results share an identical key **including the same computed line 1**, yet are **all kept** because the skip rule spares same-decoder repeats [`engine.go:1210-1214`]. So the same computed line can carry **2–3** results, not just one (§5.11).
+- **Which decoder survives on collapse is a race (source-derived).** The `PLAIN` and `BASE64` results are produced by concurrent detector workers (8 of them even at `--concurrency=1`, §5.5) and delivered to the shared LRU; whichever `Add`s its key first wins the slot, and the later one is dropped as a "different decoder type" duplicate [`engine.go:1217`]. Measured: BASE64:79 / PLAIN:21 (Case A, default); BASE64:15 / PLAIN:35 (Case A, `--concurrency=1`) — the race **persists** at `--concurrency=1`, only shifting toward PLAIN. The same-line multiplicity race is measured directly in §5.11 (count 1 ↔ 3 on the same unchanged boundary input, at both default and `--concurrency=1`).
 
 ---
 
@@ -593,11 +679,12 @@ The three behaviors are produced by **two independent mechanisms**: (i) **result
 
 | User's observation | Mechanism | Effect | Reproduced by | Root cause |
 |--------------------|-----------|--------|---------------|------------|
-| "reported twice with different decoder types" | **Deduplication — no collapse** | count = 2 (or 3) | Case D (§5.4) → 2; Case F (§5.8) → 3 | Encodings on **different computed lines** → different `SourceMetadata` → **different dedupe keys** → all survive [`engine.go:1216`]. Base64-before-plaintext (D) or split across chunks (F) |
-| "deduplicated down to a single result" | **Deduplication — collapse** | count = 1 | Cases A (§5.5), G (§5.6), H (§5.7) | Plaintext precedes Base64 in one chunk → both compute the **same first-occurrence line** → identical key → second dropped; **surviving decoder type is a race** [`engine.go:1217-1221`] |
+| "reported twice with different decoder types" | **Deduplication — no collapse (different-decoder)** | count = 2 (or 3) | Case D (§5.4) → 2; Case F (§5.8) → 3 | Encodings on **different computed lines** → different `SourceMetadata` → **different dedupe keys** → all survive [`engine.go:1216`]. Base64-before-plaintext (D) or split across chunks (F) |
+| "reported multiple times with the **same** decoder type (same line)" | **Deduplication — same-decoder retention** | count = 2–3 (races with 1) | Chunk-boundary case (§5.11) → **1 ↔ 3** | One decoder matches the secret **more than once** (Base64 run on a `ChunkSize` boundary → two overlapping chunks [`chunker.go:119-126`]; and/or un-merged Aho-Corasick spans [`ahocorasickcore.go:194-217`]) → several `BASE64` results with an **identical key and identical decoder type**, all kept [`engine.go:1210-1214`]; races the lone `PLAIN` for the shared key |
+| "deduplicated down to a single result" | **Deduplication — collapse (different-decoder)** | count = 1 | Cases A (§5.5), G (§5.6), H (§5.7) | Plaintext precedes Base64 in one chunk → both compute the **same first-occurrence line** → identical key → second (different-decoder) dropped; **surviving decoder type is a race** [`engine.go:1217-1221`] |
 | "reported an overlap error" | **Verification-overlap** (separate) | count unchanged; adds `errOverlap` annotation | Two-detector fixture (§5.10) | **≥2 different detectors** match one chunk [`engine.go:796`, `:988`]; **never** fired by the lone AWS key (0 across A–H) |
 
-Key insight: the "overlap error" is **not** a deduplication outcome and **cannot** be produced by a single AWS key no matter how it is encoded — it requires a second, different detector matching the same bytes. Conversely, the "one vs many results" behavior is purely about the dedupe key's **computed-line** component (and the raw-first vs Base64-first asymmetry) and never emits an overlap error. Conflating the two is the source of the apparent inconsistency.
+Key insight: the "overlap error" is **not** a deduplication outcome and **cannot** be produced by a single AWS key no matter how it is encoded — it requires a second, different detector matching the same bytes. Conversely, the "one vs many results" behavior is a **deduplication** outcome — driven by the dedupe key's **computed-line** component for *different*-decoder repeats (plus the raw-first vs Base64-first asymmetry), **and** by the same-decoder retention rule for repeats carrying one decoder type (§6.4, §6.6, §5.11) — and it never emits an overlap error. Conflating the two mechanisms is the source of the apparent inconsistency.
 
 ---
 
@@ -676,9 +763,9 @@ Notes:
 - [x] **Q1 (multi-encoding handling)** — ordered single-pass chain, Base64 in-place rebuild vs EscapedUnicode clone; `file:line` [`decoders.go:8-16`, `base64.go:67`, `escaped_unicode.go:39`] + observed Cases B/C/E (§6.1)
 - [x] **Q2 (decoder types)** — `PLAIN`/`BASE64`/`UTF16`/`ESCAPED_UNICODE` (+`UNKNOWN=0`); enum [`proto/detectors.proto:7-13`] + per-decoder `Type()` + observed (§6.2)
 - [x] **Q3 (overlap detection)** — gate `>1 detector` [`engine.go:796`], `errOverlap` [`engine.go:39`, `:988`]; observed 0 for lone AWS across **A–H**, fired by 2-detector fixture (§6.3, §5.10)
-- [x] **Q4 (dedup effect)** — 512-entry LRU, key excludes decoder type / includes computed line [`engine.go:1216-1221`]; observed A/G/H→1, D→2, F→3 (§6.4)
+- [x] **Q4 (dedup effect)** — 512-entry LRU suppresses only same-key **different-decoder** repeats; **same-decoder** repeats retained by design [`engine.go:1210-1221`]; key excludes decoder type / includes computed line; observed A/G/H→1, D→2, F→3, and same-line **1↔3** at a `ChunkSize` boundary (§6.4, §5.11)
 - [x] **Q5 (ordering)** — dedupe **after** overlap, **(inferred / source-derived)** from stage order [`engine.go:1186`→`:1190`, `docs/concurrency.md:10-21`, `:28-37`] (§6.5)
-- [x] **Q6 (one-vs-many)** — same **computed** line→1 (decoder a race), different lines→2/3; physical-placement-vs-computed-line distinction and raw-first-vs-Base64-first asymmetry; first-occurrence line via `FragmentLineOffset` [`engine.go:1256-1261`]; observed distributions + concurrency mechanism (§6.6, §5.5)
+- [x] **Q6 (one-vs-many)** — *different*-decoder repeats collapse on the same **computed** line (decoder a race) but survive on different lines (→2/3); **same-decoder** repeats are retained so the same computed line can still yield **2–3** results (chunk-boundary case §5.11); physical-placement-vs-computed-line distinction, raw-first-vs-Base64-first asymmetry, first-occurrence line via `FragmentLineOffset` [`engine.go:1256-1261`], same-decoder retention [`engine.go:1210-1214`], per-match-span dispatch [`engine.go:1061-1075`] + span merge [`ahocorasickcore.go:194-217`]; observed distributions + concurrency mechanism (§6.6, §5.5, §5.11)
 - [x] **Same-physical-line layout (Case G)** and **filler-separated single-chunk layout (Case H)** exercised, each collapsing to 1 with a decoder race (§5.6, §5.7); both included in the lone-AWS zero-overlap check (§5.10)
 - [x] **Read-only mandate** — only this `blitzy/` doc differs from the pinned commit; empty source diff; artifacts removed (§10)
 - [x] **Test-data removal** — all `/tmp` artifacts removed with post-cleanup absence checks; fixtures only copied; Go caches documented as external/untouched (§10)
@@ -963,6 +1050,83 @@ exit $rc_all
 - **Case H, N=100, default / N=50, `--concurrency=1`:** `count=1` every run; `BASE64 : 73 / PLAIN : 27` and `BASE64 : 37 / PLAIN : 13`. Invariant: always 1 result.
 - **Overlap fixture, N=20:** `total_results=3` every run; `errOverlap_count=1` on 16 runs, `=2` on 4 runs. Invariant: always 3 results.
 - **Overlap fixture + `--allow-verification-overlap`, N=5:** `total_results=3 errOverlap_count=0` every run. Invariant: always 3 results, 0 annotations.
+
+### §12.4 Chunk-boundary input generator (`gen_boundary.py`) + tally (drives §5.11)
+
+`gen_boundary.py` builds the boundary input entirely under `/tmp` (outside the repository). It positions the Base64 form of the AWS key to **begin exactly at byte offset `ChunkSize` = 10240**, so the encoded run straddles the chunk/peek boundary. Re-running it reproduces the file byte-for-byte (verified: `cmp` reports identical; `sha256 = d1d00e14…`):
+
+```python
+#!/usr/bin/env python3
+# gen_boundary.py — builds the §5.11 chunk-boundary input entirely under /tmp.
+# The Base64 form of the AWS key is positioned to BEGIN exactly at byte offset
+# ChunkSize (10*1024 = 10240) so it straddles the chunk/peek boundary.
+import base64, sys, hashlib
+
+CHUNK_SIZE = 10 * 1024            # pkg/sources/chunker.go:14 (ChunkSize)
+key_id = "AKIASP2TPHJSQH3FJRUX"
+secret = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+line1  = f"{key_id} {secret}"                     # 61 bytes, the raw key (PLAIN)
+b64    = base64.b64encode(line1.encode()).decode()  # 84 chars, the BASE64 form
+
+prefix = line1 + "\n"                              # bytes [0, 62)
+pad_len = CHUNK_SIZE - len(prefix)                 # bytes needed before offset 10240
+assert pad_len % 2 == 0, pad_len
+filler = ".\n" * (pad_len // 2)                    # dotted filler ending on a newline
+data = prefix + filler + b64 + "\n"                # b64 begins exactly at offset 10240
+
+out = sys.argv[1] if len(sys.argv) > 1 else "/tmp/th_investigation/boundary_10240.txt"
+with open(out, "w") as f:
+    f.write(data)
+
+blob = data.encode()
+print("b64 begins at offset:", blob.index(b64.encode()))
+print("total bytes:", len(blob))
+print("sha256:", hashlib.sha256(blob).hexdigest())
+```
+
+```console
+$ python3 gen_boundary.py /tmp/th_investigation/boundary_10240.txt
+b64 begins at offset: 10240
+total bytes: 10325
+sha256: d1d00e1472f49913f1fa8dfb0ec05ff3ba4dfbb4f01da5d2b224e288218ce287
+```
+
+`boundary_tally.sh` runs the **same unchanged input** N times through the real `filesystem` CLI and tallies the result-count and decoder-signature distributions (same shape as `race_tally.sh` in §12.2, but it records the full count distribution rather than asserting a fixed count):
+
+```bash
+#!/usr/bin/env bash
+# Runs the SAME unchanged input N times through the real filesystem CLI and tallies
+# result-count and decoder-signature distribution. Usage: boundary_tally.sh <file> <N> [extra flags...]
+set -euo pipefail
+FILE="$1"; N="$2"; shift 2
+BIN=/tmp/th/trufflehog
+declare -A count_hist
+declare -A sig_hist
+for i in $(seq 1 "$N"); do
+  out="$("$BIN" filesystem "$FILE" --no-update --json --no-verification "$@" 2>/dev/null)"
+  # count of result lines (non-empty JSON objects)
+  c="$(printf '%s' "$out" | grep -c '"DetectorName"' || true)"
+  # signature: sorted decoder@line tuples
+  sig="$(printf '%s\n' "$out" | grep -o '"DecoderName":"[^"]*"' | sed 's/"DecoderName":"//;s/"//' | sort | tr '\n' ',' )"
+  count_hist["$c"]=$(( ${count_hist["$c"]:-0} + 1 ))
+  sig_hist["$sig"]=$(( ${sig_hist["$sig"]:-0} + 1 ))
+done
+echo "  count distribution:"
+for k in $(printf '%s\n' "${!count_hist[@]}" | sort -n); do echo "    count=$k : ${count_hist[$k]}"; done
+echo "  decoder-signature distribution:"
+for k in "${!sig_hist[@]}"; do echo "    [$k] : ${sig_hist[$k]}"; done
+```
+
+The §5.11 distributions were produced by:
+
+```console
+$ bash /tmp/th_investigation/boundary_tally.sh /tmp/th_investigation/boundary_10240.txt 100
+$ bash /tmp/th_investigation/boundary_tally.sh /tmp/th_investigation/boundary_10240.txt 100 --concurrency=1
+```
+
+- **boundary_10240 (Base64 begins at offset = `ChunkSize`), N=100, default concurrency:** `count=1 : 42`, `count=3 : 58` (signatures `[PLAIN,]` vs `[BASE64,BASE64,BASE64,]`). Invariant: only ever **1 or 3**; both outcomes appear on the same unchanged input.
+- **boundary_10240, N=100, `--concurrency=1`:** `count=1 : 70`, `count=3 : 30`. Invariant: the race **persists** — `--concurrency=1` biases toward `PLAIN` but does not stabilise the count.
+- **Input immutability:** `sha256 = d1d00e14…` measured identical before and after both sweeps.
 
 ---
 
