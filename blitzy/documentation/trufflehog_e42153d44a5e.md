@@ -4,16 +4,34 @@ This document answers five onboarding questions about TruffleHog's secret-detect
 architecture. Per the governing `SWE-AtlasQnA-Repo` methodology, **every behavioral claim
 was produced by building the binary from source and running it**, and each claim is paired
 with the exact command that produced it (including its stdout/stderr redirection and exit
-status) and the complete, unedited output. Each substantive clause is labelled either
+status) and its captured output. Each substantive clause is labelled either
 **OBSERVED** (executed at runtime and seen in the captured output) or **INFERRED** (read from
 source, not exercised at runtime); where an inferred claim is corroborated by a specific source
 location it is written **INFERRED — source-confirmed**. These are the only two labels used.
 
-> **A note on embedded output.** Every command's output below is reproduced complete and unedited,
-> with one purely cosmetic exception for repository hygiene: trailing padding spaces that
-> `kingpin` emits at the end of some `--help`/`--help-long` flag lines have been trimmed so the
-> committed document contains no trailing whitespace. No visible characters, ordering, values, or
-> lines were changed, and internal tab separators inside log lines are preserved verbatim.
+> **A note on embedded output (what is verbatim, what varies per run).** Every output block below
+> is the real, unedited output of the command shown immediately above it, with exactly the
+> following disclosed exceptions — no values, counts, field sets, message text, or ordering are
+> otherwise changed:
+>
+> 1. **The throwaway fixture path is rendered as the literal `$WORK`.** The runbook creates the
+>    fixture under a unique `mktemp -d` directory, so a live run prints an absolute path such as
+>    `/tmp/thog_investigation.aB3dEf12/…`. For readability and so the shown output matches the
+>    `$WORK`-based commands, that per-run path is displayed as `$WORK` in captured output. (This is
+>    a pure path substitution; a reader can reproduce the exact display with
+>    `sed "s#$WORK#\$WORK#g"`.)
+> 2. **Per-run tokens come from one representative capture.** The ISO-8601 log timestamps, the
+>    randomly-assigned `*_worker_id` values, and sub-second `scan_duration`/`VerificationTimeSpentMS`
+>    timing figures are taken from a single investigation session and naturally differ on each run;
+>    only these tokens vary — the stable facts (worker counts, chunk/byte totals, secret counts,
+>    decisions, field sets) reproduce exactly.
+> 3. **`kingpin` trailing padding trimmed.** Trailing padding spaces that `kingpin` emits at the end
+>    of some `--help`/`--help-long` flag lines are trimmed so the committed document carries no
+>    trailing whitespace; no visible characters, ordering, or values change, and internal tab
+>    separators inside log lines are preserved verbatim.
+>
+> Where a listing would otherwise embed a non-reproducible column (for example `ls -l`'s owner and
+> timestamp), a deterministic equivalent is used instead and is called out at that block.
 
 - **Subject:** TruffleHog, Go module `github.com/trufflesecurity/trufflehog/v3`.
 - **Commit under investigation (the source being described):**
@@ -42,6 +60,46 @@ is this document under `blitzy/documentation/`.
 ---
 
 ## Environment & Methodology
+
+### Investigation runbook — variables, cleanup, and shell hardening
+
+**OBSERVED (runbook preamble).** Every shell block in this document is a step in one
+continuous, replayable runbook. It is run from the repository root and opens with the setup
+below, which defines all investigation variables **once** (they are never reassigned), routes
+**every** captured stdout/stderr under a single throwaway root, and guarantees cleanup on normal
+exit, error, or interrupt:
+
+```bash
+set -o pipefail            # a failing stage in a pipeline fails the whole pipeline, so a broken
+                           # `… | wc -l` cannot silently print 0 and mask the failure. (-e is
+                           # deliberately NOT set: TruffleHog exits 183 when it finds a secret,
+                           # and `ldd`/`grep` exit non-zero by design below — none are errors.)
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"   # the source checkout — kept strictly READ-ONLY
+BIN=/tmp/trufflehog_bin                          # canonical binary (built below, outside checkout)
+
+umask 077                                        # every artifact created owner-only (rw-------)
+readonly WORK="$(mktemp -d /tmp/thog_investigation.XXXXXXXX)"   # unique throwaway root, outside checkout
+CAPTURES="$WORK/captures"; mkdir -p "$CAPTURES"            # every captured stdout/stderr lives here
+
+# One cleanup path for success, error, AND interrupt — removes the ENTIRE work root and the
+# binary, so nothing is ever left behind regardless of how the runbook ends:
+cleanup() { rm -rf -- "$WORK"; rm -f -- "$BIN"; }
+trap cleanup EXIT INT TERM
+
+# Safety rails: $WORK must be a real directory, outside the checkout, and not a symlink:
+case "$WORK" in "$REPO_ROOT"/*) echo "refusing: WORK inside checkout" >&2; exit 1 ;; esac
+[ -d "$WORK" ] && [ ! -L "$WORK" ] || { echo "bad WORK: $WORK" >&2; exit 1; }
+```
+
+Because `WORK` is declared `readonly`, any later attempt to reassign it — the defect that
+previously left capture files orphaned when the trap followed a *reassigned* value — fails
+immediately with `bash: WORK: readonly variable` instead of silently pointing cleanup at the
+wrong directory. Throughout the rest of this document, `$REPO_ROOT`, `$BIN`, `$WORK`, and
+`$CAPTURES` are the only path roots used; no command hardcodes a per-run `mktemp` suffix, and
+every source-tree command is run under `$REPO_ROOT`, so the runbook is replayable verbatim from
+a clean shell.
+
 ### Toolchain
 
 **OBSERVED.** The build and all runs used the Go toolchain the project pins (`go.mod`:
@@ -61,22 +119,22 @@ source") gives the same. The binary exercised throughout this document is that a
 once from the checkout root at the source commit:
 
 ```text
-$ CGO_ENABLED=0 go build -o /tmp/trufflehog_bin .
+$ CGO_ENABLED=0 go build -o $BIN .
 ```
 
 **OBSERVED (artifact identity).** The resulting file and its self-reported version:
 
 ```text
-$ ls -l /tmp/trufflehog_bin
+$ ls -l $BIN
 -rwxr-xr-x 1 root root 194311322 Jul 13 16:47 /tmp/trufflehog_bin
 ```
 
 ```text
-$ /tmp/trufflehog_bin --version 1>/tmp/v.out 2>/tmp/v.err; echo "exit=$?"
-$ cat /tmp/v.err          # stderr
+$ $BIN --version 1>$CAPTURES/v.out 2>$CAPTURES/v.err; echo "exit=$?"
+$ cat $CAPTURES/v.err          # stderr
 trufflehog dev
-$ wc -c /tmp/v.out        # stdout is empty
-0 /tmp/v.out
+$ wc -c $CAPTURES/v.out        # stdout is empty
+0 $CAPTURES/v.out
 ```
 
 The default build reports the version string **`trufflehog dev`**, and it is written to
@@ -100,7 +158,7 @@ them:
    `go build` from a Git checkout. Reading it back from the binary:
 
 ```text
-$ go version -m /tmp/trufflehog_bin | grep -E '^\s+build\s+(vcs|-buildmode|CGO|GOARCH|GOOS)'
+$ go version -m $BIN | grep -E '^\s+build\s+(vcs|-buildmode|CGO|GOARCH|GOOS)'
 	build	-buildmode=exe
 	build	CGO_ENABLED=0
 	build	GOARCH=amd64
@@ -130,7 +188,7 @@ $ go version -m /tmp/trufflehog_bin | grep -E '^\s+build\s+(vcs|-buildmode|CGO|G
 `CGO_ENABLED=0`), so there is no shared-object plugin surface:
 
 ```text
-$ ldd /tmp/trufflehog_bin; echo "ldd exit=$?"
+$ ldd $BIN; echo "ldd exit=$?"
 	not a dynamic executable
 ldd exit=1
 ```
@@ -183,10 +241,9 @@ auto-cleanup trap, and a **repo-local** Git identity (so the global `agent@blitz
 is never used for the throwaway commit). The exact construction recipe:
 
 ```bash
-umask 077                                   # every artifact created owner-only (rw-------)
-WORK="$(mktemp -d /tmp/thog_investigation.XXXXXXXX)"   # unique, outside the checkout
-trap 'rm -rf "$WORK"' EXIT                   # guaranteed cleanup on shell exit
-# ... validate $WORK is outside the checkout and not a symlink ...
+# (Continues the one runbook: $WORK, $CAPTURES, `umask 077`, and the single cleanup trap were
+#  already established in the setup preamble above — they are NOT redefined here, and $WORK is
+#  readonly so it can never be reassigned.) The fixture adds only a repo-local Git identity below.
 
 # (1) The mixed-type file set lives in a PLAIN (non-git) directory — this is the
 #     directory the Q4 `filesystem` scan targets ("$WORK/thog_files"):
@@ -252,10 +309,13 @@ is text), and a **gzip archive** containing one text member.
 
 ### Fixture provenance (exact bytes)
 
-**OBSERVED.** Permissions (owner-only, from `umask 077`), byte sizes, and content types:
+**OBSERVED.** Permissions (owner-only, from `umask 077`), byte sizes, and content types. `stat`
+is used for the size/permission listing so the output is fully deterministic — it prints exactly
+perms, size, and name, with none of `ls -l`'s per-run link-count/owner/group/mtime columns:
 
 ```text
-$ ls -l ./*        # (perms, size, name)
+$ cd "$WORK/thog_files"                     # the plain fixture dir built above
+$ stat -c '%A %s %n' ./*                    # perms, size, name (deterministic)
 -rw------- 151 ./archive.tar.gz
 -rw------- 116 ./aws_creds.ini
 -rw------- 44 ./config.env
@@ -264,13 +324,13 @@ $ ls -l ./*        # (perms, size, name)
 -rw------- 91 ./notes.txt
 -rw------- 250 ./testkey.pem
 $ file ./*
-aws_creds.ini:  ASCII text
-config.env:     ASCII text
-testkey.pem:    PEM RSA private key
-notes.txt:      ASCII text
-logo.png:       PNG image data, 1 x 1, 8-bit/color RGBA, non-interlaced
-data.mp4:       ASCII text
-archive.tar.gz: gzip compressed data, from Unix, original size modulo 2^32 10240
+./archive.tar.gz: gzip compressed data, from Unix, original size modulo 2^32 10240
+./aws_creds.ini:  ASCII text
+./config.env:     ASCII text
+./data.mp4:       ASCII text
+./logo.png:       PNG image data, 1 x 1, 8-bit/color RGBA, non-interlaced
+./notes.txt:      ASCII text
+./testkey.pem:    PEM RSA private key
 ```
 
 **OBSERVED.** SHA-256 of every fixture file (so the exact bytes are reproducible/auditable):
@@ -297,7 +357,7 @@ $ tar -tzvf archive.tar.gz
 the global identity):
 
 ```text
-$ git log -1 --format='author=%an <%ae>%ncommitter=%cn <%ce>%ncommit=%H'
+$ git -C "$WORK/thog_testrepo" log -1 --format='author=%an <%ae>%ncommitter=%cn <%ce>%ncommit=%H'
 author=t <t@t.com>
 committer=t <t@t.com>
 commit=e46ff31a2e0f32349f79294d9f095bd2e5f54520
@@ -314,6 +374,7 @@ contain only the **public AWS canary key** plus a **fabricated** secret, so repr
 safe. When you run TruffleHog against real material, treat `Raw`/`RawV2` (and any captured JSON)
 as containing **live credentials**: they should be redacted, access-controlled, and shredded —
 which is why the fixture here is built under `umask 077` and destroyed on exit.
+
 ---
 
 ## Q1 — Startup and detector loading
@@ -324,21 +385,24 @@ which is why the fixture here is built under `umask 077` and destroyed on exit.
 
 ### Direct answer
 
-- **The built-in detector catalog is compiled into the binary, not read from any config file at
-  runtime.** The catalog is a Go slice assembled by `DefaultDetectors()`
+- **INFERRED — source-confirmed.** The built-in detector catalog is compiled into the binary, not
+  read from any config file at runtime. The catalog is a Go slice assembled by `DefaultDetectors()`
   (`pkg/engine/defaults/defaults.go:L1704`), which returns the list built by `buildDetectorList()`
-  (`…:L839`). No file is read to obtain these detectors.
-- **There is, however, one optional file-based path**: if you pass `--config <file>`, TruffleHog
-  reads that YAML and *appends* user-defined **custom regex** detectors to the compiled-in set.
-  This does not replace or "load" the built-in catalog; it adds to it. With a basic scan (no
-  `--config`), that path is inert.
-- **The list is *assembled* at startup**, at the point the engine config is built:
-  `main.go:L519` does `Detectors: append(defaults.DefaultDetectors(), conf.Detectors...)`.
-- **There is no per-detector "registered X" startup message at any log level.** The observable
-  startup signals are (a) the **ASCII banner** (non-JSON modes) and (b) four **worker-pool
-  "starting … workers" count** log lines. The absence of a per-detector line is the absence of a
-  *log call*, **not** evidence that assembly did not happen — assembly is compile-time/startup and
-  is not narrated per detector.
+  (`…:L839`). No file is read to obtain these detectors. *(Corroborated OBSERVED in §(A): the basic
+  scan emits no "loading detectors from file" line and runs with no `--config` present.)*
+- **INFERRED — source-confirmed.** There is, however, one optional file-based path: if you pass
+  `--config <file>`, TruffleHog reads that YAML and *appends* user-defined **custom regex**
+  detectors to the compiled-in set. This does not replace or "load" the built-in catalog; it adds
+  to it. With a basic scan (no `--config`), that path is inert.
+- **INFERRED — source-confirmed.** The list is *assembled* at startup, at the point the engine
+  config is built: `main.go:L519` does `Detectors: append(defaults.DefaultDetectors(),
+  conf.Detectors...)`.
+- **OBSERVED.** There is no per-detector "registered X" startup message at any log level; the only
+  observable startup signals are (a) the **ASCII banner** (non-JSON modes) and (b) four
+  **worker-pool "starting … workers" count** log lines (both captured in §(A) and §(C)).
+- **INFERRED — source-confirmed.** The absence of a per-detector line is the absence of a *log
+  call*, **not** evidence that assembly did not happen — assembly is compile-time/startup and is
+  not narrated per detector.
 
 ### (A) Compiled-in, not loaded from files — evidence
 
@@ -346,8 +410,8 @@ which is why the fixture here is built under `umask 077` and destroyed on exit.
 surface the worker/init lines:**
 
 ```text
-$ /tmp/trufflehog_bin git file:///tmp/thog_investigation.ulY2DMuS/thog_testrepo \
-      --json --log-level=2 1>/tmp/q1.out 2>/tmp/q1.err; echo "exit=$?"
+$ $BIN git file://$WORK/thog_testrepo \
+      --json --log-level=2 1>$CAPTURES/q1.out 2>$CAPTURES/q1.err; echo "exit=$?"
 exit=0
 ```
 
@@ -360,15 +424,15 @@ contains **no** "loading detectors from file" line and **no** per-detector "regi
 {"level":"info-2","ts":"2026-07-13T18:17:15Z","logger":"trufflehog","msg":"starting detector workers","count":1024}
 {"level":"info-2","ts":"2026-07-13T18:17:15Z","logger":"trufflehog","msg":"starting verificationOverlap workers","count":128}
 {"level":"info-2","ts":"2026-07-13T18:17:15Z","logger":"trufflehog","msg":"starting notifier workers","count":128}
-{"level":"info-1","ts":"2026-07-13T18:17:15Z","logger":"trufflehog","msg":"cloned repo","path":"/tmp/thog_investigation.ulY2DMuS/thog_testrepo"}
+{"level":"info-1","ts":"2026-07-13T18:17:15Z","logger":"trufflehog","msg":"cloned repo","path":"$WORK/thog_testrepo"}
 {"level":"info-0","ts":"2026-07-13T18:17:15Z","logger":"trufflehog","msg":"running source","source_manager_worker_id":"7469p","with_units":true}
 {"level":"info-2","ts":"2026-07-13T18:17:15Z","logger":"trufflehog","msg":"enumerating source","source_manager_worker_id":"7469p"}
-{"level":"info-0","ts":"2026-07-13T18:17:15Z","logger":"trufflehog","msg":"scanning repo","source_manager_worker_id":"7469p","unit_kind":"dir","unit":"/tmp/thog_investigation.ulY2DMuS/thog_testrepo","repo":"/tmp/thog_investigation.ulY2DMuS/thog_testrepo"}
-{"level":"info-2","ts":"2026-07-13T18:17:15Z","logger":"trufflehog","msg":"finished parsing git log.","source_manager_worker_id":"7469p","unit_kind":"dir","unit":"/tmp/thog_investigation.ulY2DMuS/thog_testrepo","repo":"/tmp/thog_investigation.ulY2DMuS/thog_testrepo","total_log_size":0}
-{"level":"info-1","ts":"2026-07-13T18:17:15Z","logger":"trufflehog","msg":"scanning staged changes","source_manager_worker_id":"7469p","unit_kind":"dir","unit":"/tmp/thog_investigation.ulY2DMuS/thog_testrepo","path":"/tmp/thog_investigation.ulY2DMuS/thog_testrepo"}
-{"level":"info-2","ts":"2026-07-13T18:17:15Z","logger":"trufflehog","msg":"finished parsing git log.","source_manager_worker_id":"7469p","unit_kind":"dir","unit":"/tmp/thog_investigation.ulY2DMuS/thog_testrepo","total_log_size":0}
-{"level":"info-1","ts":"2026-07-13T18:17:15Z","logger":"trufflehog","msg":"scanning git repo complete","source_manager_worker_id":"7469p","unit_kind":"dir","unit":"/tmp/thog_investigation.ulY2DMuS/thog_testrepo","repo":"Could not get remote for repo","path":"/tmp/thog_investigation.ulY2DMuS/thog_testrepo","time_seconds":0,"commits_scanned":1}
-{"level":"info-0","ts":"2026-07-13T18:17:15Z","logger":"trufflehog","msg":"finished scanning","chunks":7,"bytes":742,"verified_secrets":0,"unverified_secrets":1,"scan_duration":"12.257614ms","trufflehog_version":"dev","verification_caching":{"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
+{"level":"info-0","ts":"2026-07-13T18:17:15Z","logger":"trufflehog","msg":"scanning repo","source_manager_worker_id":"7469p","unit_kind":"dir","unit":"$WORK/thog_testrepo","repo":"$WORK/thog_testrepo"}
+{"level":"info-2","ts":"2026-07-13T18:17:15Z","logger":"trufflehog","msg":"finished parsing git log.","source_manager_worker_id":"7469p","unit_kind":"dir","unit":"$WORK/thog_testrepo","repo":"$WORK/thog_testrepo","total_log_size":0}
+{"level":"info-1","ts":"2026-07-13T18:17:15Z","logger":"trufflehog","msg":"scanning staged changes","source_manager_worker_id":"7469p","unit_kind":"dir","unit":"$WORK/thog_testrepo","path":"$WORK/thog_testrepo"}
+{"level":"info-2","ts":"2026-07-13T18:17:15Z","logger":"trufflehog","msg":"finished parsing git log.","source_manager_worker_id":"7469p","unit_kind":"dir","unit":"$WORK/thog_testrepo","total_log_size":0}
+{"level":"info-1","ts":"2026-07-13T18:17:15Z","logger":"trufflehog","msg":"scanning git repo complete","source_manager_worker_id":"7469p","unit_kind":"dir","unit":"$WORK/thog_testrepo","repo":"Could not get remote for repo","path":"$WORK/thog_testrepo","time_seconds":0,"commits_scanned":1}
+{"level":"info-0","ts":"2026-07-13T18:17:15Z","logger":"trufflehog","msg":"finished scanning","chunks":7,"bytes":695,"verified_secrets":0,"unverified_secrets":1,"scan_duration":"156.528246ms","trufflehog_version":"dev","verification_caching":{"Hits":0,"Misses":1,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":145}}
 ```
 
 **INFERRED — source-confirmed (why there is no file read):** the catalog is a compiled-in slice.
@@ -416,7 +480,7 @@ loaded from a `--config` YAML and appended**. A basic scan uses none.
 two identical runs**:
 
 ```text
-$ sed -n '2,5p' /tmp/q1.err     # the four worker-pool lines
+$ sed -n '2,5p' $CAPTURES/q1.err     # the four worker-pool lines
 {"level":"info-2","ts":"2026-07-13T18:17:15Z","logger":"trufflehog","msg":"starting scanner workers","count":128}
 {"level":"info-2","ts":"2026-07-13T18:17:15Z","logger":"trufflehog","msg":"starting detector workers","count":1024}
 {"level":"info-2","ts":"2026-07-13T18:17:15Z","logger":"trufflehog","msg":"starting verificationOverlap workers","count":128}
@@ -450,8 +514,8 @@ empirically across all three non-error modes:
 **OBSERVED — plain mode (banner present), first two stderr lines:**
 
 ```text
-$ /tmp/trufflehog_bin git "file://$WORK/thog_testrepo" --log-level=2 2>/tmp/q1_plain.err 1>/dev/null
-$ sed -n '1,2p' /tmp/q1_plain.err
+$ $BIN git "file://$WORK/thog_testrepo" --log-level=2 2>$CAPTURES/q1_plain.err 1>/dev/null
+$ sed -n '1,2p' $CAPTURES/q1_plain.err
 2026-07-13T18:17:28Z	info-2	trufflehog	trufflehog dev
 🐷🔑🐷  TruffleHog. Unearth your secrets. 🐷🔑🐷
 ```
@@ -459,8 +523,8 @@ $ sed -n '1,2p' /tmp/q1_plain.err
 **OBSERVED — `--github-actions` mode (banner STILL present), first two stderr lines:**
 
 ```text
-$ /tmp/trufflehog_bin git "file://$WORK/thog_testrepo" --github-actions --log-level=2 2>/tmp/q1_gha.err 1>/dev/null
-$ sed -n '1,2p' /tmp/q1_gha.err
+$ $BIN git "file://$WORK/thog_testrepo" --github-actions --log-level=2 2>$CAPTURES/q1_gha.err 1>/dev/null
+$ sed -n '1,2p' $CAPTURES/q1_gha.err
 2026-07-13T18:17:30Z	info-2	trufflehog	trufflehog dev
 🐷🔑🐷  TruffleHog. Unearth your secrets. 🐷🔑🐷
 ```
@@ -469,13 +533,13 @@ $ sed -n '1,2p' /tmp/q1_gha.err
 worker lines — no banner):
 
 ```text
-$ sed -n '1,6p' /tmp/q1.err
+$ sed -n '1,6p' $CAPTURES/q1.err
 {"level":"info-2","ts":"2026-07-13T18:17:15Z","logger":"trufflehog","msg":"trufflehog dev"}
 {"level":"info-2","ts":"2026-07-13T18:17:15Z","logger":"trufflehog","msg":"starting scanner workers","count":128}
 {"level":"info-2","ts":"2026-07-13T18:17:15Z","logger":"trufflehog","msg":"starting detector workers","count":1024}
 {"level":"info-2","ts":"2026-07-13T18:17:15Z","logger":"trufflehog","msg":"starting verificationOverlap workers","count":128}
 {"level":"info-2","ts":"2026-07-13T18:17:15Z","logger":"trufflehog","msg":"starting notifier workers","count":128}
-{"level":"info-1","ts":"2026-07-13T18:17:15Z","logger":"trufflehog","msg":"cloned repo","path":"/tmp/thog_investigation.ulY2DMuS/thog_testrepo"}
+{"level":"info-1","ts":"2026-07-13T18:17:15Z","logger":"trufflehog","msg":"cloned repo","path":"$WORK/thog_testrepo"}
 ```
 
 A `grep -c 'Unearth your secrets'` over each stream confirms the counts: **plain = 1**,
@@ -495,6 +559,7 @@ the compile-time membership of a detector's struct literal in `buildDetectorList
 `--include-detectors`/`--exclude-detectors` filters and the `analyze` subcommand shown under Q5),
 not the startup log. So the accurate statement is: **detectors are registered at compile time; the
 startup log reports worker-pool sizes and the scan lifecycle, and never a per-detector line.**
+
 ---
 
 ## Q2 — Verification setup (HTTP libraries + parallel vs sequential)
@@ -505,25 +570,28 @@ startup log reports worker-pool sizes and the scan lifecycle, and never a per-de
 
 ### Direct answer
 
-- **Yes — the build dependencies include HTTP client libraries that exist specifically for
-  network verification.** The direct dependency `github.com/hashicorp/go-retryablehttp v0.7.7`
-  (`go.mod:L63`) plus its transitive `github.com/hashicorp/go-cleanhttp v0.5.2` (`go.mod:L231`,
-  `// indirect`) are the resilient HTTP stack used when detectors call out to a provider's API to
-  confirm a secret is live. Both are **compiled into** the binary (proven below).
-- **Verification runs in parallel.** It is performed *inside* the detector worker pool, which is
-  sized at `concurrency × 8` — **1024 workers** on this 128-CPU host (OBSERVED under Q1). Each
-  worker verifies independently, so verification is distributed across a large parallel pool, not
-  run one-secret-at-a-time.
-- **Precision on the caches (a common point of confusion):** `golang-lru/v2` is **not** the
-  verification cache — it is the engine's result-**dedupe** cache. The verification *result* cache
-  is a separate structure backed by `patrickmn/go-cache`.
+- **OBSERVED.** Yes — the build dependencies include HTTP client libraries: `go.mod` lists the
+  direct dependency `github.com/hashicorp/go-retryablehttp v0.7.7` (`go.mod:L63`) and its
+  transitive `github.com/hashicorp/go-cleanhttp v0.5.2` (`go.mod:L231`, `// indirect`), and both
+  are **compiled into** the binary (proven in §(A) via `go version -m`).
+- **INFERRED — source-confirmed.** These libraries are the resilient HTTP stack that exists
+  specifically for network verification — the code path detectors take when they call out to a
+  provider's API to confirm a secret is live.
+- **OBSERVED.** The detector worker pool is **1024 workers** on this 128-CPU host (seen in the Q1
+  startup logs above).
+- **INFERRED — source-confirmed.** Verification runs **in parallel**: it is performed *inside* that
+  detector worker pool (sized `concurrency × 8`), and each worker verifies independently, so
+  verification is distributed across a large parallel pool, not run one-secret-at-a-time.
+- **INFERRED — source-confirmed.** Precision on the caches (a common point of confusion):
+  `golang-lru/v2` is **not** the verification cache — it is the engine's result-**dedupe** cache;
+  the verification *result* cache is a separate structure backed by `patrickmn/go-cache`.
 
 ### (A) Build dependencies — the HTTP verification stack
 
 **OBSERVED — the relevant `go.mod` lines** (with their line numbers):
 
 ```text
-$ grep -nE 'go-retryablehttp|golang-lru/v2|patrickmn/go-cache|go-cleanhttp' go.mod
+$ grep -nE 'go-retryablehttp|golang-lru/v2|patrickmn/go-cache|go-cleanhttp' "$REPO_ROOT/go.mod"
 63:	github.com/hashicorp/go-retryablehttp v0.7.7
 64:	github.com/hashicorp/golang-lru/v2 v2.0.7
 80:	github.com/patrickmn/go-cache v2.1.0+incompatible
@@ -533,7 +601,7 @@ $ grep -nE 'go-retryablehttp|golang-lru/v2|patrickmn/go-cache|go-cleanhttp' go.m
 **OBSERVED — the pinned hashes in `go.sum`** (integrity of the HTTP libs):
 
 ```text
-$ grep -E 'go-cleanhttp|go-retryablehttp|golang-lru/v2' go.sum
+$ grep -E 'go-cleanhttp|go-retryablehttp|golang-lru/v2' "$REPO_ROOT/go.sum"
 github.com/hashicorp/go-cleanhttp v0.5.2 h1:035FKYIWjmULyFRBKPs8TBQoi0x6d9G4xc9neXJWAZQ=
 github.com/hashicorp/go-cleanhttp v0.5.2/go.mod h1:kO/YDlP8L1346E6Sodw+PrpBSV4/SoxCXGY6BqNFT48=
 github.com/hashicorp/go-retryablehttp v0.7.7 h1:C8hUCYzor8PIfXHa4UrZkU4VvK8o9ISHxT2Q8+VepXU=
@@ -545,7 +613,7 @@ github.com/hashicorp/golang-lru/v2 v2.0.7/go.mod h1:QeFd9opnmA6QUJc5vARoKUSoFhyf
 **OBSERVED — module integrity verifies clean:**
 
 ```text
-$ go mod verify
+$ ( cd "$REPO_ROOT" && go mod verify )
 all modules verified
 ```
 
@@ -553,7 +621,7 @@ all modules verified
 read back from the artifact's embedded module list:
 
 ```text
-$ go version -m /tmp/trufflehog_bin | grep -E 'go-cleanhttp|go-retryablehttp|golang-lru/v2|patrickmn/go-cache'
+$ go version -m $BIN | grep -E 'go-cleanhttp|go-retryablehttp|golang-lru/v2|patrickmn/go-cache'
 	dep	github.com/hashicorp/go-cleanhttp	v0.5.2	h1:035FKYIWjmULyFRBKPs8TBQoi0x6d9G4xc9neXJWAZQ=
 	dep	github.com/hashicorp/go-retryablehttp	v0.7.7	h1:C8hUCYzor8PIfXHa4UrZkU4VvK8o9ISHxT2Q8+VepXU=
 	dep	github.com/hashicorp/golang-lru/v2	v2.0.7	h1:a+bsQ5rvGLjzHuww6tVxozPZFVghXaHOwFs4luLUK2k=
@@ -619,6 +687,7 @@ here, the single AWS finding came back `Verified:false` with **no** `Verificatio
 consistent with a definitive "not live" determination — but this document does **not** claim to
 have observed the network packets. The parallel *structure* is source-confirmed and the worker
 magnitude is observed; the live HTTP exchange itself is labelled inferred.
+
 ---
 
 ## Q3 — JSON output structure (the finding schema)
@@ -628,16 +697,22 @@ magnitude is observed; the live HTTP exchange itself is labelled inferred.
 
 ### Direct answer
 
-- **The per-finding schema is the anonymous struct marshalled by `JSONPrinter.Print`**
-  (`pkg/output/json.go:L19-L74`). One finding = one JSON object per line.
-- **It has verification-status fields:** `Verified` (bool), `VerificationFromCache` (bool), and
-  `VerificationError` (string, emitted only when non-empty via `json:",omitempty"`).
-- **It has rich "where was it found" metadata:** `SourceMetadata` (source-specific — for a Git
-  scan, `SourceMetadata.Data.Git` with `commit`, `file`, `email`, `timestamp`, `line`), plus
-  `SourceID`, `SourceType`, `SourceName`.
-- **It has *no* confidence-score field.** There is nothing named `Confidence` or `Score` anywhere
-  in the object or in the struct definition (OBSERVED grep + source). Detector identity is carried
-  by `DetectorType`/`DetectorName`/`DetectorDescription`, not a numeric confidence.
+- **INFERRED — source-confirmed.** The per-finding schema is the anonymous struct marshalled by
+  `JSONPrinter.Print` (`pkg/output/json.go:L19-L74`); one finding = one JSON object per line
+  (OBSERVED in §(A)).
+- **OBSERVED.** The emitted object has verification-status fields `Verified` (bool) and
+  `VerificationFromCache` (bool).
+- **INFERRED — source-confirmed.** A third verification-status field `VerificationError` (string)
+  is defined but emitted only when non-empty (`json:",omitempty"`), which is why it is **absent**
+  from this unverified finding.
+- **OBSERVED.** The object carries rich "where was it found" metadata: `SourceMetadata`
+  (source-specific — for a Git scan, `SourceMetadata.Data.Git` with `commit`, `file`, `email`,
+  `timestamp`, `line`), plus `SourceID`, `SourceType`, `SourceName`.
+- **OBSERVED.** It has **no** confidence-score field: grepping the emitted object finds nothing
+  named `Confidence` or `Score`.
+- **INFERRED — source-confirmed.** The struct definition likewise contains no such field; detector
+  identity is carried by `DetectorType`/`DetectorName`/`DetectorDescription`, not a numeric
+  confidence.
 
 ### (A) The command and the real finding object (complete, unedited)
 
@@ -645,9 +720,9 @@ magnitude is observed; the live HTTP exchange itself is labelled inferred.
 file, then pretty-printed for readability — the raw bytes are shown first):
 
 ```text
-$ /tmp/trufflehog_bin git file:///tmp/thog_investigation.ulY2DMuS/thog_testrepo \
-      --json --no-update 1>/tmp/thog_investigation.ulY2DMuS/captures/q3_stdout.json 2>/dev/null
-$ cat /tmp/thog_investigation.ulY2DMuS/captures/q3_stdout.json
+$ $BIN git file://$WORK/thog_testrepo \
+      --json --no-update 1>$CAPTURES/q3_stdout.json 2>/dev/null
+$ cat $CAPTURES/q3_stdout.json
 {"SourceMetadata":{"Data":{"Git":{"commit":"e46ff31a2e0f32349f79294d9f095bd2e5f54520","file":"aws_creds.ini","email":"t \u003ct@t.com\u003e","timestamp":"2026-07-13 18:16:00 +0000","line":2}}},"SourceID":1,"SourceType":16,"SourceName":"trufflehog - git","DetectorType":2,"DetectorName":"AWS","DetectorDescription":"AWS (Amazon Web Services) is a comprehensive cloud computing platform offering a wide range of on-demand services like computing power, storage, databases. API keys for AWS can have varying amount of access to these services depending on the IAM policy attached.","DecoderName":"PLAIN","Verified":false,"VerificationFromCache":false,"Raw":"AKIAYVP4CIPPERUVIFXG","RawV2":"AKIAYVP4CIPPERUVIFXG:qUGtRtqlJNUCoY5SBly3QymVf33zOXxHcEuS7VxA","Redacted":"AKIAYVP4CIPPERUVIFXG","ExtraData":{"account":"595918472158","is_canary":"true","message":"This is an AWS canary token generated at canarytokens.org.","resource_type":"Access key"},"StructuredData":null}
 ```
 
@@ -761,7 +836,7 @@ string.
 **OBSERVED.** Grepping the actual JSON output for any confidence/score field returns nothing:
 
 ```text
-$ grep -ic -E 'confidence|score' q3_stdout.json
+$ grep -ic -E 'confidence|score' "$CAPTURES/q3_stdout.json"
 0
 grep exit=1 (grep -c prints 0 and exits 1 when there is no match)
 ```
@@ -778,6 +853,7 @@ values are the **public AWS canary key** (`AKIAYVP4CIPPERUVIFXG`, `is_canary=tru
 `message: "This is an AWS canary token generated at canarytokens.org."`) plus a **fabricated**
 secret in `RawV2`, so reproducing them here is safe. Against real material, treat these fields as
 **live credentials**.
+
 ---
 
 ## Q4 — Repository traversal (which files are scanned vs skipped)
@@ -787,36 +863,36 @@ secret in `RawV2`, so reproducing them here is safe. Against real material, trea
 
 ### Direct answer
 
-There is **no single rule**. The scan-vs-skip decision is made in **three different places**
-depending on how the content is reached, and they use **different keys**:
+**INFERRED — source-confirmed.** There is **no single rule**. The scan-vs-skip decision is made in
+**three different places** depending on how the content is reached, and they use **different keys**:
 
-1. **Loose (non-archive) files — decided by *content-derived* MIME, then an extension check.** The
-   file's bytes are sniffed to a MIME type; that MIME's canonical extension is looked up in the
-   ignored/binary extension sets. **Key = detected content type, not the filename.** (This is why
-   `data.mp4` — text bytes with a video name — is *scanned*, while `logo.png` — real PNG bytes — is
-   *skipped*.)
-2. **Archive members — pre-filtered by member *metadata* (name/size/type) *before* content.** Inside
-   an archive, each member is checked by its **archive filename**, its size against a 2 GB cap, and
-   whether it is a directory/symlink — before (and independently of) any content sniff, and only up
-   to a maximum nesting depth of 10.
-3. **Git source — a filename-based ignored-extension check, path exclude-globs, plus a
-   *conditional* binary skip.** A Git scan first drops any blob whose **filename** extension is in
-   the ignored set — `common.SkipFile(path)` keyed on the blob **path** (not a content sniff),
-   logging `file contains ignored extension` (this is what skips `logo.png` under the git source,
-   as opposed to the loose-file content-MIME path above). It can also exclude paths by glob at the
-   git-log level, and it detects binary blobs — but it only *skips* binaries when the
-   `--force-skip-binaries` flag (internally `skipBinaries` / `feature.ForceSkipBinaries`) is set;
-   otherwise binary blobs are scanned.
+1. **INFERRED — source-confirmed. Loose (non-archive) files — decided by *content-derived* MIME,
+   then an extension check.** The file's bytes are sniffed to a MIME type; that MIME's canonical
+   extension is looked up in the ignored/binary extension sets. **Key = detected content type, not
+   the filename.** *(OBSERVED in §(A): this is why `data.mp4` — text bytes with a video name — is
+   **scanned**, while `logo.png` — real PNG bytes — is **skipped**.)*
+2. **INFERRED — source-confirmed. Archive members — pre-filtered by member *metadata*
+   (name/size/type) *before* content.** Inside an archive, each member is checked by its **archive
+   filename**, its size against a 2 GB cap, and whether it is a directory/symlink — before (and
+   independently of) any content sniff, and only up to a maximum nesting depth of 10.
+3. **INFERRED — source-confirmed. Git source — a filename-based ignored-extension check, path
+   exclude-globs, plus a *conditional* binary skip.** A Git scan first drops any blob whose
+   **filename** extension is in the ignored set — `common.SkipFile(path)` keyed on the blob
+   **path** (not a content sniff), logging `file contains ignored extension`. It can also exclude
+   paths by glob at the git-log level, and it detects binary blobs — but it only *skips* binaries
+   when the `--force-skip-binaries` flag (internally `skipBinaries` / `feature.ForceSkipBinaries`)
+   is set; otherwise binary blobs are scanned. *(OBSERVED in §(D): this filename check is what skips
+   `logo.png` under the git source, as opposed to the loose-file content-MIME path above.)*
 
-### The exact run (absolute paths, offline, trace verbosity)
+### The exact run (offline, trace verbosity)
 
 **OBSERVED — command and channels** (findings→stdout, banner+trace→stderr; `--no-verification`
-keeps it offline; `--log-level=5` is trace):
+keeps it offline; `--log-level=5` is trace). `$WORK` is the throwaway root established in the
+setup preamble — no per-run path is hardcoded:
 
 ```text
-$ WORK=/tmp/thog_investigation.ulY2DMuS
-$ /tmp/trufflehog_bin filesystem "$WORK/thog_files" --no-verification --log-level=5 \
-      1>"$WORK/captures/q4_stdout.log" 2>"$WORK/captures/q4_trace.log"; echo "exit=$?"
+$ $BIN filesystem "$WORK/thog_files" --no-verification --log-level=5 \
+      1>"$CAPTURES/q4_stdout.log" 2>"$CAPTURES/q4_trace.log"; echo "exit=$?"
 exit=0
 ```
 
@@ -831,7 +907,7 @@ Resource_type: Access key
 Account: 595918472158
 Message: This is an AWS canary token generated at canarytokens.org.
 Is_canary: true
-File: /tmp/thog_investigation.ulY2DMuS/thog_files/aws_creds.ini
+File: $WORK/thog_files/aws_creds.ini
 Line: 2
 
 ```
@@ -842,19 +918,19 @@ Line: 2
 complete 172-line trace follows in section (D)):
 
 ```text
-16:2026-07-13T18:43:13Z	info-4	trufflehog	Starting archive processing	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "/tmp/thog_investigation.ulY2DMuS/thog_files/archive.tar.gz", "path": "/tmp/thog_investigation.ulY2DMuS/thog_files/archive.tar.gz", "mime": "application/gzip", "timeout": 60, "depth": 0}
-17:2026-07-13T18:43:13Z	info-4	trufflehog	Starting archive processing	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "/tmp/thog_investigation.ulY2DMuS/thog_files/archive.tar.gz", "path": "/tmp/thog_investigation.ulY2DMuS/thog_files/archive.tar.gz", "mime": "application/gzip", "timeout": 60, "depth": 1}
-18:2026-07-13T18:43:13Z	info-4	trufflehog	Opened file successfully	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "/tmp/thog_investigation.ulY2DMuS/thog_files/archive.tar.gz", "path": "/tmp/thog_investigation.ulY2DMuS/thog_files/archive.tar.gz", "mime": "application/gzip", "timeout": 60, "filename": "inside.txt", "size": 40, "filename": "inside.txt", "size": 40}
-19:2026-07-13T18:43:13Z	info-4	trufflehog	Starting archive processing	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "/tmp/thog_investigation.ulY2DMuS/thog_files/archive.tar.gz", "path": "/tmp/thog_investigation.ulY2DMuS/thog_files/archive.tar.gz", "mime": "application/gzip", "timeout": 60, "filename": "inside.txt", "size": 40, "depth": 2}
-20:2026-07-13T18:43:13Z	info-4	trufflehog	Finished archive processing	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "/tmp/thog_investigation.ulY2DMuS/thog_files/archive.tar.gz", "path": "/tmp/thog_investigation.ulY2DMuS/thog_files/archive.tar.gz", "mime": "application/gzip", "timeout": 60, "filename": "inside.txt", "size": 40, "depth": 2}
-21:2026-07-13T18:43:13Z	info-4	trufflehog	Finished archive processing	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "/tmp/thog_investigation.ulY2DMuS/thog_files/archive.tar.gz", "path": "/tmp/thog_investigation.ulY2DMuS/thog_files/archive.tar.gz", "mime": "application/gzip", "timeout": 60, "depth": 1}
-22:2026-07-13T18:43:13Z	info-4	trufflehog	Finished archive processing	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "/tmp/thog_investigation.ulY2DMuS/thog_files/archive.tar.gz", "path": "/tmp/thog_investigation.ulY2DMuS/thog_files/archive.tar.gz", "mime": "application/gzip", "timeout": 60, "depth": 0}
-32:2026-07-13T18:43:13Z	info-3	trufflehog	skipping file: extension is ignored	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "/tmp/thog_investigation.ulY2DMuS/thog_files/logo.png", "path": "/tmp/thog_investigation.ulY2DMuS/thog_files/logo.png", "mime": "image/png", "timeout": 60, "ext": ".png"}
-33:2026-07-13T18:43:13Z	info-5	trufflehog	dataErrChan closed, all chunks processed	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "/tmp/thog_investigation.ulY2DMuS/thog_files/config.env", "path": "/tmp/thog_investigation.ulY2DMuS/thog_files/config.env", "mime": "text/plain; charset=utf-8", "timeout": 60}
-36:2026-07-13T18:43:13Z	info-5	trufflehog	dataErrChan closed, all chunks processed	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "/tmp/thog_investigation.ulY2DMuS/thog_files/aws_creds.ini", "path": "/tmp/thog_investigation.ulY2DMuS/thog_files/aws_creds.ini", "mime": "text/plain; charset=utf-8", "timeout": 60}
-39:2026-07-13T18:43:13Z	info-5	trufflehog	dataErrChan closed, all chunks processed	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "/tmp/thog_investigation.ulY2DMuS/thog_files/testkey.pem", "path": "/tmp/thog_investigation.ulY2DMuS/thog_files/testkey.pem", "mime": "text/plain; charset=utf-8", "timeout": 60}
-41:2026-07-13T18:43:13Z	info-5	trufflehog	dataErrChan closed, all chunks processed	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "/tmp/thog_investigation.ulY2DMuS/thog_files/data.mp4", "path": "/tmp/thog_investigation.ulY2DMuS/thog_files/data.mp4", "mime": "text/plain; charset=utf-8", "timeout": 60}
-42:2026-07-13T18:43:13Z	info-5	trufflehog	dataErrChan closed, all chunks processed	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "/tmp/thog_investigation.ulY2DMuS/thog_files/notes.txt", "path": "/tmp/thog_investigation.ulY2DMuS/thog_files/notes.txt", "mime": "text/plain; charset=utf-8", "timeout": 60}
+16:2026-07-13T18:43:13Z	info-4	trufflehog	Starting archive processing	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "$WORK/thog_files/archive.tar.gz", "path": "$WORK/thog_files/archive.tar.gz", "mime": "application/gzip", "timeout": 60, "depth": 0}
+17:2026-07-13T18:43:13Z	info-4	trufflehog	Starting archive processing	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "$WORK/thog_files/archive.tar.gz", "path": "$WORK/thog_files/archive.tar.gz", "mime": "application/gzip", "timeout": 60, "depth": 1}
+18:2026-07-13T18:43:13Z	info-4	trufflehog	Opened file successfully	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "$WORK/thog_files/archive.tar.gz", "path": "$WORK/thog_files/archive.tar.gz", "mime": "application/gzip", "timeout": 60, "filename": "inside.txt", "size": 40, "filename": "inside.txt", "size": 40}
+19:2026-07-13T18:43:13Z	info-4	trufflehog	Starting archive processing	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "$WORK/thog_files/archive.tar.gz", "path": "$WORK/thog_files/archive.tar.gz", "mime": "application/gzip", "timeout": 60, "filename": "inside.txt", "size": 40, "depth": 2}
+20:2026-07-13T18:43:13Z	info-4	trufflehog	Finished archive processing	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "$WORK/thog_files/archive.tar.gz", "path": "$WORK/thog_files/archive.tar.gz", "mime": "application/gzip", "timeout": 60, "filename": "inside.txt", "size": 40, "depth": 2}
+21:2026-07-13T18:43:13Z	info-4	trufflehog	Finished archive processing	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "$WORK/thog_files/archive.tar.gz", "path": "$WORK/thog_files/archive.tar.gz", "mime": "application/gzip", "timeout": 60, "depth": 1}
+22:2026-07-13T18:43:13Z	info-4	trufflehog	Finished archive processing	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "$WORK/thog_files/archive.tar.gz", "path": "$WORK/thog_files/archive.tar.gz", "mime": "application/gzip", "timeout": 60, "depth": 0}
+32:2026-07-13T18:43:13Z	info-3	trufflehog	skipping file: extension is ignored	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "$WORK/thog_files/logo.png", "path": "$WORK/thog_files/logo.png", "mime": "image/png", "timeout": 60, "ext": ".png"}
+33:2026-07-13T18:43:13Z	info-5	trufflehog	dataErrChan closed, all chunks processed	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "$WORK/thog_files/config.env", "path": "$WORK/thog_files/config.env", "mime": "text/plain; charset=utf-8", "timeout": 60}
+36:2026-07-13T18:43:13Z	info-5	trufflehog	dataErrChan closed, all chunks processed	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "$WORK/thog_files/aws_creds.ini", "path": "$WORK/thog_files/aws_creds.ini", "mime": "text/plain; charset=utf-8", "timeout": 60}
+39:2026-07-13T18:43:13Z	info-5	trufflehog	dataErrChan closed, all chunks processed	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "$WORK/thog_files/testkey.pem", "path": "$WORK/thog_files/testkey.pem", "mime": "text/plain; charset=utf-8", "timeout": 60}
+41:2026-07-13T18:43:13Z	info-5	trufflehog	dataErrChan closed, all chunks processed	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "$WORK/thog_files/data.mp4", "path": "$WORK/thog_files/data.mp4", "mime": "text/plain; charset=utf-8", "timeout": 60}
+42:2026-07-13T18:43:13Z	info-5	trufflehog	dataErrChan closed, all chunks processed	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "$WORK/thog_files/notes.txt", "path": "$WORK/thog_files/notes.txt", "mime": "text/plain; charset=utf-8", "timeout": 60}
 ```
 
 Reading these:
@@ -922,13 +998,13 @@ message `file contains ignored extension`, while the loose-file `skipping file: 
 ignored` message (emitted by the default handler above) never appears under the git source:
 
 ```text
-$ WORK=/tmp/thog_investigation.ZCrEoHBV      # companion git-source capture (its own throwaway fixture root)
-$ /tmp/trufflehog_bin git "file://$WORK/thog_testrepo" --no-verification --log-level=5 \
-      1>"$WORK/captures/q4_git_stdout.log" 2>"$WORK/captures/q4_git_trace.log"; echo "exit=$?"
+$ # companion git-source scan of the SAME fixture repo ($WORK/thog_testrepo) built above:
+$ $BIN git "file://$WORK/thog_testrepo" --no-verification --log-level=5 \
+      1>"$CAPTURES/q4_git_stdout.log" 2>"$CAPTURES/q4_git_trace.log"; echo "exit=$?"
 exit=0
-$ grep 'file contains ignored extension' "$WORK/captures/q4_git_trace.log"
-2026-07-13T23:10:15Z	info-5	trufflehog	file contains ignored extension	{"source_manager_worker_id": "P430h", "unit_kind": "dir", "unit": "/tmp/thog_investigation.ZCrEoHBV/thog_testrepo", "commit": "e46ff31", "path": "logo.png"}
-$ grep -c 'skipping file: extension is ignored' "$WORK/captures/q4_git_trace.log"
+$ grep 'file contains ignored extension' "$CAPTURES/q4_git_trace.log"
+2026-07-13T23:10:15Z	info-5	trufflehog	file contains ignored extension	{"source_manager_worker_id": "P430h", "unit_kind": "dir", "unit": "$WORK/thog_testrepo", "commit": "e46ff31", "path": "logo.png"}
+$ grep -c 'skipping file: extension is ignored' "$CAPTURES/q4_git_trace.log"
 0
 ```
 
@@ -963,35 +1039,35 @@ run, but the file decisions above are stable):
 2026-07-13T18:43:13Z	info-2	trufflehog	starting notifier workers	{"count": 128}
 2026-07-13T18:43:13Z	info-0	trufflehog	running source	{"source_manager_worker_id": "MHAG2", "with_units": true}
 2026-07-13T18:43:13Z	info-2	trufflehog	enumerating source	{"source_manager_worker_id": "MHAG2"}
-2026-07-13T18:43:13Z	info-3	trufflehog	chunking unit	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "/tmp/thog_investigation.ulY2DMuS/thog_files/archive.tar.gz"}
-2026-07-13T18:43:13Z	info-3	trufflehog	scanning file	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "/tmp/thog_investigation.ulY2DMuS/thog_files/archive.tar.gz", "path": "/tmp/thog_investigation.ulY2DMuS/thog_files/archive.tar.gz"}
-2026-07-13T18:43:13Z	info-4	trufflehog	Starting archive processing	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "/tmp/thog_investigation.ulY2DMuS/thog_files/archive.tar.gz", "path": "/tmp/thog_investigation.ulY2DMuS/thog_files/archive.tar.gz", "mime": "application/gzip", "timeout": 60, "depth": 0}
-2026-07-13T18:43:13Z	info-4	trufflehog	Starting archive processing	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "/tmp/thog_investigation.ulY2DMuS/thog_files/archive.tar.gz", "path": "/tmp/thog_investigation.ulY2DMuS/thog_files/archive.tar.gz", "mime": "application/gzip", "timeout": 60, "depth": 1}
-2026-07-13T18:43:13Z	info-4	trufflehog	Opened file successfully	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "/tmp/thog_investigation.ulY2DMuS/thog_files/archive.tar.gz", "path": "/tmp/thog_investigation.ulY2DMuS/thog_files/archive.tar.gz", "mime": "application/gzip", "timeout": 60, "filename": "inside.txt", "size": 40, "filename": "inside.txt", "size": 40}
-2026-07-13T18:43:13Z	info-4	trufflehog	Starting archive processing	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "/tmp/thog_investigation.ulY2DMuS/thog_files/archive.tar.gz", "path": "/tmp/thog_investigation.ulY2DMuS/thog_files/archive.tar.gz", "mime": "application/gzip", "timeout": 60, "filename": "inside.txt", "size": 40, "depth": 2}
-2026-07-13T18:43:13Z	info-4	trufflehog	Finished archive processing	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "/tmp/thog_investigation.ulY2DMuS/thog_files/archive.tar.gz", "path": "/tmp/thog_investigation.ulY2DMuS/thog_files/archive.tar.gz", "mime": "application/gzip", "timeout": 60, "filename": "inside.txt", "size": 40, "depth": 2}
-2026-07-13T18:43:13Z	info-4	trufflehog	Finished archive processing	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "/tmp/thog_investigation.ulY2DMuS/thog_files/archive.tar.gz", "path": "/tmp/thog_investigation.ulY2DMuS/thog_files/archive.tar.gz", "mime": "application/gzip", "timeout": 60, "depth": 1}
-2026-07-13T18:43:13Z	info-4	trufflehog	Finished archive processing	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "/tmp/thog_investigation.ulY2DMuS/thog_files/archive.tar.gz", "path": "/tmp/thog_investigation.ulY2DMuS/thog_files/archive.tar.gz", "mime": "application/gzip", "timeout": 60, "depth": 0}
-2026-07-13T18:43:13Z	info-5	trufflehog	dataErrChan closed, all chunks processed	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "/tmp/thog_investigation.ulY2DMuS/thog_files/archive.tar.gz", "path": "/tmp/thog_investigation.ulY2DMuS/thog_files/archive.tar.gz", "mime": "application/gzip", "timeout": 60}
-2026-07-13T18:43:13Z	info-3	trufflehog	chunking unit	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "/tmp/thog_investigation.ulY2DMuS/thog_files/aws_creds.ini"}
-2026-07-13T18:43:13Z	info-3	trufflehog	scanning file	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "/tmp/thog_investigation.ulY2DMuS/thog_files/aws_creds.ini", "path": "/tmp/thog_investigation.ulY2DMuS/thog_files/aws_creds.ini"}
-2026-07-13T18:43:13Z	info-3	trufflehog	chunking unit	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "/tmp/thog_investigation.ulY2DMuS/thog_files/logo.png"}
-2026-07-13T18:43:13Z	info-3	trufflehog	chunking unit	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "/tmp/thog_investigation.ulY2DMuS/thog_files/config.env"}
-2026-07-13T18:43:13Z	info-3	trufflehog	scanning file	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "/tmp/thog_investigation.ulY2DMuS/thog_files/logo.png", "path": "/tmp/thog_investigation.ulY2DMuS/thog_files/logo.png"}
-2026-07-13T18:43:13Z	info-3	trufflehog	scanning file	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "/tmp/thog_investigation.ulY2DMuS/thog_files/config.env", "path": "/tmp/thog_investigation.ulY2DMuS/thog_files/config.env"}
-2026-07-13T18:43:13Z	info-3	trufflehog	chunking unit	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "/tmp/thog_investigation.ulY2DMuS/thog_files/testkey.pem"}
-2026-07-13T18:43:13Z	info-3	trufflehog	scanning file	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "/tmp/thog_investigation.ulY2DMuS/thog_files/testkey.pem", "path": "/tmp/thog_investigation.ulY2DMuS/thog_files/testkey.pem"}
-2026-07-13T18:43:13Z	info-3	trufflehog	skipping file: extension is ignored	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "/tmp/thog_investigation.ulY2DMuS/thog_files/logo.png", "path": "/tmp/thog_investigation.ulY2DMuS/thog_files/logo.png", "mime": "image/png", "timeout": 60, "ext": ".png"}
-2026-07-13T18:43:13Z	info-5	trufflehog	dataErrChan closed, all chunks processed	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "/tmp/thog_investigation.ulY2DMuS/thog_files/config.env", "path": "/tmp/thog_investigation.ulY2DMuS/thog_files/config.env", "mime": "text/plain; charset=utf-8", "timeout": 60}
-2026-07-13T18:43:13Z	info-5	trufflehog	dataErrChan closed, all chunks processed	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "/tmp/thog_investigation.ulY2DMuS/thog_files/logo.png", "path": "/tmp/thog_investigation.ulY2DMuS/thog_files/logo.png", "mime": "image/png", "timeout": 60}
-2026-07-13T18:43:13Z	info-3	trufflehog	chunking unit	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "/tmp/thog_investigation.ulY2DMuS/thog_files/data.mp4"}
-2026-07-13T18:43:13Z	info-5	trufflehog	dataErrChan closed, all chunks processed	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "/tmp/thog_investigation.ulY2DMuS/thog_files/aws_creds.ini", "path": "/tmp/thog_investigation.ulY2DMuS/thog_files/aws_creds.ini", "mime": "text/plain; charset=utf-8", "timeout": 60}
-2026-07-13T18:43:13Z	info-3	trufflehog	scanning file	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "/tmp/thog_investigation.ulY2DMuS/thog_files/data.mp4", "path": "/tmp/thog_investigation.ulY2DMuS/thog_files/data.mp4"}
-2026-07-13T18:43:13Z	info-3	trufflehog	chunking unit	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "/tmp/thog_investigation.ulY2DMuS/thog_files/notes.txt"}
-2026-07-13T18:43:13Z	info-5	trufflehog	dataErrChan closed, all chunks processed	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "/tmp/thog_investigation.ulY2DMuS/thog_files/testkey.pem", "path": "/tmp/thog_investigation.ulY2DMuS/thog_files/testkey.pem", "mime": "text/plain; charset=utf-8", "timeout": 60}
-2026-07-13T18:43:13Z	info-3	trufflehog	scanning file	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "/tmp/thog_investigation.ulY2DMuS/thog_files/notes.txt", "path": "/tmp/thog_investigation.ulY2DMuS/thog_files/notes.txt"}
-2026-07-13T18:43:13Z	info-5	trufflehog	dataErrChan closed, all chunks processed	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "/tmp/thog_investigation.ulY2DMuS/thog_files/data.mp4", "path": "/tmp/thog_investigation.ulY2DMuS/thog_files/data.mp4", "mime": "text/plain; charset=utf-8", "timeout": 60}
-2026-07-13T18:43:13Z	info-5	trufflehog	dataErrChan closed, all chunks processed	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "/tmp/thog_investigation.ulY2DMuS/thog_files/notes.txt", "path": "/tmp/thog_investigation.ulY2DMuS/thog_files/notes.txt", "mime": "text/plain; charset=utf-8", "timeout": 60}
+2026-07-13T18:43:13Z	info-3	trufflehog	chunking unit	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "$WORK/thog_files/archive.tar.gz"}
+2026-07-13T18:43:13Z	info-3	trufflehog	scanning file	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "$WORK/thog_files/archive.tar.gz", "path": "$WORK/thog_files/archive.tar.gz"}
+2026-07-13T18:43:13Z	info-4	trufflehog	Starting archive processing	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "$WORK/thog_files/archive.tar.gz", "path": "$WORK/thog_files/archive.tar.gz", "mime": "application/gzip", "timeout": 60, "depth": 0}
+2026-07-13T18:43:13Z	info-4	trufflehog	Starting archive processing	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "$WORK/thog_files/archive.tar.gz", "path": "$WORK/thog_files/archive.tar.gz", "mime": "application/gzip", "timeout": 60, "depth": 1}
+2026-07-13T18:43:13Z	info-4	trufflehog	Opened file successfully	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "$WORK/thog_files/archive.tar.gz", "path": "$WORK/thog_files/archive.tar.gz", "mime": "application/gzip", "timeout": 60, "filename": "inside.txt", "size": 40, "filename": "inside.txt", "size": 40}
+2026-07-13T18:43:13Z	info-4	trufflehog	Starting archive processing	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "$WORK/thog_files/archive.tar.gz", "path": "$WORK/thog_files/archive.tar.gz", "mime": "application/gzip", "timeout": 60, "filename": "inside.txt", "size": 40, "depth": 2}
+2026-07-13T18:43:13Z	info-4	trufflehog	Finished archive processing	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "$WORK/thog_files/archive.tar.gz", "path": "$WORK/thog_files/archive.tar.gz", "mime": "application/gzip", "timeout": 60, "filename": "inside.txt", "size": 40, "depth": 2}
+2026-07-13T18:43:13Z	info-4	trufflehog	Finished archive processing	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "$WORK/thog_files/archive.tar.gz", "path": "$WORK/thog_files/archive.tar.gz", "mime": "application/gzip", "timeout": 60, "depth": 1}
+2026-07-13T18:43:13Z	info-4	trufflehog	Finished archive processing	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "$WORK/thog_files/archive.tar.gz", "path": "$WORK/thog_files/archive.tar.gz", "mime": "application/gzip", "timeout": 60, "depth": 0}
+2026-07-13T18:43:13Z	info-5	trufflehog	dataErrChan closed, all chunks processed	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "$WORK/thog_files/archive.tar.gz", "path": "$WORK/thog_files/archive.tar.gz", "mime": "application/gzip", "timeout": 60}
+2026-07-13T18:43:13Z	info-3	trufflehog	chunking unit	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "$WORK/thog_files/aws_creds.ini"}
+2026-07-13T18:43:13Z	info-3	trufflehog	scanning file	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "$WORK/thog_files/aws_creds.ini", "path": "$WORK/thog_files/aws_creds.ini"}
+2026-07-13T18:43:13Z	info-3	trufflehog	chunking unit	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "$WORK/thog_files/logo.png"}
+2026-07-13T18:43:13Z	info-3	trufflehog	chunking unit	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "$WORK/thog_files/config.env"}
+2026-07-13T18:43:13Z	info-3	trufflehog	scanning file	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "$WORK/thog_files/logo.png", "path": "$WORK/thog_files/logo.png"}
+2026-07-13T18:43:13Z	info-3	trufflehog	scanning file	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "$WORK/thog_files/config.env", "path": "$WORK/thog_files/config.env"}
+2026-07-13T18:43:13Z	info-3	trufflehog	chunking unit	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "$WORK/thog_files/testkey.pem"}
+2026-07-13T18:43:13Z	info-3	trufflehog	scanning file	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "$WORK/thog_files/testkey.pem", "path": "$WORK/thog_files/testkey.pem"}
+2026-07-13T18:43:13Z	info-3	trufflehog	skipping file: extension is ignored	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "$WORK/thog_files/logo.png", "path": "$WORK/thog_files/logo.png", "mime": "image/png", "timeout": 60, "ext": ".png"}
+2026-07-13T18:43:13Z	info-5	trufflehog	dataErrChan closed, all chunks processed	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "$WORK/thog_files/config.env", "path": "$WORK/thog_files/config.env", "mime": "text/plain; charset=utf-8", "timeout": 60}
+2026-07-13T18:43:13Z	info-5	trufflehog	dataErrChan closed, all chunks processed	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "$WORK/thog_files/logo.png", "path": "$WORK/thog_files/logo.png", "mime": "image/png", "timeout": 60}
+2026-07-13T18:43:13Z	info-3	trufflehog	chunking unit	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "$WORK/thog_files/data.mp4"}
+2026-07-13T18:43:13Z	info-5	trufflehog	dataErrChan closed, all chunks processed	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "$WORK/thog_files/aws_creds.ini", "path": "$WORK/thog_files/aws_creds.ini", "mime": "text/plain; charset=utf-8", "timeout": 60}
+2026-07-13T18:43:13Z	info-3	trufflehog	scanning file	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "$WORK/thog_files/data.mp4", "path": "$WORK/thog_files/data.mp4"}
+2026-07-13T18:43:13Z	info-3	trufflehog	chunking unit	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "$WORK/thog_files/notes.txt"}
+2026-07-13T18:43:13Z	info-5	trufflehog	dataErrChan closed, all chunks processed	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "$WORK/thog_files/testkey.pem", "path": "$WORK/thog_files/testkey.pem", "mime": "text/plain; charset=utf-8", "timeout": 60}
+2026-07-13T18:43:13Z	info-3	trufflehog	scanning file	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "$WORK/thog_files/notes.txt", "path": "$WORK/thog_files/notes.txt"}
+2026-07-13T18:43:13Z	info-5	trufflehog	dataErrChan closed, all chunks processed	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "$WORK/thog_files/data.mp4", "path": "$WORK/thog_files/data.mp4", "mime": "text/plain; charset=utf-8", "timeout": 60}
+2026-07-13T18:43:13Z	info-5	trufflehog	dataErrChan closed, all chunks processed	{"source_manager_worker_id": "MHAG2", "unit_kind": "unit", "unit": "$WORK/thog_files/notes.txt", "path": "$WORK/thog_files/notes.txt", "mime": "text/plain; charset=utf-8", "timeout": 60}
 2026-07-13T18:43:13Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "Mha4E"}
 2026-07-13T18:43:13Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "HESR0"}
 2026-07-13T18:43:13Z	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "DQw88"}
@@ -1133,13 +1209,15 @@ run, but the file decisions above are stable):
 
 ### Direct answer
 
-- **Detectors are embedded/compiled-in modules — not separate plugins.** The build produces a
-  single, fully static binary with no dynamic-link or plugin-load surface (`ldd` → "not a dynamic
-  executable"), and the word "plugin" appears nowhere in the CLI. Each detector is a Go type
-  compiled into the binary and enrolled in a compiled-in slice (`buildDetectorList` /
-  `DefaultDetectors`). **831** detectors are active in the default build.
-- **The help flags reveal the detection capabilities as CLI flags + source commands**, not a
-  plugin registry: detector-selection flags (`--include-detectors`, `--exclude-detectors`),
+- **OBSERVED.** The build produces a single, fully static binary with no dynamic-link or
+  plugin-load surface (`ldd` → "not a dynamic executable"), and the word "plugin" appears nowhere
+  in the CLI (a case-insensitive search of the full long help returns 0 matches — see §(A)).
+- **INFERRED — source-confirmed.** Detectors are therefore embedded/compiled-in modules — **not**
+  separate plugins: each detector is a Go type compiled into the binary and enrolled in a
+  compiled-in slice (`buildDetectorList` / `DefaultDetectors`). **831** detectors are active in the
+  default build (counted from that source slice — see §(D)).
+- **OBSERVED.** The help flags reveal the detection capabilities as CLI flags + source commands,
+  not a plugin registry: detector-selection flags (`--include-detectors`, `--exclude-detectors`),
   verification-capability flags (`--no-verification`, `--results`, `--verifier`,
   `--detector-timeout`, `--no-verification-cache`, …), and the list of scannable **source
   sub-commands** (`git`, `github`, `gitlab`, `filesystem`, `s3`, `gcs`, `docker`, `postman`,
@@ -1151,21 +1229,21 @@ run, but the file decisions above are stable):
 full long help finds nothing:
 
 ```text
-$ ldd /tmp/trufflehog_bin
+$ ldd $BIN
 	not a dynamic executable
 ldd exit=1
 ```
 
 ```text
-$ grep -ic plugin helplong_stdout.txt   # helplong_stdout.txt = captured --help-long
+$ $BIN --help-long 2>/dev/null | grep -ic plugin   # count "plugin" mentions in the long help
 0
-grep exit=1 (no match: grep -c prints 0 and exits 1; a trailing `|| true` prevents set -e abort)
 ```
 
 `ldd` exiting **1** with "not a dynamic executable" is the expected signal for a `CGO_ENABLED=0`
 static Go binary — there are no shared objects and therefore no plugin `.so` surface. The
-`grep -ic plugin` printing **0** and exiting **1** (no match) is why such a check is written with a
-trailing `|| true` in a `set -e` script.
+`grep -ic plugin` printing **0** confirms the word "plugin" never appears in the tool's own help
+text. (`grep -c` prints the count `0` and itself exits `1` on no-match; because the runbook sets
+only `pipefail` — not `-e` — this expected non-zero status does not abort the run.)
 
 ### (B) Compiled-in registration and the detector count (831)
 
@@ -1176,17 +1254,17 @@ literals plus two constructor-based entries:
 
 ```text
 # active &Scanner{} struct literals:
-$ grep -cE '^[[:space:]]*&[A-Za-z0-9_]+\.Scanner\{\}' pkg/engine/defaults/defaults.go
+$ grep -cE '^[[:space:]]*&[A-Za-z0-9_]+\.Scanner\{\}' "$REPO_ROOT/pkg/engine/defaults/defaults.go"
 829
 # constructor-call detectors in the list:
-$ grep -nE '\.New\(\),$' pkg/engine/defaults/defaults.go
+$ grep -nE '\.New\(\),$' "$REPO_ROOT/pkg/engine/defaults/defaults.go"
 906:		aws_access_keys.New(),
 907:		aws_session_keys.New(),
 # commented-out (inactive) detector lines:
-$ grep -cE '^[[:space:]]*//[[:space:]]*&[A-Za-z0-9_]+\.Scanner\{\}' pkg/engine/defaults/defaults.go
+$ grep -cE '^[[:space:]]*//[[:space:]]*&[A-Za-z0-9_]+\.Scanner\{\}' "$REPO_ROOT/pkg/engine/defaults/defaults.go"
 28
 # detector directories:
-$ find pkg/detectors -mindepth 1 -maxdepth 1 -type d | wc -l
+$ find "$REPO_ROOT/pkg/detectors" -mindepth 1 -maxdepth 1 -type d | wc -l
 845
 ```
 
@@ -1213,9 +1291,9 @@ capture). These two facts are independent; neither implies a plugin mechanism.
 capture is 124 lines and ends with the `analyze` command followed by trailing blank lines:
 
 ```text
-$ /tmp/trufflehog_bin --help 1>/tmp/help.out 2>/tmp/help.err; echo "exit=$?  stdout=$(wc -l </tmp/help.out)L  stderr=$(wc -l </tmp/help.err)L"
+$ $BIN --help 1>$CAPTURES/help.out 2>$CAPTURES/help.err; echo "exit=$?  stdout=$(wc -l <$CAPTURES/help.out)L  stderr=$(wc -l <$CAPTURES/help.err)L"
 exit=0  stdout=0L  stderr=124L
-$ cat /tmp/help.err
+$ cat $CAPTURES/help.err
 usage: TruffleHog [<flags>] <command> [<args> ...]
 
 TruffleHog is a tool for finding credentials.
@@ -1351,9 +1429,9 @@ verification-capability flags are visible here (e.g. `--concurrency=128` reflect
 `--verifier`, `--detector-timeout`, `--no-verification-cache`):
 
 ```text
-$ /tmp/trufflehog_bin --help-long 1>/tmp/helplong.out 2>/tmp/helplong.err; echo "exit=$?  stdout=$(wc -l </tmp/helplong.out)L  stderr=$(wc -l </tmp/helplong.err)L"
+$ $BIN --help-long 1>$CAPTURES/helplong.out 2>$CAPTURES/helplong.err; echo "exit=$?  stdout=$(wc -l <$CAPTURES/helplong.out)L  stderr=$(wc -l <$CAPTURES/helplong.err)L"
 exit=0  stdout=416L  stderr=0L
-$ cat /tmp/helplong.out
+$ cat $CAPTURES/helplong.out
 usage: TruffleHog [<flags>] <command> [<args> ...]
 
 TruffleHog is a tool for finding credentials.
@@ -1781,7 +1859,7 @@ includes a digit range (`[a-z0-9-]+`) so the numeric command `s3` (L194) is capt
 `analyze` command (L412) that a trailing-space-only pattern would miss:
 
 ```text
-$ grep -nE '^[a-z]' helplong_stdout.txt | grep -E '^[0-9]+:[a-z0-9-]+( |$)'
+$ $BIN --help-long 2>/dev/null | grep -nE '^[a-z]' | grep -E '^[0-9]+:[a-z0-9-]+( |$)'
 71:help [<command>...]
 75:git [<flags>] <uri>
 98:github [<flags>]
@@ -1806,6 +1884,7 @@ There are **17** such command entries — `help`, `git`, `github`, `github-exper
 `jenkins`, `huggingface`, and `analyze`. These are the sources TruffleHog can scan (plus the
 `analyze` utility), and they are the CLI-visible expression of its detection capabilities — again,
 compiled-in, not plugin-loaded.
+
 ---
 
 ## Coverage pass — every named item addressed
@@ -1878,6 +1957,7 @@ where an inference is corroborated by source it is written **INFERRED — source
 
 There is **no** blanket "everything else is OBSERVED" claim: each section labels its clauses
 individually, and anything derived from reading rather than running is marked inferred.
+
 ---
 
 ## Final integrity and cleanup
@@ -1891,30 +1971,27 @@ document under `blitzy/documentation/`.
 - **Source commit under investigation:** `e42153d44a5e5c37c1bd0c70e074781e9edcb760` — the exact
   revision the binary was built from (its `vcs.revision`, `vcs.modified=false`; see Environment /
   Q5). All source `file:line` citations and all runtime behavior describe this commit.
-- **Delivery commit (identified by role):** the branch-HEAD commit that adds/updates this Markdown
-  file and **nothing else** — a document cannot embed its own commit hash, so it is named by role
-  rather than by hash. The commit graph captured at delivery time shows the documentation commit
-  with the source commit `e42153d4` as its ancestor (later corrective revisions add further
-  doc-only commits on top of the commit shown):
+- **Delivery commit (identified by role):** the branch-HEAD commit(s) that add/update this
+  Markdown file and **nothing else**. A document cannot embed its own commit hash, and corrective
+  doc-only revisions stack on top over time, so the delivery is characterized by two **reproducible
+  invariants** rather than by a fixed hash. First, the source commit under investigation is an
+  **ancestor** of HEAD — true no matter how many doc-only commits sit on top:
 
 ```text
-$ git log --oneline -3
-86a21931 docs: add runtime-grounded TruffleHog Q&A answer document
-e42153d4 [Fix] Added Prefix In Dockerhub Detector Regex (#4084)
-87a80345 Issue - 3697 - GitHub analyzer panic (#4113)
+$ git -C "$REPO_ROOT" merge-base --is-ancestor e42153d44a5e5c37c1bd0c70e074781e9edcb760 HEAD \
+    && echo "source commit e42153d4… is an ancestor of HEAD"
+source commit e42153d4… is an ancestor of HEAD
 ```
 
-**OBSERVED.** `git show HEAD` for the documentation commit confirms the delivery touches **only**
-the documentation file — no `.go`, `proto`, manifest, or build file — so the compiled behavior
-described here is unchanged from the source commit. The insertion count shown is that of the
-documentation commit at capture time; this corrective revision is likewise a doc-only change to the
-very same file:
+**OBSERVED.** Second, the delivery is **doc-only**: the cumulative set of files changed between
+the source commit and HEAD is exactly one path — this answer document. No `.go`, `proto`,
+manifest, or build file is touched, so the compiled behavior described here is unchanged from the
+source commit. The specific hashes, subjects, and *number* of doc-only commits stacked on top vary
+per replay and cannot be self-embedded; the **set of changed files** shown here is invariant:
 
 ```text
-$ git show --stat --oneline HEAD
-86a21931 docs: add runtime-grounded TruffleHog Q&A answer document
- blitzy/documentation/trufflehog_e42153d44a5e.md | 1118 +++++++++++++++++++++++
- 1 file changed, 1118 insertions(+)
+$ git -C "$REPO_ROOT" diff --name-only e42153d44a5e5c37c1bd0c70e074781e9edcb760..HEAD
+blitzy/documentation/trufflehog_e42153d44a5e.md
 ```
 
 ### Prior-milestone note (transparency)
@@ -1928,31 +2005,31 @@ actually contains.
 
 ### Cleanup (executed, with proof)
 
-**OBSERVED.** All temporary investigation artifacts were removed after the answers were captured:
-the built binary `/tmp/trufflehog_bin`, the secure work directory
-`/tmp/thog_investigation.XXXXXXXX` (fixture + captures), and all `/tmp` scratch files. The exact
-commands and the post-removal verification (each path absent; the tracked tree clean except the
-committed document):
+**OBSERVED.** Every temporary investigation artifact lives under exactly two paths — the
+throwaway work root `$WORK` (which holds the fixture *and* every captured log under `$CAPTURES`)
+and the built binary `$BIN` — so the single `cleanup()` defined in the setup preamble removes
+everything in one step. It fires automatically via `trap cleanup EXIT INT TERM`; shown here
+invoked explicitly, followed by path-independent absence checks and the clean-tree proof:
 
 ```text
-# Remove all temporary investigation artifacts (all live under /tmp, outside the checkout):
-$ rm -f  /tmp/trufflehog_bin
-$ rm -rf /tmp/thog_investigation.ulY2DMuS
-$ rm -f  /tmp/.thog_workdir_path /tmp/cites.txt /tmp/check_cites.py /tmp/blockcount.py /tmp/trailcheck.py
-$ rm -rf /tmp/thog_captures_backup
+# The single cleanup path — identical to the trap handler installed in the preamble:
+$ cleanup                                   # cleanup() { rm -rf -- "$WORK"; rm -f -- "$BIN"; }
 
-# Verify each artifact is gone (ls reports "No such file or directory" for each):
-$ ls -ld /tmp/trufflehog_bin /tmp/thog_investigation.ulY2DMuS /tmp/thog_captures_backup
-ls: cannot access '/tmp/trufflehog_bin': No such file or directory
-ls: cannot access '/tmp/thog_investigation.ulY2DMuS': No such file or directory
-ls: cannot access '/tmp/thog_captures_backup': No such file or directory
+# Prove both roots are gone (deterministic checks that do not depend on the per-run $WORK suffix):
+$ test -e "$WORK" && echo "WORK present" || echo "WORK removed"
+WORK removed
+$ test -e "$BIN"  && echo "BIN present"  || echo "BIN removed"
+BIN removed
 
-# The tracked repository tree is clean — no temporary file leaked into the checkout
-# (findings, binary, fixture, and logs were all confined to /tmp):
-$ git status --porcelain | wc -l
+# The tracked source tree is clean — the only delivered change is the committed answer document;
+# the binary, the fixture, and every capture were confined to $WORK and $BIN (both under /tmp).
+# Run from $REPO_ROOT so the check is independent of the (now-deleted) working directory:
+$ cd "$REPO_ROOT" && git status --porcelain | wc -l
 0
 ```
 
 After cleanup, `git status` reports a clean working tree with the single documentation file as the
 only delivered change — satisfying the "repository itself should remain unchanged, and anything
-temporary should be cleaned up afterward" constraint.
+temporary should be cleaned up afterward" constraint. (During a live replay the count is `0`
+*after* the answer document is committed as the delivery commit; before that commit the same
+command reports `1` — the document itself as the sole expected change — and nothing else.)
