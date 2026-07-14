@@ -191,13 +191,54 @@ trap 'rm -rf "$WORK"' EXIT                   # guaranteed cleanup on shell exit
 # (1) The mixed-type file set lives in a PLAIN (non-git) directory — this is the
 #     directory the Q4 `filesystem` scan targets ("$WORK/thog_files"):
 mkdir -p "$WORK/thog_files" && cd "$WORK/thog_files"
-# create fixture files here (see provenance below) ...
+
+# aws_creds.ini — the one detectable secret: an AWS canary access key on line 2,
+# paired with a fabricated (non-live) secret on line 3. The line-2 placement is
+# what makes the finding report "line": 2 (Q3):
+printf '[default]\naws_access_key_id = AKIAYVP4CIPPERUVIFXG\naws_secret_access_key = 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\n' > aws_creds.ini
+
+# config.env, notes.txt, data.mp4 — plain-text files. data.mp4 carries a video
+# extension but its bytes are ASCII text, which is the crux of the Q4 demo
+# (content-sniffed MIME, not the filename, decides scan-vs-skip):
+printf 'APP_NAME=demo\nLOG_LEVEL=info\nCACHE_TTL=3600\n' > config.env
+printf 'Fixture notes for a TruffleHog scan demo.\nIt holds one AWS canary key and no live secrets.\n' > notes.txt
+printf 'Named data.mp4, but the content is plain ASCII text, so TruffleHog sniffs it as text/plain and scans the whole file, too.\n' > data.mp4
+
+# testkey.pem — a dummy private-key file. file(1) recognizes the PEM header as a
+# "PEM RSA private key" and TruffleHog scans it as text, but the body is not a
+# real/parseable key, so it produces no finding:
+cat > testkey.pem <<'PEM'
+-----BEGIN RSA PRIVATE KEY-----
+ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/
+XYZabcdefghijklmnopqrstuvwxyz0123456789+/ABCDEFGHIJKLMNOPQRSTUVW
+uvwxyz0123456789+/ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklm
+-----END RSA PRIVATE KEY-----
+PEM
+
+# logo.png — a 1x1 RGBA PNG (real binary image, decoded from base64). Its
+# content-detected MIME is image/png, so the loose-file scan skips it (Q4):
+base64 -d > logo.png <<'PNG'
+iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYGBgAAAABQABpfZFQAAAAABJRU5ErkJggg==
+PNG
+
+# archive.tar.gz — a gzip tarball with a single plain-text member (for the Q4
+# archive-descent evidence). Deterministic flags (pinned member mtime, fixed
+# owner/group, and `gzip -n` to strip the name/timestamp from the gzip header)
+# make the archive bytes — and therefore its SHA-256 — reproducible:
+printf 'Plain text file inside the tar archive.\n' > inside.txt
+touch -d '2026-07-13T18:16:00Z' inside.txt
+tar --sort=name --owner=root:0 --group=root:0 --mtime='2026-07-13T18:16:00Z' -cf archive.tar inside.txt
+gzip -n -f archive.tar
+rm -f inside.txt                   # only the archived copy belongs in the fixture
 
 # (2) A separate GIT repository holding the identical files — this is the
-#     directory the Q1/Q3 git-source scans target ("$WORK/thog_testrepo"):
+#     directory the Q1/Q3 git-source scans target ("$WORK/thog_testrepo"). The
+#     author/committer dates are pinned so the commit hash and the finding's
+#     "timestamp" (Q3) are deterministic and reproducible, not capture-time:
 cp -a "$WORK/thog_files" "$WORK/thog_testrepo"
 cd "$WORK/thog_testrepo"
 git init -q
+export GIT_AUTHOR_DATE='2026-07-13T18:16:00+00:00' GIT_COMMITTER_DATE='2026-07-13T18:16:00+00:00'
 git -c user.name='t' -c user.email='t@t.com' add -A
 git -c user.name='t' -c user.email='t@t.com' commit -q -m 'fixture'
 ```
@@ -237,12 +278,12 @@ archive.tar.gz: gzip compressed data, from Unix, original size modulo 2^32 10240
 ```text
 $ sha256sum aws_creds.ini config.env testkey.pem notes.txt logo.png data.mp4 archive.tar.gz
 f5eab59f5a1d48fd78f31056e381f81993ab4c334a2fb27125de4a17cc75bc1b  aws_creds.ini
-9c476f44616897c73ecc1fe066a6363b226a0a3886a86b58d61822d94f2ee1cf  config.env
-d68126502edfd1e0e59e23ee8036359484360fe33393f7a8c4fd206f3eac72da  testkey.pem
-6a404b93cf6f483118e365fa4999385b22e262c2b34096a877a3b91a66635550  notes.txt
-5f31de7b7059acf773ba2fafcd318a2f46883d58deb9b323e74dfb20453ed3d0  logo.png
-faa84139cd4adb50b4c03a193f286fe69ad608021b47f1d0664466d176871d89  data.mp4
-b24e3364c9ad2ab037c5bbf8ada15f673ea4e93921aa380b2c8c0a555188cc7d  archive.tar.gz
+db417f40474f67c2e7aa6f552114fbbe335c2fa1cc4292c6923b7a1aa7fd1628  config.env
+56a8a0191351aea7e439ae7ec8e2ac0e18ec7e398fc69e9ef73facb3699b965d  testkey.pem
+e20a4d5398fbaefcd7428f7f779f830cf9c72589e805cc252b60598a66e31455  notes.txt
+c2153f77e11087fcb078ae38527fa83bef29791e3700e30cc87fec4405a66d0f  logo.png
+be421314b1831c43797aa025f8c0a5fb6d0638f1c7967fd7efa0f960e940ba13  data.mp4
+c86621b81f4181f2cd4a5c907a0e1d676cfc616dd181d11311c3ac11c916379d  archive.tar.gz
 ```
 
 **OBSERVED.** The archive's single member (used for the Q4 archive-descent evidence):
@@ -259,7 +300,7 @@ the global identity):
 $ git log -1 --format='author=%an <%ae>%ncommitter=%cn <%ce>%ncommit=%H'
 author=t <t@t.com>
 committer=t <t@t.com>
-commit=6b84f04f1c0982272bb21e3ec5ae447b639420d5
+commit=e46ff31a2e0f32349f79294d9f095bd2e5f54520
 ```
 
 The one detectable secret is an **AWS canary access key** (`AKIA…`, `is_canary=true` — see Q3),
@@ -607,7 +648,7 @@ file, then pretty-printed for readability — the raw bytes are shown first):
 $ /tmp/trufflehog_bin git file:///tmp/thog_investigation.ulY2DMuS/thog_testrepo \
       --json --no-update 1>/tmp/thog_investigation.ulY2DMuS/captures/q3_stdout.json 2>/dev/null
 $ cat /tmp/thog_investigation.ulY2DMuS/captures/q3_stdout.json
-{"SourceMetadata":{"Data":{"Git":{"commit":"6b84f04f1c0982272bb21e3ec5ae447b639420d5","file":"aws_creds.ini","email":"t \u003ct@t.com\u003e","timestamp":"2026-07-13 18:16:00 +0000","line":2}}},"SourceID":1,"SourceType":16,"SourceName":"trufflehog - git","DetectorType":2,"DetectorName":"AWS","DetectorDescription":"AWS (Amazon Web Services) is a comprehensive cloud computing platform offering a wide range of on-demand services like computing power, storage, databases. API keys for AWS can have varying amount of access to these services depending on the IAM policy attached.","DecoderName":"PLAIN","Verified":false,"VerificationFromCache":false,"Raw":"AKIAYVP4CIPPERUVIFXG","RawV2":"AKIAYVP4CIPPERUVIFXG:qUGtRtqlJNUCoY5SBly3QymVf33zOXxHcEuS7VxA","Redacted":"AKIAYVP4CIPPERUVIFXG","ExtraData":{"account":"595918472158","is_canary":"true","message":"This is an AWS canary token generated at canarytokens.org.","resource_type":"Access key"},"StructuredData":null}
+{"SourceMetadata":{"Data":{"Git":{"commit":"e46ff31a2e0f32349f79294d9f095bd2e5f54520","file":"aws_creds.ini","email":"t \u003ct@t.com\u003e","timestamp":"2026-07-13 18:16:00 +0000","line":2}}},"SourceID":1,"SourceType":16,"SourceName":"trufflehog - git","DetectorType":2,"DetectorName":"AWS","DetectorDescription":"AWS (Amazon Web Services) is a comprehensive cloud computing platform offering a wide range of on-demand services like computing power, storage, databases. API keys for AWS can have varying amount of access to these services depending on the IAM policy attached.","DecoderName":"PLAIN","Verified":false,"VerificationFromCache":false,"Raw":"AKIAYVP4CIPPERUVIFXG","RawV2":"AKIAYVP4CIPPERUVIFXG:qUGtRtqlJNUCoY5SBly3QymVf33zOXxHcEuS7VxA","Redacted":"AKIAYVP4CIPPERUVIFXG","ExtraData":{"account":"595918472158","is_canary":"true","message":"This is an AWS canary token generated at canarytokens.org.","resource_type":"Access key"},"StructuredData":null}
 ```
 
 **OBSERVED — the same object pretty-printed** (`python3 -m json.tool`), for field-by-field
@@ -618,7 +659,7 @@ reading:
     "SourceMetadata": {
         "Data": {
             "Git": {
-                "commit": "6b84f04f1c0982272bb21e3ec5ae447b639420d5",
+                "commit": "e46ff31a2e0f32349f79294d9f095bd2e5f54520",
                 "file": "aws_creds.ini",
                 "email": "t <t@t.com>",
                 "timestamp": "2026-07-13 18:16:00 +0000",
@@ -698,7 +739,7 @@ error key appears.
 
 ```json
 "SourceMetadata": { "Data": { "Git": {
-  "commit": "6b84f04f1c0982272bb21e3ec5ae447b639420d5",
+  "commit": "e46ff31a2e0f32349f79294d9f095bd2e5f54520",
   "file": "aws_creds.ini", "email": "t <t@t.com>",
   "timestamp": "2026-07-13 18:16:00 +0000", "line": 2 } } }
 ```
@@ -886,7 +927,7 @@ $ /tmp/trufflehog_bin git "file://$WORK/thog_testrepo" --no-verification --log-l
       1>"$WORK/captures/q4_git_stdout.log" 2>"$WORK/captures/q4_git_trace.log"; echo "exit=$?"
 exit=0
 $ grep 'file contains ignored extension' "$WORK/captures/q4_git_trace.log"
-2026-07-13T23:10:15Z	info-5	trufflehog	file contains ignored extension	{"source_manager_worker_id": "P430h", "unit_kind": "dir", "unit": "/tmp/thog_investigation.ZCrEoHBV/thog_testrepo", "commit": "9f16472", "path": "logo.png"}
+2026-07-13T23:10:15Z	info-5	trufflehog	file contains ignored extension	{"source_manager_worker_id": "P430h", "unit_kind": "dir", "unit": "/tmp/thog_investigation.ZCrEoHBV/thog_testrepo", "commit": "e46ff31", "path": "logo.png"}
 $ grep -c 'skipping file: extension is ignored' "$WORK/captures/q4_git_trace.log"
 0
 ```
