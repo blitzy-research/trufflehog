@@ -144,9 +144,12 @@ use (
 )
 ```
 
-The observation program (`/tmp/thog_obs_q1/main.go`):
+The observation program is created at `/tmp/thog_obs_q1/main.go` by the heredoc below (the
+complete Go source is written verbatim by this `cat` command — this is the exact file whose
+output is captured further down, so the section is fully self-contained):
 
-```go
+```bash
+cat > /tmp/thog_obs_q1/main.go <<'EOF'
 package main
 
 import (
@@ -198,6 +201,7 @@ func main() {
 		fmt.Printf("  %q -> %d\n", e.kw, e.n)
 	}
 }
+EOF
 ```
 
 **Exact commands** (run inside the external module; `-mod=mod` is incompatible with workspace
@@ -207,6 +211,7 @@ run's complete `stdout` captured to a separate file (`stderr` was empty for all 
 
 ```bash
 cd /tmp/thog_obs_q1
+mkdir -p /tmp/blitzy_captures   # transcript capture directory used by every question below
 go run . > /tmp/blitzy_captures/q1_run1.txt 2>/tmp/blitzy_captures/q1_run1.err
 go run . > /tmp/blitzy_captures/q1_run2.txt 2>/tmp/blitzy_captures/q1_run2.err
 go run . > /tmp/blitzy_captures/q1_run3.txt 2>/tmp/blitzy_captures/q1_run3.err
@@ -375,6 +380,7 @@ ordering under investigation is per-chunk and independent of the worker count �
 across concurrency values in Q4):
 
 ```bash
+mkdir -p /tmp/blitzy_captures   # (already created in Q1; repeated so this section runs standalone)
 /tmp/thog filesystem /tmp/thog_obs_q2m --concurrency=1 --trace --no-verification \
   --results=verified,unverified,unknown --no-update  1>/tmp/blitzy_captures/q2_stdout.log 2>/tmp/blitzy_captures/q2_stderr.log
 ```
@@ -440,10 +446,54 @@ Q5).** URL-A (`alice`) is present as plaintext, so it matches under the UTF8 pas
 decoder rewrites only the base64 substring and leaves the rest of the chunk intact, so the plaintext
 URL-A is *also* present in the Base64-decoded view and matches again there. The notifier's LRU dedupe
 (Q5) then keeps whichever pass's result arrives first and drops the other, so URL-A's reported
-`Decoder Type` is non-deterministic. Over 12 identical runs it was `PLAIN` 11 times and `BASE64` once
-(URL-B was `BASE64` and the result **count was 2** in every run). The run shown above is a
-representative `PLAIN`-for-URL-A capture. This race is analyzed in Q5 (finding on non-atomic
-`Get`→`Add` across concurrent notifier workers).
+`Decoder Type` is a **non-deterministic race** whose exact ratio is not reproducible run-to-run.
+What *is* invariant is that the result **count is 2** and URL-B is always `BASE64`; only URL-A's
+label varies. The single run shown above is a representative `PLAIN`-for-URL-A capture. This race is
+analyzed in Q5 (finding on non-atomic `Get`→`Add` across concurrent notifier workers).
+
+**Repeat evidence — exact command and complete output (12 runs).** To characterize the race per the
+requirement to observe repeated behavior at least twice, the scan was run 12 times, tallying URL-A's
+decoder label, URL-B's decoder label, and the result count on each run:
+
+```bash
+plain=0; base64=0; count2=0
+for i in $(seq 1 12); do
+  out=$(/tmp/thog filesystem /tmp/thog_obs_q2m --concurrency=1 --no-verification \
+        --results=verified,unverified,unknown --no-update 2>/dev/null)
+  cnt=$(printf '%s\n' "$out" | grep -c 'Detector Type:')
+  labelA=$(printf '%s\n' "$out" | grep -B2 'alice:secretpw111@api-one' | grep 'Decoder Type:' | awk '{print $3}')
+  labelB=$(printf '%s\n' "$out" | grep -B2 'bob:secretpw222@api-two'  | grep 'Decoder Type:' | awk '{print $3}')
+  echo "run $i: results=$cnt  URL-A(alice)=$labelA  URL-B(bob)=$labelB"
+  [ "$cnt" = 2 ]        && count2=$((count2+1))
+  [ "$labelA" = PLAIN ]  && plain=$((plain+1))
+  [ "$labelA" = BASE64 ] && base64=$((base64+1))
+done
+echo "SUMMARY: runs_with_count_2=$count2/12 ; URL-A PLAIN=$plain BASE64=$base64 ; URL-B always BASE64"
+```
+
+Complete, unedited output:
+
+```
+run 1: results=2  URL-A(alice)=PLAIN  URL-B(bob)=BASE64
+run 2: results=2  URL-A(alice)=BASE64  URL-B(bob)=BASE64
+run 3: results=2  URL-A(alice)=PLAIN  URL-B(bob)=BASE64
+run 4: results=2  URL-A(alice)=BASE64  URL-B(bob)=BASE64
+run 5: results=2  URL-A(alice)=PLAIN  URL-B(bob)=BASE64
+run 6: results=2  URL-A(alice)=BASE64  URL-B(bob)=BASE64
+run 7: results=2  URL-A(alice)=BASE64  URL-B(bob)=BASE64
+run 8: results=2  URL-A(alice)=BASE64  URL-B(bob)=BASE64
+run 9: results=2  URL-A(alice)=BASE64  URL-B(bob)=BASE64
+run 10: results=2  URL-A(alice)=PLAIN  URL-B(bob)=BASE64
+run 11: results=2  URL-A(alice)=PLAIN  URL-B(bob)=BASE64
+run 12: results=2  URL-A(alice)=BASE64  URL-B(bob)=BASE64
+SUMMARY: runs_with_count_2=12/12 ; URL-A PLAIN=5 BASE64=7 ; URL-B always BASE64
+```
+
+In this 12-run sample the result count was **2 in every run** and URL-B was **`BASE64` in every run**
+(both invariant); only URL-A's label varied (`PLAIN` 5, `BASE64` 7). The exact PLAIN/BASE64 split is
+**not** a reproducible constant — it shifts between sessions — so it is reported as an observed
+distribution, not a fixed ratio; the reproducible facts are the two invariants (result count 2,
+URL-B `BASE64`), which together are what actually demonstrate decode-before-match.
 
 **`file:line` grounding (verified).** In `func (e *Engine) scannerWorker(ctx context.Context)`
 (`pkg/engine/engine.go:L777`), for each chunk and each decoder in order, the decode runs first:
@@ -598,13 +648,24 @@ present in the tree but is **not** wired into these pipeline channels).
 /tmp/thog filesystem --directory=/tmp/thog_obs_q3 --concurrency=4 --debug --no-verification --no-update
 ```
 
-**Complete, unedited `stderr` (worker-count lines):**
+**Complete, unedited `stderr` — the command above was run twice consecutively; the worker counts are byte-identical across both runs, confirming run-to-run stability.**
+
+_Run 1:_
 
 ```
-2026-07-13T17:26:50Z	info-2	trufflehog	starting scanner workers	{"count": 4}
-2026-07-13T17:26:50Z	info-2	trufflehog	starting detector workers	{"count": 32}
-2026-07-13T17:26:50Z	info-2	trufflehog	starting verificationOverlap workers	{"count": 4}
-2026-07-13T17:26:50Z	info-2	trufflehog	starting notifier workers	{"count": 4}
+2026-07-14T01:13:52Z	info-2	trufflehog	starting scanner workers	{"count": 4}
+2026-07-14T01:13:52Z	info-2	trufflehog	starting detector workers	{"count": 32}
+2026-07-14T01:13:52Z	info-2	trufflehog	starting verificationOverlap workers	{"count": 4}
+2026-07-14T01:13:52Z	info-2	trufflehog	starting notifier workers	{"count": 4}
+```
+
+_Run 2 (a second consecutive invocation of the identical command):_
+
+```
+2026-07-14T01:13:54Z	info-2	trufflehog	starting scanner workers	{"count": 4}
+2026-07-14T01:13:54Z	info-2	trufflehog	starting detector workers	{"count": 32}
+2026-07-14T01:13:54Z	info-2	trufflehog	starting verificationOverlap workers	{"count": 4}
+2026-07-14T01:13:54Z	info-2	trufflehog	starting notifier workers	{"count": 4}
 ```
 
 **Stability cross-check at a second concurrency value** (`--concurrency=128`) — same ×1/×8/×1/×1
@@ -657,6 +718,50 @@ send *is* the backpressure mechanism. There is no observable channel-depth count
 `channelmetrics` is not referenced in `engine.go`, so the pipeline channels are unwrapped, and
 backpressure is not surfaced as a metric.
 
+**Backpressure under high volume — observed no-loss / no-deadlock at scale.** The blocking-send
+mechanism itself is not observable through a metric, but its *safety property* is: feeding the
+pipeline far more detectable chunks than the `detectableChunksChan` buffer can hold (6400 on this
+host) must still report every secret with no loss, no deadlock, and no panic — exactly what a
+correctly back-pressured bounded channel guarantees. The fixture below is **7001** single-line files
+(each its own chunk, each a distinct URI credential) — **601 more chunks than the 6400 buffer** — and
+is scanned with only 4 scanner / 32 detector workers (`--concurrency=4`), so producers necessarily
+outrun consumers and drive the buffer to saturation:
+
+```bash
+mkdir -p /tmp/blitzy_captures   # (already created in Q1; repeated so this section runs standalone)
+
+# 7001 distinct single-chunk files > the 6400 detectableChunksChan buffer
+rm -rf /tmp/thog_obs_q4stress && mkdir -p /tmp/thog_obs_q4stress
+for i in $(seq 1 7001); do
+  printf 'endpoint = https://user%05d:Secretpw%05dXYZ@host-%05d.example.com\n' "$i" "$i" "$i" \
+    > /tmp/thog_obs_q4stress/f$i.txt
+done
+
+/tmp/thog filesystem /tmp/thog_obs_q4stress --concurrency=4 --no-verification \
+  --results=verified,unverified,unknown --no-update \
+  1>/tmp/blitzy_captures/q4_stress_stdout.log 2>/tmp/blitzy_captures/q4_stress_stderr.log
+echo "exit_code=$?"
+echo "results reported = $(grep -c 'Detector Type:' /tmp/blitzy_captures/q4_stress_stdout.log)"
+echo "panic/deadlock/fatal lines = $(grep -ciE 'panic|deadlock|fatal' /tmp/blitzy_captures/q4_stress_stderr.log)"
+grep 'finished scanning' /tmp/blitzy_captures/q4_stress_stderr.log
+```
+
+**Complete, unedited output:**
+
+```
+exit_code=0
+results reported = 7001
+panic/deadlock/fatal lines = 0
+2026-07-14T01:14:32Z	info-0	trufflehog	finished scanning	{"chunks": 7001, "bytes": 483069, "verified_secrets": 0, "unverified_secrets": 7001, "scan_duration": "379.214001ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
+```
+
+All **7001** chunks were scanned and all **7001** secrets reported (`unverified_secrets: 7001`), the
+process exited **0**, and there were **zero** panic/deadlock/fatal lines. With only 4 scanner and 32
+detector workers draining 7001 queued chunks, the `detectableChunksChan` buffer is driven to (and
+past) saturation, yet nothing is dropped — the bounded channel's blocking send **(inferred
+mechanism)** throttles the producing workers instead of losing data. This is the observable
+manifestation of the backpressure described above.
+
 **Discrepancy to call out (observed comment/code mismatch).** The comment at
 `pkg/engine/engine.go:L658` reads `// We want 1/4th of the notifier workers as the number of scanner
 workers.`, but the code uses a default notifier multiplier of **1**, so the notifier count *equals* the
@@ -690,6 +795,19 @@ notifier runs as many concurrent workers and the `Get`/`Add` pair is not atomic 
 **Fixture (different locations → reported twice).** The same URI credential, plaintext in `plain.txt`
 (line 2) and base64-encoded in `encoded.txt` (line 2) — different files/lines, hence different
 `SourceMetadata`.
+
+Create the two fixtures — `plain.txt` carries the URI in plaintext on line 2; `encoded.txt` carries
+the base64 of the same URI on line 2:
+
+```bash
+mkdir -p /tmp/blitzy_captures   # (already created in Q1; repeated so this section runs standalone)
+rm -rf /tmp/thog_obs_q5 && mkdir -p /tmp/thog_obs_q5
+printf 'service config\nurl = https://myuser:mypassword123@api.example.com\n' > /tmp/thog_obs_q5/plain.txt
+printf 'backup blob\naHR0cHM6Ly9teXVzZXI6bXlwYXNzd29yZDEyM0BhcGkuZXhhbXBsZS5jb20=\n' > /tmp/thog_obs_q5/encoded.txt
+```
+
+(The base64 string in `encoded.txt` decodes to `https://myuser:mypassword123@api.example.com`; verify
+with `echo 'aHR0cHM6Ly9teXVzZXI6bXlwYXNzd29yZDEyM0BhcGkuZXhhbXBsZS5jb20=' | base64 -d`.)
 
 **Exact command:**
 
@@ -756,7 +874,16 @@ both resolve to the same reported line — because the Base64 decoder rewrites o
 and the URI detector reports the first (plaintext) occurrence — so both passes produce the identical
 key.
 
-Fixture (`/tmp/thog_obs_q5s/same.txt`):
+Create the fixture (`/tmp/thog_obs_q5s/same.txt`) — plaintext URI on line 2, base64 of the same URI
+on line 3, in a single file:
+
+```bash
+rm -rf /tmp/thog_obs_q5s && mkdir -p /tmp/thog_obs_q5s
+printf 'app config\nurl = https://myuser:mypassword123@api.example.com\nb64 = aHR0cHM6Ly9teXVzZXI6bXlwYXNzd29yZDEyM0BhcGkuZXhhbXBsZS5jb20=\nend\n' > /tmp/thog_obs_q5s/same.txt
+cat -n /tmp/thog_obs_q5s/same.txt
+```
+
+`cat -n` output (plaintext URI on line 2, base64 of the same URI on line 3):
 
 ```
      1	app config
@@ -782,11 +909,46 @@ File: /tmp/thog_obs_q5s/same.txt
 Line: 2
 ```
 
-**Observed distribution.** Over **20** identical runs the credential was reported exactly **once**
-every time (dedupe always fired), but the **retained `Decoder Type` was indeterminate**: `BASE64` 17
-times and `PLAIN` 3 times. A stress run at `--concurrency=128` (40 runs) also produced exactly one
-result every time — i.e., a *double*-report was not observed here — but the code does not preclude it
-(below).
+**Observed distribution (20 runs, default concurrency).** Over **20** identical runs the credential
+was reported exactly **once** every time (the dedupe always fired — the count is invariant), but the
+**retained `Decoder Type` was indeterminate** (a race between concurrent notifier workers, explained
+below). The exact loop and its complete output:
+
+```bash
+once=0; multi=0; plain=0; base64=0
+for i in $(seq 1 20); do
+  out=$(/tmp/thog filesystem /tmp/thog_obs_q5s --no-verification --results=verified,unverified,unknown --no-update 2>/dev/null)
+  cnt=$(printf '%s\n' "$out" | grep -c 'Detector Type:')
+  lbl=$(printf '%s\n' "$out" | grep 'Decoder Type:' | head -1 | awk '{print $3}')
+  [ "$cnt" = 1 ] && once=$((once+1)) || multi=$((multi+1))
+  [ "$lbl" = PLAIN ]  && plain=$((plain+1))
+  [ "$lbl" = BASE64 ] && base64=$((base64+1))
+done
+echo "count==1 in $once/20 ; count!=1 in $multi/20 ; retained-decoder PLAIN=$plain BASE64=$base64"
+```
+
+```
+count==1 in 20/20 ; count!=1 in 0/20 ; retained-decoder PLAIN=5 BASE64=15
+```
+
+The retained-decoder split (here `PLAIN` 5 / `BASE64` 15) **varies run-to-run** — it is a genuine
+race (see below) — so the specific ratio is not reproducible, but the **count is always 1**. A stress
+loop at `--concurrency=128` (40 runs) also produced exactly one result every time — a *double*-report
+was not observed here, though the code does not preclude it (below):
+
+```bash
+once=0; multi=0
+for i in $(seq 1 40); do
+  out=$(/tmp/thog filesystem /tmp/thog_obs_q5s --concurrency=128 --no-verification --results=verified,unverified,unknown --no-update 2>/dev/null)
+  cnt=$(printf '%s\n' "$out" | grep -c 'Detector Type:')
+  [ "$cnt" = 1 ] && once=$((once+1)) || multi=$((multi+1))
+done
+echo "count==1 in $once/40 ; count!=1 in $multi/40"
+```
+
+```
+count==1 in 40/40 ; count!=1 in 0/40
+```
 
 **Why this is best-effort, not guaranteed (code-derived).** `startNotifierWorkers`
 (`pkg/engine/engine.go:L705`) spawns `numWorkers := e.notificationWorkerMultiplier * e.concurrency`
@@ -802,11 +964,90 @@ goroutine's `Add` executed first — hence the indeterminate `PLAIN`/`BASE64` la
 but it does **not** serialize the concurrent notifier workers, so it does not guarantee the
 plaintext/UTF8 result is the one retained.
 
-**Edge case — Postman sources (code-derived).** When
+**Edge case — Postman sources (observed via `trufflehog postman`).** When
 `result.SourceType == sourcespb.SourceType_SOURCE_TYPE_POSTMAN` (**L1218**), the `||` short-circuits the
 skip condition, so a same-key result is deduped **regardless of decoder type** (i.e., even when the
-stored and current decoders match). Filesystem fixtures cannot exercise this branch (they are not
-Postman sources), so it is reported as code-derived.
+stored and current decoders match). This branch **is** reachable at runtime through the `postman`
+subcommand, whose local-collection path scans without any network token. A collection with **two
+variables that both hold the same Slack token** is joined into a single chunk by `scanVariableData`,
+so the Slack detector returns two results with an **identical** dedupe key (same `DetectorType`,
+`Raw`, `RawV2`, and Postman `SourceMetadata`) and the **same** decoder (`PLAIN`); the Postman clause
+then skips the second, so the credential is reported **once**:
+
+```bash
+mkdir -p /tmp/thog_obs_q5pm
+cat > /tmp/thog_obs_q5pm/collection.json <<'JSON'
+{
+  "info": {
+    "_postman_id": "dedupe-demo-0001",
+    "name": "Dedupe Demo Collection",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [],
+  "variable": [
+    { "key": "slack_token_a", "value": "xoxb-9273641850-7382910465aZqXpLmNbVcD", "type": "string" },
+    { "key": "slack_token_b", "value": "xoxb-9273641850-7382910465aZqXpLmNbVcD", "type": "string" }
+  ]
+}
+JSON
+
+/tmp/thog postman --collection-paths=/tmp/thog_obs_q5pm/collection.json \
+  --no-verification --results=verified,unverified,unknown --no-update
+```
+
+**Complete, unedited `stdout` — reported once (Postman dedupe across the two identical variables):**
+
+```
+Found unverified result 🐷🔑❓
+Detector Type: Slack
+Decoder Type: PLAIN
+Raw result: xoxb-9273641850-7382910465aZqXpLmNbVcD
+Rotation_guide: https://howtorotate.com/docs/tutorials/slack/
+Token_type: Slack Bot Token
+Collection_name: Dedupe Demo Collection
+Field_type: collection variables
+Link: /tmp/thog_obs_q5pm/collection.json
+Location_type: 14
+```
+
+The `Field_type: collection variables` and `Location_type: 14` fields confirm the source is a Postman
+collection variable. To prove the Postman clause is the **sole** deciding factor, the identical pair
+of results in a **non-Postman** (filesystem) source — the same Slack token twice on one line, i.e. the
+same `Raw`, decoder (`PLAIN`), and `SourceMetadata` — is instead reported **twice**:
+
+```bash
+mkdir -p /tmp/thog_obs_q5fs
+printf 'xoxb-9273641850-7382910465aZqXpLmNbVcD xoxb-9273641850-7382910465aZqXpLmNbVcD\n' > /tmp/thog_obs_q5fs/tokens.txt
+/tmp/thog filesystem /tmp/thog_obs_q5fs --no-verification --results=verified,unverified,unknown --no-update
+```
+
+**Complete, unedited `stdout` — reported twice (no Postman clause):**
+
+```
+Found unverified result 🐷🔑❓
+Detector Type: Slack
+Decoder Type: PLAIN
+Raw result: xoxb-9273641850-7382910465aZqXpLmNbVcD
+Rotation_guide: https://howtorotate.com/docs/tutorials/slack/
+Token_type: Slack Bot Token
+File: /tmp/thog_obs_q5fs/tokens.txt
+Line: 1
+
+Found unverified result 🐷🔑❓
+Detector Type: Slack
+Decoder Type: PLAIN
+Raw result: xoxb-9273641850-7382910465aZqXpLmNbVcD
+Rotation_guide: https://howtorotate.com/docs/tutorials/slack/
+Token_type: Slack Bot Token
+File: /tmp/thog_obs_q5fs/tokens.txt
+Line: 1
+```
+
+Both filesystem results carry the identical `Raw`, `Decoder Type: PLAIN`, and `File`/`Line`, so their
+dedupe keys are identical (confirmed via `--json`: `Raw`, decoder, and `SourceMetadata` all equal).
+The **only** difference between the once-reported Postman case and the twice-reported filesystem case
+is `result.SourceType`, which isolates the **L1218 Postman clause** as the cause. (`RawV2` is not
+shown by the plain printer but is identical for both by construction.)
 
 
 ---
@@ -830,10 +1071,19 @@ block's `VerificationTimeSpentMS` (Q3), which tracks verification wall-time inde
 exactly one detector — a URI credential and a Slack bot token:
 
 ```bash
-$ cat /tmp/thog_obs_q6/uri.txt
-url = https://myuser:mypassword123@api.example.com
-$ cat /tmp/thog_obs_q6/slack.txt
-slack_token = xoxb-9273641850-7382910465aZqXpLmNbVcD
+mkdir -p /tmp/blitzy_captures   # (already created in Q1; repeated so this section runs standalone)
+rm -rf /tmp/thog_obs_q6 && mkdir -p /tmp/thog_obs_q6
+printf 'url = https://myuser:mypassword123@api.example.com\n' > /tmp/thog_obs_q6/uri.txt
+printf 'slack_token = xoxb-9273641850-7382910465aZqXpLmNbVcD\n' > /tmp/thog_obs_q6/slack.txt
+wc -c /tmp/thog_obs_q6/uri.txt /tmp/thog_obs_q6/slack.txt
+```
+
+`wc -c` output — the **104-byte** total matches `"bytes": 104` in every scan below:
+
+```
+ 51 /tmp/thog_obs_q6/uri.txt
+ 53 /tmp/thog_obs_q6/slack.txt
+104 total
 ```
 
 Both scans below are run at `--concurrency=1` so the captured streams are compact and deterministic;
@@ -886,6 +1136,23 @@ Only two detector lines appear (`URI`, `Slack`) — there is no line for any of 
 in the default set — and both matched secrets are reported on stdout (`unverified_secrets: 2`). The
 `verification_caching` block is all-zero because verification (and therefore the result cache) is off.
 
+**Run A, repeated (the identical Run A command above, re-executed — confirming the coverage rule and the
+microsecond/low-millisecond magnitudes are stable across runs).** Complete, unedited `stderr`:
+
+```
+🐷🔑🐷  TruffleHog. Unearth your secrets. 🐷🔑🐷
+
+2026-07-14T01:42:21Z	info-0	trufflehog	running source	{"source_manager_worker_id": "ri7UW", "with_units": true}
+Average detector time is the measurement of average time spent on each detector when results are returned.
+URI: 1.135399ms
+Slack: 48.861µs
+2026-07-14T01:42:21Z	info-0	trufflehog	finished scanning	{"chunks": 2, "bytes": 104, "verified_secrets": 0, "unverified_secrets": 2, "scan_duration": "2.277608ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
+```
+
+Again only `URI` and `Slack` are timed (never the other ~829 detectors) and `VerificationTimeSpentMS`
+is `0`; the `stdout` is the same two unverified results as Run A (their print order may differ because
+the metrics map iteration order is not fixed).
+
 ### Run B — verification ON (default)
 
 **Exact command:**
@@ -934,12 +1201,35 @@ DNS resolution for `api.example.com` in this sandbox); the Slack detector likewi
 request that fails. Both verification attempts happen *inside* the timed window, which is why the
 reported averages are far larger than in Run A.
 
-**Side-by-side (same two detectors; representative single-run wall-clock values):**
+**Run B, repeated (the identical Run B command above, re-executed — confirming the order-of-magnitude inflation is
+stable across runs).** Complete, unedited `stderr`:
 
-| Detector | verification OFF | verification ON | change |
-|----------|------------------|-----------------|--------|
-| URI      | 1.202726ms       | 18.059607ms     | ≈15× larger with verification |
-| Slack    | 311.472µs        | 126.192958ms    | ≈400× larger with verification |
+```
+🐷🔑🐷  TruffleHog. Unearth your secrets. 🐷🔑🐷
+
+2026-07-14T01:42:22Z	info-0	trufflehog	running source	{"source_manager_worker_id": "PTgiG", "with_units": true}
+Average detector time is the measurement of average time spent on each detector when results are returned.
+Slack: 132.211483ms
+URI: 28.116442ms
+2026-07-14T01:42:23Z	info-0	trufflehog	finished scanning	{"chunks": 2, "bytes": 104, "verified_secrets": 0, "unverified_secrets": 2, "scan_duration": "133.572596ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":2,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":158}}
+```
+
+Both detectors are again inflated into the tens-to-hundreds of milliseconds and `VerificationTimeSpentMS`
+is again non-zero with `Misses: 2`, matching Run B; the `stdout` again carries the URI
+`Verification issue: … no such host` line.
+
+**Side-by-side (same two detectors; two runs per mode — Run 1 = Run A/B above, Run 2 = the repeats
+above):**
+
+| Detector | OFF run 1 | OFF run 2 | ON run 1 | ON run 2 |
+|----------|-----------|-----------|----------|----------|
+| URI      | 1.202726ms | 1.135399ms | 18.059607ms | 28.116442ms |
+| Slack    | 311.472µs  | 48.861µs   | 126.192958ms | 132.211483ms |
+
+Across both repeats per mode the OFF averages stay in the microsecond/low-millisecond range while the
+ON averages stay in the tens-to-hundreds of milliseconds; the ON-vs-OFF gap (≈15–25× for URI,
+≈400–2700× for Slack) is stable in direction and magnitude across runs even though the exact figures
+vary run-to-run.
 
 With verification **off**, the Slack average sits in **microseconds** (~311 µs) and URI at about **one
 millisecond** (~1.2 ms) — the times do not all collapse to microseconds; only Slack does, while URI
@@ -1015,14 +1305,15 @@ $ git status --porcelain --untracked-files=all
 (no output — no modified, staged, or untracked files.)
 
 **Cleanup — exact commands and output.** The compiled binary (`/tmp/thog`), every scan fixture
-(`/tmp/thog_obs_q1` … `/tmp/thog_obs_q6s`, including the Q1 external observation module with its
+(`/tmp/thog_obs_q1` … `/tmp/thog_obs_q6`, including the Q4 high-volume stress fixture, the Q5
+Postman collection and filesystem-contrast fixtures, and the Q1 external observation module with its
 `go.work` / `go.mod` / `main.go`), and the capture directory (`/tmp/blitzy_captures`) were removed
 with explicit, path-specific deletes (no broad or wildcard-root deletion):
 
 ```bash
-$ rm -rf /tmp/thog /tmp/thog_obs_q1 /tmp/thog_obs_q2 /tmp/thog_obs_q2a /tmp/thog_obs_q2c \
-         /tmp/thog_obs_q2m /tmp/thog_obs_q3 /tmp/thog_obs_q5 /tmp/thog_obs_q5s \
-         /tmp/thog_obs_q6 /tmp/thog_obs_q6b /tmp/thog_obs_q6s /tmp/blitzy_captures
+$ rm -rf /tmp/thog /tmp/thog_obs_q1 /tmp/thog_obs_q2m /tmp/thog_obs_q3 \
+         /tmp/thog_obs_q4stress /tmp/thog_obs_q5 /tmp/thog_obs_q5s \
+         /tmp/thog_obs_q5pm /tmp/thog_obs_q5fs /tmp/thog_obs_q6 /tmp/blitzy_captures
 $ ls -d /tmp/thog /tmp/thog_obs_q* /tmp/blitzy_captures 2>&1
 ls: cannot access '/tmp/thog': No such file or directory
 ls: cannot access '/tmp/thog_obs_q*': No such file or directory
