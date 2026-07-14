@@ -222,7 +222,7 @@ The 2-second bound here is a literal `time.Second*2`; it is **not** affected by 
 **Stage 2 — `detectChunk`, the configurable timeout (+ watchdog):**
 
 ```go
-// pkg/engine/engine.go:1044,1057-1069  [source, current tree]
+// pkg/engine/engine.go:1044,1061-1070  [source, current tree]
 func (e *Engine) detectChunk(ctx context.Context, data detectableChunk) {
     ...
     matches := data.detector.Matches()
@@ -1114,8 +1114,8 @@ $ trufflehog_bin filesystem ctrlC.txt --no-verification --log-level=2 | grep 'fi
 ### 8.3 Matched-span bound — what each detector `FromData` actually receives
 
 Both worker stages pass only `detector.Matches()` (the matched sub-spans), not the whole chunk, to
-`FromData` (engine.go:937, engine.go:1057) — an explicit optimization commented "to reduce the
-overhead of regex calls in the detector" (engine.go:1058-1061) **[source]**. Span size is set by the
+`FromData` (engine.go:937, engine.go:1061) — an explicit optimization commented "to reduce the
+overhead of regex calls in the detector" (engine.go:1056-1060) **[source]**. Span size is set by the
 Aho-Corasick span calculator: `defaultOffsetRadius = 512` (ahocorasickcore.go:155) yields a
 `[idx-512, idx+512]` window per keyword hit, widened for detectors implementing
 `MaxSecretSizeProvider` (e.g. Docker's 4096, docker_auth_config.go:46), and merged across overlapping
@@ -1180,7 +1180,7 @@ CPU-pattern controls or are measurement-isolation flags.
 |---------|-------------|----------------|
 | **RE2-class linear engines** (go.mod:100; §4) | Per-regex time is linear in input | The real protection against ReDoS. Not configurable; relies on detectors continuing to use go-re2/stdlib |
 | **13 KiB raw chunking** (chunker.go:14-18) | Prefilter input per chunk | Only the *raw* pass; decoded re-scans and archives are separate (§8) |
-| **Matched-span limiting** (engine.go:1057-1061; radius 512, ahocorasickcore.go:155) | Data each `FromData` sees | Grows for `MaxSecretSizeProvider` and whole-chunk detectors |
+| **Matched-span limiting** (engine.go:1056-1061; radius 512, ahocorasickcore.go:155) | Data each `FromData` sees | Grows for `MaxSecretSizeProvider` and whole-chunk detectors |
 | **Aho-Corasick prefilter** (ahocorasickcore.go:241) | Skips detectors whose keywords are absent | A crafted file *defeats* this by including many keywords (the §5.2 amplifier) |
 
 ### 9.2 In-product controls that are weaker than they look
