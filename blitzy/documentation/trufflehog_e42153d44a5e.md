@@ -201,7 +201,7 @@ Because `--allow-verification-overlap` **defaults to false**, `e.verificationOve
 **by default any chunk matching more than one detector is sent to STAGE 1**, the
 `verificationOverlapWorker`. A crafted keyword-fan-out file makes *almost every* chunk match many
 detectors, so **stage 1 is where the dominant work happens by default** — confirmed by the profile
-in §7 (`verificationOverlapWorker` accounts for 42.44 % cumulative on-CPU).
+in §7 (`verificationOverlapWorker` accounts for 40.52 % cumulative on-CPU).
 
 **Stage 1 — `verificationOverlapWorker`, hardcoded 2-second context:**
 
@@ -363,16 +363,18 @@ invoked to match scanned content, it cannot be the vector for a complexity attac
 
 **[external + observed] Advisory note.** `regexp2` is a **backtracking** (.NET-style)
 engine and *is* ReDoS-capable in general — which is exactly why its scan-unreachability matters. The
-pinned **v1.4.0** falls within the affected range of a published ReDoS advisory for the library
-(**GHSA-wq9v-j77v-qr26**, a HIGH / CWE-1333 catastrophic-backtracking issue; affected range
-**reviewer-reported as `< 2.3.0`**, cited as reviewer-reported and not independently re-fetched here). A
+pinned **v1.4.0** carries **no library-level security advisory of its own**: as of this snapshot there
+is no `github.com/dlclark/regexp2` advisory in the Go vulnerability database or on OSV.dev. The concern
+is the engine *class*, not a specific CVE — `regexp2`'s own documentation states it "supports features
+that can lead to catastrophic backtracking" and, unlike RE2/stdlib `regexp`, gives no constant-time
+guarantee (the classic CWE-1333 shape). A
 `govulncheck ./...` run against this repository (Go vulnerability DB snapshot `2026-07-08`) does **not**
 flag `regexp2 v1.4.0` in any category — it appears only in govulncheck's "scanned … 261 modules"
 inventory, never as the module of a reachable, imported-but-uncalled, or required-but-uncalled finding
-(the Go DB does not carry that GitHub advisory as of this snapshot; see §11). It
+(no such advisory is carried by the Go DB or OSV as of this snapshot; see §11). It
 does **not** change the conclusion: §7.4's `go mod why` closure shows `regexp2` is reachable only from
 the TUI renderer, never from `trufflehog filesystem`/`git` scanning, so even a genuinely vulnerable
-`regexp2` version **cannot be reached by a crafted scanned file**. If anything, the advisory
+`regexp2` version **cannot be reached by a crafted scanned file**. If anything, this fact
 **strengthens** the finding — the one backtracking engine in the graph is confined off the scan path.
 
 ### 4.3 Engine survey — method and counts (AST-based, not grep)
@@ -389,7 +391,7 @@ universal file census.
 | — literal / string-concatenation patterns | **234** | statically inspectable |
 | — dynamic / helper-built patterns | **943** | pattern text assembled at runtime (~80 %); a pure grep **cannot** enumerate these, which is why grep is not exhaustive |
 | Test-file compile sites | **19** | excluded from the "detector pattern" analysis |
-| Production literal patterns containing `.*` | **3** | figma, docker_auth_config, jdbc (see §5.3) |
+| Production literal patterns containing `.*` | **2** | docker_auth_config, jdbc (see §5.3) |
 | Production patterns with a **nested-quantifier** shape (a `*`/`+` repeat whose subexpression contains another `*`/`+` repeat — the classic `(x+)+`/`(x*)*` evil shape) | **5** | enumerated below; **all linear under RE2** (§4.4, §4.4.1, §5.3) |
 | Production patterns with an **unbounded `{m,}` repeat over a `*`/`+`** repeat | **1** | SQL Server (`sqlserver/sqlserver.go:25`, `{3,}`); enumerated below; linear under RE2 |
 
@@ -981,9 +983,9 @@ $ go tool nm <workdir>/trufflehog_bin | grep -c wasilibs/go-re2
 references it), while go-re2 contributes 149 — but `regexp2` shows **0 CPU samples in the pprof
 profile and 0 samples in fgprof** (§7.2, §7.3). Linked ≠ executed. Because the backtracking engine is
 never invoked on scanned content, it cannot be a complexity-attack vector (the point of §4.2). This is
-also why the published `regexp2` ReDoS advisory affecting v1.4.0 (**GHSA-wq9v-j77v-qr26**; see the
-advisory note in §4.2) is **irrelevant to the scan path** — the vulnerable engine is unreachable from
-`trufflehog filesystem`/`git`.
+also why `regexp2`'s general ReDoS capability (a backtracking engine with no constant-time guarantee;
+see the advisory note in §4.2) is **irrelevant to the scan path** — the vulnerable engine is unreachable
+from `trufflehog filesystem`/`git`.
 
 ### 7.5 Base64 path profile — RE2 re-scan of decoded content dominates
 
@@ -1338,13 +1340,14 @@ loop on large SSH channel writes, `GO-2026-5018` pathological RSA/DSA parameters
 `GO-2026-4945` go-jose JWE, `GO-2025-3922` LZMA-decode memory leak), but every one lives in a crypto /
 SSH / HTTP-2 / Git-index / JOSE / archive-decompress subsystem that is **off the detector-regex
 pattern-matching path** this investigation measures. No dependency was introduced or version-changed by
-this deliverable (the inventory is empty, §6.2), so these are pre-existing, upstream-owned advisories
+this deliverable (the repository is unchanged except this document — `go.mod`/`go.sum` were not
+modified; see Appendix B), so these are pre-existing, upstream-owned advisories
 that do not alter any R1–R5 conclusion. The exact reachable count depends on the analyzer toolchain
 version (a newer toolchain prunes reachability more precisely, yielding fewer "called" findings), but
 that number is immaterial here — no reachable advisory, at any count, touches the complexity class.
 Finally, `github.com/dlclark/regexp2 v1.4.0` appears **only** in govulncheck's "scanned … 261 modules"
-inventory and is **not** the subject of any advisory finding in any category (its GitHub advisory
-`GHSA-wq9v-j77v-qr26` is not carried by the Go vulnerability database as of this snapshot);
+inventory and is **not** the subject of any advisory finding in any category (no library-level
+`regexp2` advisory is carried by the Go vulnerability database or OSV.dev as of this snapshot);
 independently, its scan-unreachability is proven by `go mod why` (TUI-only; §4.2, §7.4). **[observed;
 run-first — command output above]**
 
