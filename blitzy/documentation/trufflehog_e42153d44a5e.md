@@ -22,7 +22,7 @@
 |---|----------|---------|
 | **Q1** | Can a crafted committed file **hang or time out** TruffleHog and block CI? | **No indefinite hang.** Pattern matching is linear‑time. The only achievable effect is a **linear, bounded** slowdown; a sufficiently large *unique‑match‑dense* file could exceed a fixed CI step timeout (~0.66 s/MiB) and flood findings — a linear resource cost, backstopped by per‑detector cooperative timeouts. |
 | **Q2** | Is pattern matching **vulnerable to computational‑complexity (ReDoS)** attacks? | **No.** Detectors run on RE2‑lineage engines (`go-re2` WASM + stdlib `regexp`) with a documented **linear‑time** guarantee and no unbounded backtracking. Confirmed empirically. |
-| **Q3** | **Which detector patterns**, if any, are exploitable? | **None** for catastrophic blow‑up. Only a handful of detectors even contain a group‑repetition shape; every one was measured and none blows up. |
+| **Q3** | **Which detector patterns**, if any, are exploitable? | **None** for catastrophic blow‑up. Only a handful of detectors (6 of 845) even contain a genuine group‑repetition shape; the highest‑risk of them were measured directly and none blows up, and the engine‑level RE2 linear‑time guarantee covers the rest. |
 | **Q4** | **How much slower** vs. normal files of equivalent size? | A ReDoS‑*structured* (non‑matching) file is only **~1.2×** an equivalent‑size prefilter‑miss baseline. The maximum amplification — a **unique synthetic match‑dense** file — is **~62×** at 8 MiB, and it is **linear and bounded**. |
 | **Q5** | **Evidence** (timing + CPU profiling)? | Timing tables across 3+ runs (§7.1–7.4), a `go tool pprof` CPU profile of the real scan (§7.5), and the engine‑contrast corroboration (§7.6). |
 
@@ -115,18 +115,18 @@ These are the documented guarantees of the engines above, cited to primary sourc
 
 ### 5.1 Semantic candidate inventory (not a lexical grep)
 
-A naïve `grep` for the tokens `)*` or `)+` across the Go source is **misleading**: it matches ordinary Go slice/arithmetic expressions and character‑class text, not regex group‑repetition. To enumerate *real* candidates we searched **only inside compiled regex literals** — `regexp.MustCompile(\`…\`)` patterns — for a group‑repetition `)*`/`)+`. Across all **845** detector directories, exactly **8 production detectors** contain that shape:
+A naïve `grep` for the tokens `)*` or `)+` across the Go source is **misleading**: it matches ordinary Go slice/arithmetic expressions and character‑class text, not regex group‑repetition. To enumerate *real* candidates we searched **only inside pure compiled regex literals** — `regexp.MustCompile(\`…\`)` patterns — for a *genuine* group‑repetition `)*`/`)+`, after discarding matches that are merely literal `)`, `*`, or `+` characters *inside a character‑class* (e.g. `[…()*+…]`). Across all **845** detector directories, exactly **6 production detectors** contain a genuine group‑repetition `)*`/`)+` (rows 1, 3, 4, 6, 7, 8 below). To those we add the **2** highest‑risk *bounded*‑quantifier detectors (`uri` and `azure_entra` v1, rows 2 and 5 — large overlapping character classes governed by `{0,50}`/`{3,50}`/`.{0,80}` quantifiers, the next‑most‑plausible ReDoS shape), for a total of **8 candidate patterns**. Two further detectors — `jiratoken` ([jiratoken.go:L33], v1 and v2: `(?:[a-zA-Z0-9-]{1,24}\.)+`) and `generic` ([generic.go:L25]: `([\w]+[/])+`) — also contain a group‑repetition, but are **excluded by the strict method** because each builds its pattern by string concatenation (`detectors.PrefixRegex(...)` prepended to a raw literal) or from a `[]string` slice rather than a single pure `MustCompile` literal; counting them under a broader reading would raise the genuine‑group‑repetition tally to **8** but changes no conclusion:
 
-| # | Detector | Group‑repetition sub‑expression (the "risky" shape) | Benchmarked? |
+| # | Detector (file:line) | Risky quantifier sub‑expression (shape class) | Benchmarked? |
 |---|----------|------------------------------------------------------|--------------|
-| 1 | `mongodb` ([mongodb.go:L32]) | `(?:,[-.%\w]+(?::\d{1,5})?)*` and `(?:&(?:amp;)?\w+=[\w@/.$-]+)*` | **Yes** — canonical scan |
-| 2 | `uri` ([uri.go:L33]) | bounded `{0,50}`/`{3,50}` classes + trailing group; required `@` | **Yes** — canonical scan |
-| 3 | `azuresastoken` ([azuresastoken.go:L32]) | `(?:/[a-zA-Z0-9._-]+)*` | **Yes** — canonical scan |
-| 4 | `databrickstoken` ([databrickstoken.go:L27]) | `(?:\.[a-z0-9-]+)*` | **Yes** — canonical scan |
-| 5 | `azure_entra` v1 ([spv1.go:L35]) | `.{0,80}` around a bounded class (go‑re2) | **Yes** — canonical scan |
-| 6 | `coinbase_waas` | `(?:[A-Za-z0-9+\/]{4})*` (base64 body) | Source‑reviewed only |
-| 7 | `docker` auth config | `(?:\s|\\+[nrt])*` whitespace repetition; `(?:…={0,2}(?:\r|\n|…))+` | Source‑reviewed only |
-| 8 | `robinhoodcrypto` | `(?:[a-zA-Z0-9-]{1,24}\.)+` | Source‑reviewed only |
+| 1 | `mongodb` ([mongodb.go:L32]) | group‑rep `(?:,[-.%\w]+(?::\d{1,5})?)*` and `(?:&(?:amp;)?\w+=[\w@/.$-]+)*` | **Yes** — canonical scan |
+| 2 | `uri` ([uri.go:L33]) | **bounded** `{0,50}`/`{3,50}` classes + trailing group; required `@` (no `)*`/`)+`) | **Yes** — canonical scan |
+| 3 | `azuresastoken` ([azuresastoken.go:L32]) | group‑rep `(?:/[a-zA-Z0-9._-]+)*` | **Yes** — canonical scan |
+| 4 | `databrickstoken` ([databrickstoken.go:L27]) | group‑rep `(?:\.[a-z0-9-]+)*` | **Yes** — canonical scan |
+| 5 | `azure_entra` v1 ([spv1.go:L35]) | **bounded** `.{0,80}` around a bounded class (go‑re2; no `)*`/`)+`) | **Yes** — canonical scan |
+| 6 | `coinbase_waas` ([coinbase_waas.go:L35]) | group‑rep `(?:[a-zA-Z0-9+/]+={0,2}(?:\r|\n|\\+r|\\+n))+` (`privKeyPat` base64 body) | Source‑reviewed only |
+| 7 | `docker` auth config ([docker_auth_config.go:L51]) | group‑rep `(?:\s|\\+[nrt])*` whitespace repetition and lazy `(?:…)+?` auth‑block repetition | Source‑reviewed only |
+| 8 | `robinhoodcrypto` ([robinhoodcrypto.go:L36]) | group‑rep `(?:[A-Za-z0-9+\/]{4})*` (`privKeyBase64Pat` base64 body) | Source‑reviewed only |
 
 **Timed vs. source‑reviewed‑only — an honest distinction.** We drove candidates 1–5 through the **canonical** `trufflehog filesystem` scan on maximally‑adversarial 8 MiB inputs (§7.2, §7.5), plus the two stdlib‑engine detectors `jdbc` and `azure_cosmosdb` (§7.2). Candidates 6–8 were **reviewed in source but not individually benchmarked**; we do not claim measured times for them. This is acceptable because the ReDoS verdict is an **engine‑level** property, not a per‑pattern one: all eight compile on RE2‑lineage engines (§4), whose linear‑time guarantee holds for *every* pattern regardless of shape. Benchmarking the highest‑risk five is corroboration, not the basis of the conclusion.
 
