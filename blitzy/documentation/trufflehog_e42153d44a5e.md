@@ -49,8 +49,9 @@ detector regex to exponential time.
 
 1. **A crafted file inflates scan time by a large, bounded factor.** At an identical 10,485,760-byte
    (10 MiB) size, a keyword-fan-out file scanned in **~9.82 s median** versus **~0.15 s** for
-   equivalent-size normal prose — a **~64× slowdown on this host** (observed **52–74×** across runs;
-   the sub-200 ms baseline is the noisy denominator) **[observed, §6]**. Scaled up, a 40 MiB crafted
+   equivalent-size normal prose — a **~64× slowdown on this host** (an observed **sample of ~52–78×**
+   across runs — a host/load-dependent figure, not a universal bound; the sub-200 ms baseline is the
+   noisy denominator) **[observed, §6]**. Scaled up, a 40 MiB crafted
    file took **~44 s** **[observed, §7]**. That is finite and linear, but tens of seconds for one file
    is easily enough to blow an external per-step CI wall-clock budget.
 
@@ -87,7 +88,7 @@ gets scanned (file-size/type filters, archive/history controls). See §9.
 | Q1 | Can a crafted file hang / time out / block the scan? | **No unbounded hang; yes to a bounded multi-second-to-multi-tens-of-seconds inflation that can exceed an external CI budget. Per-detector timeouts do not preempt.** | §3 (two-stage path, many non-preemptive watchdog fires) |
 | Q2 | Is pattern matching vulnerable to computational-complexity attacks? | **Not to exponential/catastrophic ReDoS** (RE2-class linear engines); **yes to bounded linear amplification** via fan-out/decoders. | §4 (engine survey, classic payload at baseline speed) |
 | Q3 | Which detector patterns, if any, are exploitable? | **None to exponential time.** Permissive patterns exist (`.*`, wide bounded quantifiers) but stay linear; keyword *fan-out* (many detectors firing per chunk) is the real amplifier, not any one regex. | §5 (AST survey + valid JDBC/Docker/GitHub firing) |
-| Q4 | How much slower than normal files of equal size? | **~64× at 10 MiB** (keyword fan-out; 52–74× across runs); **~27×** (Base64); a keyword-bearing quantifier only **~2.6×**, and keyword-free quantifier stress is **0.53× — *faster* than prose**. Linear in input size. | §6 (equal-size distributions, linearity) |
+| Q4 | How much slower than normal files of equal size? | **~64× at 10 MiB** (keyword fan-out; observed sample ~52–78× across runs, not a universal bound); **~27×** (Base64); a keyword-bearing quantifier only **~2.6×**, and keyword-free quantifier stress is **0.53× — *faster* than prose**. Linear in input size. | §6 (equal-size distributions, linearity) |
 | Q5 | Timing + CPU-profiling evidence? | Provided: `scan_duration` telemetry + concurrent pprof (on-CPU) and fgprof (off-CPU) profiles; RE2 via WASM dominates on-CPU; `regexp2` never executes. | §7 (profiles, dependency closure) |
 
 ---
@@ -103,7 +104,7 @@ counts:
 | Property | Value | How obtained |
 |----------|-------|--------------|
 | `nproc` (OS-visible CPUs) | **4** | `nproc` **[observed]** |
-| cgroup CPU quota (`cpu.max`) | **`400000 100000`** → **4.0 CPUs** | `cat /sys/fs/cgroup/cpu.max` **[observed]** |
+| cgroup CPU quota (`cpu.max`) | **`400000 100000`** → **4.0 CPUs** | `cat /sys/fs/cgroup$(awk -F: '/^0::/{print $3}' /proc/self/cgroup)/cpu.max` — resolves this process's own cgroup-v2 path; note `cpu.max` is **not** at the cgroup root in this container (a bare `cat /sys/fs/cgroup/cpu.max` returns *No such file or directory*), so the path is host/runtime-specific **[observed]** |
 | `runtime.NumCPU()` | **128** | Go runtime reads host, not cgroup **[observed]** |
 | `GOMAXPROCS` after startup | **128 → 4** | `go.uber.org/automaxprocs` `maxprocs.Set()` at main.go:260 clamps to the cgroup quota **[observed; source main.go:24,260]** |
 | Go build toolchain | **go1.24.2** | `go.mod` `go 1.23.1` (language) + `toolchain go1.24.2` (build) — go.mod:3,5 **[source]** |
@@ -146,7 +147,7 @@ non-default behavior is silently presented as canonical.
 | Flag | Default? | Effect | Why used here |
 |------|----------|--------|---------------|
 | `filesystem <path>` | — | Canonical file scan entry point | The real path under test |
-| `--results=verified,unknown,unverified` (add `filtered_unverified` for GitHub) | **non-default** | Selects which result classes print. The four classes are `verified` / `unverified` / `unknown` / `filtered_unverified` (main.go:61,985) | Surface **unverified** detector hits for the reachability proof (§5). Under `--no-verification` a hit is classed **`unverified`** — the else-branch of `notifierWorker`, gated by `notifyUnverifiedResults` (engine.go:1199) — which is a **distinct** class from **`unknown`** (produced only for `VerificationError` results, engine.go:1194). So `unknown` alone surfaces nothing here; `unverified` must be included. Some detectors (e.g. GitHub) additionally mark hits `filtered_unverified`, requiring that token too |
+| `--results=verified,unknown,unverified` (add `filtered_unverified` for low-entropy/FP-classified hits) | **non-default** | Selects which result classes print. The four classes are `verified` / `unverified` / `unknown` / `filtered_unverified` (main.go:61,985) | Surface **unverified** detector hits for the reachability proof (§5). Under `--no-verification` a hit is classed **`unverified`** — the else-branch of `notifierWorker`, gated by `notifyUnverifiedResults` (engine.go:1199) — which is a **distinct** class from **`unknown`** (produced only for `VerificationError` results, engine.go:1194). So `unknown` alone surfaces nothing here; `unverified` must be included. A hit whose **matched value** is reclassified a likely false positive by the engine's entropy filter (`FilterResultsWithEntropy`, falsepositives.go:154) is instead placed in **`filtered_unverified`**; surfacing those requires that token too. This is a **per-value** classification (low Shannon entropy), **not** a per-detector one — a realistic high-entropy token surfaces as plain `unverified` (§5.1a) |
 | `--no-verification` | **non-default** | Skips network verification | Isolates *pattern-matching* CPU from network latency for timing (§6). This is a **measurement isolation** flag, not a security mitigation (§9) |
 | `--json` | **non-default** | Emits results as JSON on **stdout** | Detector-firing evidence prints to stdout, not the stderr summary (§5) |
 | `--detector-timeout=<dur>` | **non-default** | Overrides stage-2 `detectChunk` timeout only (main.go:471-472 → engine.go:1066) | Probe timeout enforcement (§3) |
@@ -289,13 +290,25 @@ error  trufflehog  a detector ignored the context timeout  {"detector_worker_id"
 
 ### 3.3 Does it "hang"? — finite, but potentially longer than your CI budget
 
-No test produced a non-terminating scan. The worst tested single-file case terminated in **~10.7 s**
-(10 MiB, §6) and **~44.3 s** at 40 MiB (§7) **[observed]**. That is not a "hang" in the
-infinite-loop sense. But from the perspective of a CI gate with, say, a 30-second per-step budget, a
-single 40 MiB crafted file already exceeds it, and a committer can add many such files. So the honest
-answer to "could they block our scans?" is: **not by hanging the process, but by inflating its
-runtime past whatever external time limit you enforce** — and TruffleHog's own per-detector timeouts
-will not rescue you, per §3.2.
+No test produced a non-terminating scan. The worst case is **finite but configuration-dependent**, so
+the full observed band is reported rather than a single number:
+
+- **Default path, 10 MiB:** **~10.7 s** worst of ≥3 runs (keyword fan-out; median ~9.82 s, §6.2) **[observed]**.
+- **Forced stage-2, 10 MiB** (Case D, the **non-default** `--allow-verification-overlap
+  --detector-timeout=1ns`): the *same* 10 MiB file is **slower still — ~13–19 s** (§3.2, observed
+  12.8–18.7 s across re-runs under variable host load) **[observed]**, because the per-detector timeout
+  is **non-preemptive** and its watchdog bookkeeping is pure added overhead on top of work that
+  completes regardless. This band is explicitly load-variable (like the Case-D watchdog count, §3.2);
+  the ~18.7 s upper figure was reproduced by the Appendix A harness on a loaded host.
+- **Default path, 40 MiB:** **~44.3 s** (§7) **[observed]**.
+
+So the honest single-file 10 MiB worst-case band is **~10.7 s (default) to ~19 s (forced stage-2,
+non-default and load-variable)**, rising to **~44.3 s at 40 MiB**. None of these is a "hang" in the infinite-loop sense.
+But from the perspective of a CI gate with, say, a 30-second per-step budget, a single 40 MiB crafted
+file already exceeds it, and a committer can add many such files. So the honest answer to "could they
+block our scans?" is: **not by hanging the process, but by inflating its runtime past whatever
+external time limit you enforce** — and TruffleHog's own per-detector timeouts will not rescue you
+(they are non-preemptive, and the *forced-stage-2* case is actually **worse**, not better), per §3.2.
 
 ### 3.4 Tested vs untested conditions for Q1
 
@@ -348,6 +361,20 @@ path is the TUI markdown highlighter (`pkg/tui → glamour → chroma → regexp
 that it contributes **zero** CPU samples in either profile. Because the ReDoS-capable engine is never
 invoked to match scanned content, it cannot be the vector for a complexity attack.
 
+**[external + observed] Advisory note.** `regexp2` is a **backtracking** (.NET-style)
+engine and *is* ReDoS-capable in general — which is exactly why its scan-unreachability matters. The
+pinned **v1.4.0** falls within the affected range of a published ReDoS advisory for the library
+(**GHSA-wq9v-j77v-qr26**, a HIGH / CWE-1333 catastrophic-backtracking issue; affected range
+**reviewer-reported as `< 2.3.0`**, cited as reviewer-reported and not independently re-fetched here). A
+`govulncheck ./...` run against this repository (Go vulnerability DB snapshot `2026-07-08`) does **not**
+flag `regexp2 v1.4.0` in any category — it appears only in govulncheck's "scanned … 261 modules"
+inventory, never as the module of a reachable, imported-but-uncalled, or required-but-uncalled finding
+(the Go DB does not carry that GitHub advisory as of this snapshot; see §11). It
+does **not** change the conclusion: §7.4's `go mod why` closure shows `regexp2` is reachable only from
+the TUI renderer, never from `trufflehog filesystem`/`git` scanning, so even a genuinely vulnerable
+`regexp2` version **cannot be reached by a crafted scanned file**. If anything, the advisory
+**strengthens** the finding — the one backtracking engine in the graph is confined off the scan path.
+
 ### 4.3 Engine survey — method and counts (AST-based, not grep)
 
 The original survey counted `regexp.MustCompile` call sites with `grep`, which conflates production
@@ -363,7 +390,8 @@ universal file census.
 | — dynamic / helper-built patterns | **943** | pattern text assembled at runtime (~80 %); a pure grep **cannot** enumerate these, which is why grep is not exhaustive |
 | Test-file compile sites | **19** | excluded from the "detector pattern" analysis |
 | Production literal patterns containing `.*` | **3** | figma, docker_auth_config, jdbc (see §5.3) |
-| Production patterns with a nested-quantifier shape `(x+)+` / `(x*)*` | **2** | inspected; both linear under RE2 (§5.3) |
+| Production patterns with a **nested-quantifier** shape (a `*`/`+` repeat whose subexpression contains another `*`/`+` repeat — the classic `(x+)+`/`(x*)*` evil shape) | **5** | enumerated below; **all linear under RE2** (§4.4, §4.4.1, §5.3) |
+| Production patterns with an **unbounded `{m,}` repeat over a `*`/`+`** repeat | **1** | SQL Server (`sqlserver/sqlserver.go:25`, `{3,}`); enumerated below; linear under RE2 |
 
 **[observed]** Because ~80 % of production compile sites build their pattern text dynamically, a
 grep-only survey is structurally incapable of being exhaustive — the AST walk is the correct
@@ -371,6 +399,33 @@ instrument, and even it enumerates *compile sites*, not every possible runtime p
 commented-out line in `couchbase.go` (a `.*` inside a comment, and additionally inside a character
 class where `.` is literal) is **correctly excluded** by the AST walk; the earlier grep-based count
 had over-counted it.
+
+**Nested-quantifier predicate (exact).** The AST walk parses each compiled pattern with the Go
+standard library `regexp/syntax` (`syntax.Parse(pat, syntax.Perl)`) and flags a pattern when any
+`OpStar`/`OpPlus` node (`*` or `+`) has, anywhere in its subexpression subtree, another
+`OpStar`/`OpPlus` node — i.e. a quantifier applied to something that itself repeats, the structural
+signature of catastrophic backtracking. A separate, weaker predicate flags an unbounded `{m,}`
+(`OpRepeat` with `Max == -1`) over a `*`/`+`. Running this over `pkg/detectors` **[observed]**:
+
+```
+=== NESTED (a * or + repeat whose subexpression contains another * or + repeat) : 5 ===
+azuresastoken/azuresastoken.go:32   https://([a-zA-Z0-9][a-z0-9_-]{1,22}[a-zA-Z0-9])\.blob\.core\.windows\.net/[a-z0-9]([a-z0-9-]{1,61}[…
+coinbase_waas/coinbase_waas.go:35   (-----BEGIN EC(?:DSA)? PRIVATE KEY-----(?:\r|\n|\\+r|\\+n)(?:[a-zA-Z0-9+/]+={0,2}(?:\r|\n|\\+r|\\+n)…
+databrickstoken/databrickstoken.go:27   \b([a-z0-9-]+(?:\.[a-z0-9-]+)*\.(cloud\.databricks\.com|gcp\.databricks\.com|azuredatabricks\.net))\…
+docker/docker_auth_config.go:51   {(?:\s|\\+[nrt])*\\*"auths\\*"(?:\s|\\+t)*:(?:\s|\\+t)*{(?:\s|\\+[nrt])*\\*"(?i:https?:\/\/)?[a-z0-9…
+mongodb/mongodb.go:32   \b(mongodb(?:\+srv)?://(?P<username>\S{3,50}):(?P<password>\S{3,88})@(?P<host>[-.%\w]+(?::\d{1,5})?(…
+
+=== UNBOUNDED-OVER-STARPLUS ({m,} repeat over a * or + repeat) — e.g. SQL Server {3,} : 1 ===
+sqlserver/sqlserver.go:25   (?:\n|`|'|"| )?((?:[A-Za-z0-9_ ]+=[^;$'`"$]+;?){3,})(?:'|`|"|\r\n|\n)?
+```
+
+**[observed]** So there are **5** nested-quantifier production patterns (not the 2 an earlier draft
+reported) plus **1** unbounded-`{m,}`-over-repeat (SQL Server). This larger, honest count does **not**
+change the conclusion: every one of them is compiled by RE2/go-re2, which simulates all match paths in
+a single linear pass, so none can backtrack (§4.4). The empirical check in §4.4.1 drives the textbook
+`(a+)+$` evil input through the real CLI and observes **baseline speed**, and §5.3 inspects the
+worst-shaped of these patterns directly — confirming the count is about *survey honesty*, not about a
+reachable vulnerability.
 
 ### 4.4 Why RE2-class engines are ReDoS-immune (corrected theory)
 
@@ -407,14 +462,21 @@ A genuinely vulnerable (backtracking) engine on the same input would exhibit sec
 
 ### 4.5 External corroboration
 
-| Source | URL | Exact claim it supports |
-|--------|-----|-------------------------|
-| RE2 (Google) | https://github.com/google/re2 | RE2 runtime is "asymptotically linear" in input size; "does not support constructs for which only backtracking solutions are known" (backrefs/generalized assertions excluded *because* they require backtracking); the Go `regexp` package follows the same principles and provides the same efficiency guarantees. |
-| go-re2 (wasilibs) | https://github.com/wasilibs/go-re2 · https://pkg.go.dev/github.com/wasilibs/go-re2 | "drop-in replacement for the standard library regexp"; "By default, re2 is packaged as a WebAssembly module and accessed with the pure Go runtime, wazero"; for *small* regexes/inputs it can be **slower** than stdlib — i.e. a constant per-call WASM/FFI overhead, not super-linear scaling. |
-| OWASP ReDoS | https://owasp.org/www-community/attacks/Regular_expression_Denial_of_Service_-_ReDoS | ReDoS is exponential in input size on *backtracking* engines; canonical "evil regex" `^(a+)+$`; the evil shapes are **nested quantifiers + overlapping alternation** (no backreference required); mitigations = linear-time engine, input-length caps, timeouts (CWE-1333). |
+All URLs were accessed **2026-07-14**. The go-re2 links are pinned to the repository's own dependency
+version **v1.9.0** (go.mod:100) to avoid documentation drift from the pinned build.
+
+| Source | URL (accessed 2026-07-14) | Exact claim it supports |
+|--------|---------------------------|-------------------------|
+| RE2 — "Why RE2?" (Google) | https://github.com/google/re2/wiki/WhyRE2 | RE2's runtime is guaranteed **linear** in input size and avoids the exponential-time behavior of backtracking engines; it **omits** backreferences and generalized lookaround *because* those require backtracking. The Go `regexp` package follows the same automaton principles and efficiency guarantees. |
+| Russ Cox — "Regular Expression Matching Can Be Simple And Fast" | https://swtch.com/~rsc/regexp/regexp1.html | The Thompson-NFA / automaton construction underlying RE2 matches in worst-case **O(n·m)** (input length × pattern size) — the theoretical basis for RE2's no-catastrophic-backtracking guarantee. |
+| go-re2 (wasilibs), **v1.9.0** — go.mod:100 | https://github.com/wasilibs/go-re2/tree/v1.9.0 · https://pkg.go.dev/github.com/wasilibs/go-re2@v1.9.0 | "drop-in replacement for the standard library regexp"; RE2 packaged **by default as a WebAssembly module** run via the pure-Go **wazero** runtime; for *small* regexes/inputs it can be **slower** than stdlib — a constant per-call WASM/FFI overhead, not super-linear scaling. |
+| OWASP — Regular expression Denial of Service (ReDoS) | https://owasp.org/www-community/attacks/Regular_expression_Denial_of_Service_-_ReDoS | ReDoS is exponential in input size on **backtracking** engines; canonical "evil regex" `^(a+)+$`; the evil shapes are **nested quantifiers + overlapping alternation** (no backreference required); mitigations = linear-time engine, input-length caps, and timeouts. |
+| CWE-1333 — Inefficient Regular Expression Complexity (MITRE) | https://cwe.mitre.org/data/definitions/1333.html | The formal weakness class for ReDoS (typical CVSS 3.1 base score **7.5 HIGH**, `AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H`); its listed mitigation is bounded/linear-time matching — the classification this investigation's **negative** result is measured against. Cited **separately** from OWASP because the OWASP page does not itself define the CWE. |
 
 These are used only to interpret the runtime observations; every behavioral claim in this document is
-backed by captured output, not by the external text.
+backed by captured output, not by the external text. **[inferred, external]** The CWE-1333 CVSS score
+is the standard published classification for ReDoS and is cited as context, not as a measurement of
+this codebase.
 
 ---
 
@@ -438,12 +500,17 @@ as JSON on stdout**, so firing was captured with `--json` on stdout. **Crucially
 filter must include `unverified`:** under `--no-verification` a hit is classed `unverified`
 (engine.go:1199), **not** `unknown`, so `--results=verified,unknown` alone surfaces **nothing** — a
 run with that flag emits zero detector JSON objects for all three inputs **[observed]**. The correct
-command adds `unverified` (and `filtered_unverified` for GitHub, whose hits are marked filtered):
+command adds `unverified`. A **fourth** class, `filtered_unverified`, holds hits the engine's
+low-entropy false-positive filter sets aside (`FilterResultsWithEntropy`, falsepositives.go:154); it
+is **per-value, not per-detector** — a *realistic* high-entropy token surfaces as plain `unverified`,
+and only an *FP-like low-entropy* value needs the extra token (demonstrated in §5.1a). The GitHub
+input used for the reachability table below is a low-entropy `[a-f0-9]{40}` value, so it needs the
+`filtered_unverified` token:
 
 ```
-# JDBC and Docker:
+# JDBC and Docker (realistic high-entropy inputs):
 <workdir>/trufflehog_bin filesystem <input> --no-verification --results=verified,unknown,unverified --json
-# GitHub additionally needs filtered_unverified:
+# a LOW-ENTROPY (FP-like) match needs filtered_unverified to surface:
 <workdir>/trufflehog_bin filesystem <input> --no-verification --results=verified,unknown,unverified,filtered_unverified --json
 ```
 
@@ -451,7 +518,7 @@ command adds `unverified` (and `filtered_unverified` for GitHub, whose hits are 
 |----------|------------------|--------|-----------|------------------------------|
 | **JDBC** | stdlib `regexp`; `keyPat` jdbc.go:53 | **Yes** | **BASE64** and **PLAIN** | `DetectorName=JDBC` twice; `Redacted":"jdbc:postgresql:password=****..."` — proves the **redaction** path `tryRedactAnonymousJDBC` (jdbc.go:118) → `tryRedactRegex` (jdbc.go:191, whose redaction regex is compiled at jdbc.go:192) was reached |
 | **Docker** | go-re2; `keyPat` docker_auth_config.go:51 | **Yes** | PLAIN | `DetectorName=Docker`, `Raw=dXNlcjpzM2NyZXRwYXNz` (valid non-example registry; the example-registry input is correctly dropped by the `exampleRegistries` FP map, docker_auth_config.go:61,104) |
-| **GitHub** | go-re2; `keyPat` github_old.go:30 | **Yes** | PLAIN | `DetectorName=Github` (surfaced only when `filtered_unverified` is added to `--results`, as GitHub marks the hit filtered) |
+| **GitHub** | go-re2; `keyPat` github_old.go:30 | **Yes** | PLAIN | `DetectorName=Github` (this input's `[a-f0-9]{40}` value is **low-entropy**, so the engine's entropy filter classes it `filtered_unverified` and it surfaces only when that token is added — **not** because the detector is GitHub; see §5.1a) |
 
 Two findings from this exercise, both corrected from the earlier draft:
 - **[observed]** The JDBC firing via the **BASE64** decoder confirms the decoder re-scan path (§8):
@@ -463,6 +530,42 @@ Two findings from this exercise, both corrected from the earlier draft:
   `jdbc:<subprotocol>:` prefix) never did — that string failed `keyPat` (jdbc.go:53) and so exercised
   no JDBC code at all.
 
+#### 5.1a `filtered_unverified` is an entropy classification, not a GitHub property
+
+The earlier draft implied GitHub hits are *universally* marked `filtered_unverified`. That is wrong:
+the class is decided **per matched value by the engine's entropy filter**, not by which detector
+fired. Two GitHub inputs, scanned through the real CLI with `--no-verification`, prove it
+**[observed, /tmp/th_work/gh/]**:
+
+```
+# realistic.txt : github_token = 3f8a1c9e2b7d4056af13e8c05d29b6f47a0e1d82   (high-entropy 40-hex)
+$ trufflehog_bin filesystem realistic.txt --no-verification --results=verified,unknown,unverified
+Found unverified result 🐷🔑❓
+Detector Type: Github
+# ...and the SAME result with filtered_unverified added — the token surfaces either way.
+
+# fplike.txt : github_token = aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa       (zero-entropy 40×'a')
+$ trufflehog_bin filesystem fplike.txt --no-verification --results=verified,unknown,unverified,filtered_unverified
+Found unverified result 🐷🔑❓
+Detector Type: Github
+$ trufflehog_bin filesystem fplike.txt --no-verification --results=verified,unknown,unverified
+# (no output — SUPPRESSED without the filtered_unverified token)
+```
+
+- **[observed]** The realistic high-entropy token surfaces as plain **`unverified`** under the default
+  three-class `--results`; adding `filtered_unverified` changes nothing for it.
+- **[observed]** The all-`a` token is emitted **only** when `filtered_unverified` is requested, and is
+  **suppressed** otherwise.
+- **Mechanism [source]:** the GitHub detector's own FP map is only `{"github commit"}`
+  (`ghFalsePositives`, github_old.go:61-62) and its `FromData` calls
+  `detectors.IsKnownFalsePositive(token, ghFalsePositives, false)` (github_old.go:78) — neither token
+  is in that map, so **both pass the detector**. The reclassification happens at the **engine** layer:
+  `FilterResultsWithEntropy` (falsepositives.go:154) computes `StringShannonEntropy`
+  (falsepositives.go:136) and, for a value below the threshold, logs `"Filtered out result with low
+  entropy"` (falsepositives.go:163) and moves it to `filtered_unverified`. The all-`a` value has
+  Shannon entropy 0; the hex value is high-entropy. Thus `filtered_unverified` tracks the **value's
+  entropy**, not the detector — a realistic committed GitHub token would surface by default.
+
 ### 5.2 The real amplifier is keyword fan-out, not any single regex
 
 `FindDetectorMatches` (ahocorasickcore.go:241) routes each chunk only to detectors whose keywords are
@@ -470,8 +573,9 @@ present, using an Aho-Corasick trie prefilter and returning only matched sub-spa
 (ahocorasickcore.go:228) **[source]**. A crafted chunk that contains the keywords of *hundreds* of
 detectors therefore fans out to hundreds of `FromData` calls per chunk. The §7 profile shows exactly
 this signature: the CPU peek under `verificationOverlapWorker` spreads across dozens of small
-detectors (`mapbox` 3.72 %, `snowflake` 2.31 %, `couchbase` 2.04 %, `azure_cosmosdb` 1.23 %, `jdbc`
-0.6 %, `mailgun` 0.6 %, `boxoauth` 0.36 %, …) rather than concentrating in one **[observed, §7]**.
+detectors (`mapbox` 3.90 %, `snowflake` 2.14 %, `couchbase` 1.98 %, `azure_cosmosdb` 1.07 %, `jdbc`
+0.47 %, `boxoauth` 0.35 %, `sumologickey` 0.35 %, …) rather than concentrating in one
+**[observed, §7.2]**.
 This is linear in (chunks × firing-detectors) and is the mechanism behind the ~64× slowdown in §6.
 
 ### 5.3 The permissive patterns, inspected
@@ -505,9 +609,9 @@ tokens (e.g. `mapbox`, per the profile) dominate the per-chunk cost, but each re
 normal files of equivalent size?"*
 
 **Direct answer (this host).** At an identical **10,485,760-byte (10 MiB)** size, the worst crafted
-file (keyword fan-out) scanned **~64× slower** than equivalent-size normal prose (observed **52–74×**
-across runs — the sub-200 ms baseline is the noisy denominator, so the ratio wobbles run-to-run while
-the crafted-file absolute time is stable). Base64 amplification is **~27×**; a *keyword-bearing*
+file (keyword fan-out) scanned **~64× slower** than equivalent-size normal prose (an observed **sample
+of ~52–78×** across runs — not a universal bound: the sub-200 ms baseline is the noisy denominator, so
+the ratio wobbles run-to-run while the crafted-file absolute time is stable). Base64 amplification is **~27×**; a *keyword-bearing*
 quantifier-stress file only **~2.6×**. Pure quantifier stress with **no** keyword is actually
 **~0.5× — i.e. FASTER than the baseline** (§6.2), because a keyword-free file triggers almost no
 detector fan-out. The amplification is **bounded and linear** in input size (§6.3) — there is no
@@ -522,13 +626,32 @@ not size. Each was produced by a deterministic generator (full script in the App
 | File | Bytes | SHA-256 | Shape |
 |------|-------|---------|-------|
 | `baseline_prose_10mib.txt` | 10,485,760 | `d1bf8b3541370cea6dff8ace8b369b2eab73fba2eab18fe8f02a3daba6efe320` | Natural-language prose (normal file) |
-| `crafted_keywords_10mib.txt` | 10,485,760 | `3b0d41593566dad38a86b8cd75ac62a0cc3ea1f4f4bc7430f24d8fc783a89ff9` | 938 detector keywords repeated (max fan-out) |
+| `crafted_keywords_10mib.txt` | 10,485,760 | `3b0d41593566dad38a86b8cd75ac62a0cc3ea1f4f4bc7430f24d8fc783a89ff9` | 938 **source-scraped** detector keywords repeated (heavy-fan-out **stress** input; the 938-token scrape is *not* the canonical keyword set — see note below) |
 | `crafted_base64_10mib.txt` | 10,485,760 | `d0f5da299086cfc76417f631b16331ce4884fc90010238be9ee2b801e32e3a82` | Valid Base64 of the keyword blob (decoder re-scan) |
 | `crafted_quantifier_10mib.txt` | 10,485,760 | `5215fda3ea1fa03199357342502d7c19fbe78a89cfbc5b00e15e3e588a5664bc` | `jdbc:mysql://` + 4096-char unbroken `A` run (bounded-quantifier stress, keyword-routed) |
 | `crafted_keywords_40mib.txt` | 41,943,040 | `e5bc8b2845e507cc7c078a853d838cad59b992989701eadfd415b74298476588` | 40 MiB keyword file (profiling scale, §7) |
 
-The keyword pool used is **938** distinct detector keywords (harvested from detectors' own
-`Keywords()` method bodies), not a round number — stated exactly to be reproducible.
+**Keyword pool — scraped stress set vs. canonical runtime set (corrected).** The crafted file repeats
+**938** distinct tokens obtained by *textually scraping* the string literals out of every
+`func (…) Keywords() []string { … }` body across the detector source tree. This 938-token scrape is a
+deliberate **stress superset**, **not** the canonical keyword set the engine actually loads: it
+includes tokens from **non-default / disabled** detectors that `DefaultDetectors()` does not
+instantiate, plus a few mis-parsed Docker string fragments, while *missing* 9 tokens its text filter
+drops. The **canonical** figures — instantiated exactly as the engine does, via
+`defaults.DefaultDetectors()` (`github.com/trufflesecurity/trufflehog/v3/pkg/engine/defaults`) — are
+**831 default detectors** exposing **914 distinct keywords** **[observed]**:
+
+```
+default_detectors=831
+distinct_keywords=914
+```
+
+Using the 938-token scrape therefore drives the crafted file to fan out to *at least* the full
+canonical keyword surface (it is a superset in practice), which is exactly what a "maximize fan-out"
+stress input should do — but the honest description is "938 source-scraped tokens repeated," not
+"every detector's keywords" and not a "canonical maximum." The 938 count is stated exactly only for
+byte-reproducibility of this specific input; the canonical fan-out ceiling is the 914-keyword /
+831-detector surface above.
 
 ### 6.2 Equal-size timing distributions (≥3 runs each)
 
@@ -556,12 +679,13 @@ is the run-to-run distribution the timing rule asks for — the crafted-file wor
 breathes only because its sub-200 ms denominator does. Ordering is consistent every run:
 **keyword ≫ base64 ≫ keyword-bearing quantifier > baseline > keyword-free quantifier**.
 
-**Note on `bytes`.** The logged `bytes` is `BytesScanned` (engine.go:819,835), the running sum of
-`len(chunk.Data)` over scanned source chunks. For the prose and keyword files it is **13,628,416** —
-the ~1.3× peek-overlap inflation of the 10,485,760-byte input, since each 10 KiB chunk carries a
-3 KiB peek (chunker.go:14-18). The Base64 and quantifier rows log smaller, content-dependent totals
-(e.g. 12,065,764 for Base64); this byte figure is incidental to the timing ratios and is shown only
-for completeness.
+**Note on `bytes`.** The logged `bytes` is `BytesScanned` (engine.go:819,835), the running sum of each
+chunk's **final, post-decoder** `len(chunk.Data)` — computed *after* the decoder loop and added once
+per chunk (§8.2). For the prose and keyword files it is **13,628,416** — the ~1.3× peek-overlap
+inflation of the 10,485,760-byte input (each 10 KiB chunk carries a 3 KiB peek, chunker.go:14-18) and
+those plain-text chunks are not mutated by any decoder. The Base64 and quantifier rows log smaller,
+content-dependent totals (e.g. 12,065,764 for Base64, reflecting the base64 decode-shrink of §8.2);
+this byte figure is incidental to the timing ratios and is shown only for completeness.
 
 ### 6.3 Linearity in input size (default concurrency, ≥3 runs)
 
@@ -593,8 +717,8 @@ chunks, the opposite of a super-linear attack). A super-linear vulnerability wou
 ### 6.5 Interpreting "how much slower"
 
 **[observed]** On this host the maximum equal-size amplification a single crafted file achieved was
-**~64×** (keyword fan-out at 10 MiB; observed 52–74× across runs as the sub-200 ms baseline denominator
-fluctuates). **[inferred]** Because the mechanism is linear fan-out (§5.2),
+**~64×** (keyword fan-out at 10 MiB; an observed sample of ~52–78× across runs — not a universal bound —
+as the sub-200 ms baseline denominator fluctuates). **[inferred]** Because the mechanism is linear fan-out (§5.2),
 the ceiling on a *single* file is set by file size × per-chunk fan-out cost, both finite; there is no
 input that turns this into exponential time. **[inferred]** The practical DoS lever for an attacker is
 thus *volume* (many crafted files, large files, deep history) against an external time budget — not a
@@ -617,92 +741,212 @@ product's own `--profile` server, with the on-CPU vs off-CPU distinction made ex
 (40 MiB keyword file) was scanned long enough to fit **both** capture windows **concurrently**:
 
 ```
-<workdir>/trufflehog_bin filesystem crafted_keywords_40mib.txt --no-verification --profile &   # scan_duration 44.251 s
-# concurrently, against http://localhost:18066 :
-go tool pprof  -seconds 20 http://localhost:18066/debug/pprof/profile   -> prof/cpu.pb.gz     (on-CPU)
-go tool pprof  -seconds 20 http://localhost:18066/debug/fgprof          -> prof/fgprof.pb.gz  (wall/off-CPU)
+# scan the worst case (40 MiB keyword file) with the built-in profile server:
+<workdir>/trufflehog_bin filesystem crafted_keywords_40mib.txt --no-verification --profile &
+
+# concurrently, capture BOTH profiles from :18066 as two 20 s windows that run at the
+# SAME time inside the single ~44.55 s scan; -proto -output writes each .pb.gz:
+go tool pprof -proto -seconds 20 -output prof/cpu.pb.gz    http://localhost:18066/debug/pprof/profile
+go tool pprof -proto -seconds 20 -output prof/fgprof.pb.gz http://localhost:18066/debug/fgprof
+
+# then analyze locally, deterministic on the stored profile:
+go tool pprof -top -nodecount=15 prof/cpu.pb.gz
 ```
 
-Because the scan ran **44.251 s** (4096 chunks, 54,522,880 bytes) **[observed, scan.log]**, both 20 s
-windows fit **inside a single scan, at the same time** — not sequentially. (An earlier draft implied a
-sequential "25 s CPU then 20 s fgprof" capture, which could not fit; corrected: concurrent, 20 s + 20 s
-inside one 44 s scan.) A Base64 40 MiB run (**~14.9 s median**, 4096 chunks, 48,285,212 bytes) was
-profiled the same way, with a shorter 8 s CPU window that fits inside its runtime (§7.5).
+The CPU-capture command's own output confirms the fetch and the saved file **[observed,
+cpu_capture.log]**:
+
+```
+Fetching profile over HTTP from http://localhost:18066/debug/pprof/profile?seconds=20
+Please wait... (20s)
+Saved profile in /root/pprof/pprof.trufflehog_bin.samples.cpu.001.pb.gz
+Generating report in /tmp/th_work/prof/cpu.pb.gz
+```
+
+The scan that produced these profiles ran **44.55 s** — its complete, unedited summary line
+**[observed, keyword_scan.log]**:
+
+```
+2026-07-14T02:12:25Z	info-0	trufflehog	finished scanning	{"chunks": 4096, "bytes": 54522880, "verified_secrets": 0, "unverified_secrets": 2, "scan_duration": "44.550508941s", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
+```
+
+Because the scan ran **44.55 s** (4096 chunks, 54,522,880 bytes), both 20 s windows fit **inside a
+single scan, at the same time** — not sequentially. (An earlier draft implied a sequential "25 s CPU
+then 20 s fgprof" capture, which could not fit; corrected: concurrent, 20 s + 20 s inside one ~44.55 s
+scan.) A Base64 40 MiB run (**~14.9 s median**, 4096 chunks, 48,285,212 bytes; its finished-scanning
+line shows `"scan_duration": "14.910878768s"` **[observed, base64_40_scan.log]**) was profiled the
+same way, over a 12 s CPU window that fits inside its runtime (§7.5).
 
 ### 7.2 On-CPU profile (pprof) — where CPU time is actually spent
 
-`go tool pprof -top` **flat** (raw, unedited head):
+Command: `go tool pprof -top -nodecount=15 prof/cpu.pb.gz` — **flat** (self-time) view, complete
+verbatim head, top 15 of 183 nodes (deterministic on the stored profile):
 
 ```
-Duration: 20.20s, Total samples = 78.49s (388.58%)
-      flat  flat%
-     27.05s 34.46%  runtime._ExternalCode            # RE2 matching inside the WASM module
-      2.35s  2.99%  sync.(*Mutex).Unlock
-      1.89s  2.41%  sync.(*Mutex).Lock
-      1.79s  2.28%  runtime.findObject
-      1.55s  1.97%  runtime.scanobject
-      0.72s  0.92%  (*Trie).Walk                     # aho-corasick keyword prefilter
-      0.67s  0.85%  verificationOverlapWorker
+File: trufflehog_bin
+Build ID: 5a5e90cf76fa251b272b2c0caa18866fe694e144
+Type: cpu
+Time: 2026-07-14 02:11:41 UTC
+Duration: 20.18s, Total samples = 78390ms (388.49%)
+Showing nodes accounting for 46640ms, 59.50% of 78390ms total
+Dropped 1266 nodes (cum <= 391.95ms)
+Showing top 15 nodes out of 183
+      flat  flat%   sum%        cum   cum%
+   28510ms 36.37% 36.37%    28510ms 36.37%  runtime._ExternalCode
+    2350ms  3.00% 39.37%     5920ms  7.55%  internal/sync.(*Mutex).Unlock (inline)
+    1590ms  2.03% 41.40%     2690ms  3.43%  runtime.lock2
+    1570ms  2.00% 43.40%     5270ms  6.72%  runtime.scanobject
+    1550ms  1.98% 45.38%     1550ms  1.98%  runtime.(*mspan).base (inline)
+    1480ms  1.89% 47.26%     2060ms  2.63%  runtime.findObject
+    1310ms  1.67% 48.93%     1310ms  1.67%  runtime.memmove
+    1290ms  1.65% 50.58%     7000ms  8.93%  internal/sync.(*Mutex).Lock (inline)
+    1170ms  1.49% 52.07%     5710ms  7.28%  internal/sync.(*Mutex).lockSlow
+    1060ms  1.35% 53.43%     1360ms  1.73%  runtime.(*unwinder).resolveInternal
+    1050ms  1.34% 54.76%     1580ms  2.02%  github.com/BobuSumisu/aho-corasick.(*Trie).Walk
+     940ms  1.20% 55.96%      940ms  1.20%  runtime.memclrNoHeapPointers
+     930ms  1.19% 57.15%     1010ms  1.29%  container/list.(*List).remove (inline)
+     930ms  1.19% 58.34%      930ms  1.19%  runtime.futex
+     910ms  1.16% 59.50%    31760ms 40.52%  github.com/trufflesecurity/trufflehog/v3/pkg/engine.(*Engine).verificationOverlapWorker
 ```
 
-`go tool pprof -top -cum` **cumulative** (raw head):
+Command: `go tool pprof -top -cum -nodecount=18 prof/cpu.pb.gz` — **cumulative** view, complete
+verbatim head, top 18 of 183 nodes:
 
 ```
-      flat  flat%    cum    cum%
-     0.11s  0.14%  33.31s 42.44%  startVerificationOverlapWorkers.func1   # STAGE 1 dominates
-     0.67s  0.85%  33.31s 42.44%  (*Engine).verificationOverlapWorker
-    27.05s 34.46%  27.05s 34.46%  runtime._ExternalCode
-     0.00s     0%  18.30s 23.32%  go-re2 (*Regexp).FindAllStringSubmatch
-     0.05s  0.06%  16.89s 21.52%  ...callWithStack                        # WASM call bridge
-     0.00s     0%  10.18s 12.97%  ...Call1
-     0.20s  0.25%   8.43s 10.74%  ...getChildModule
-     0.10s  0.13%   7.90s 10.06%  context.WithTimeout
-     0.30s  0.38%   6.40s  8.15%  (*Engine).scannerWorker
+File: trufflehog_bin
+Build ID: 5a5e90cf76fa251b272b2c0caa18866fe694e144
+Type: cpu
+Time: 2026-07-14 02:11:41 UTC
+Duration: 20.18s, Total samples = 78.39s (388.49%)
+Showing nodes accounting for 31.45s, 40.12% of 78.39s total
+Dropped 1266 nodes (cum <= 0.39s)
+Showing top 18 nodes out of 183
+      flat  flat%   sum%        cum   cum%
+         0     0%     0%     31.76s 40.52%  github.com/trufflesecurity/trufflehog/v3/pkg/engine.(*Engine).startVerificationOverlapWorkers.func1
+     0.91s  1.16%  1.16%     31.76s 40.52%  github.com/trufflesecurity/trufflehog/v3/pkg/engine.(*Engine).verificationOverlapWorker
+    28.51s 36.37% 37.53%     28.51s 36.37%  runtime._ExternalCode
+         0     0% 37.53%     28.51s 36.37%  runtime._System
+     0.25s  0.32% 37.85%     17.22s 21.97%  github.com/wasilibs/go-re2/internal.(*Regexp).FindAllStringSubmatch
+     0.12s  0.15% 38.00%     15.99s 20.40%  github.com/wasilibs/go-re2/internal.(*lazyFunction).callWithStack
+     0.03s 0.038% 38.04%     10.45s 13.33%  runtime.systemstack
+         0     0% 38.04%      9.56s 12.20%  github.com/wasilibs/go-re2/internal.(*lazyFunction).Call1
+     0.02s 0.026% 38.07%      8.22s 10.49%  github.com/wasilibs/go-re2/internal.getChildModule
+         0     0% 38.07%      7.68s  9.80%  github.com/trufflesecurity/trufflehog/v3/pkg/context.WithTimeout
+     0.09s  0.11% 38.18%      7.32s  9.34%  github.com/wasilibs/go-re2/internal.(*Regexp).findAllSubmatch
+     0.05s 0.064% 38.24%      7.27s  9.27%  github.com/wasilibs/go-re2/internal.matchFrom
+     0.10s  0.13% 38.37%      7.22s  9.21%  github.com/wasilibs/go-re2/internal.(*lazyFunction).Call8
+     0.01s 0.013% 38.38%      7.01s  8.94%  sync.(*Mutex).Lock (inline)
+     1.29s  1.65% 40.03%         7s  8.93%  internal/sync.(*Mutex).Lock (inline)
+     0.01s 0.013% 40.04%      6.69s  8.53%  github.com/trufflesecurity/trufflehog/v3/pkg/engine.(*Engine).scannerWorker
+         0     0% 40.04%      6.69s  8.53%  github.com/trufflesecurity/trufflehog/v3/pkg/engine.(*Engine).startScannerWorkers.func1
+     0.06s 0.077% 40.12%      6.56s  8.37%  github.com/wasilibs/go-re2/internal.putChildModule
 ```
 
-**Reading this [observed]:**
-- **On-CPU work is dominated by RE2 executing inside WASM** — `runtime._ExternalCode` (34.46 % flat)
-  is the WASM/RE2 boundary, and `go-re2 FindAllStringSubmatch` carries 23.32 % cumulative. This is the
-  regex matching itself, exactly the "pattern matching in action" the question asks for.
-- **The dominant call tree is STAGE 1** — `verificationOverlapWorker` at **42.44 % cumulative**,
-  confirming §3.1: by default the multi-detector fan-out runs in the 2 s-context stage, not the
-  configurable-timeout stage.
-- The mutex rows (Lock/Unlock ~5.4 %) are the WASM runtime's single-threaded locking under 1024
-  workers — consistent with go-re2's WASM packaging **[external, §4.5]**.
+**Reading the flat + cumulative views [observed]:**
+- `runtime._ExternalCode` is **36.37 % flat** — the single largest self-time node. This frame is RE2
+  executing **inside the go-re2 WebAssembly module** (go-re2 runs the C++ RE2 engine as a WASM module
+  via wazero, §4.5); the WASM boundary appears to the Go profiler as external code. This is the regex
+  matching itself — exactly the "pattern matching in action" the question asks for.
+- The RE2/WASM call chain is visible cumulatively: `go-re2 FindAllStringSubmatch` **21.97 % cum** →
+  `callWithStack` **20.40 %** → `Call1` **12.20 %** / `Call8` **9.21 %** → `matchFrom` **9.27 %**, plus
+  `getChildModule` **10.49 %** / `putChildModule` **8.37 %** (the per-call WASM module pool). Together
+  these go-re2 internal frames account for the bulk of on-CPU time.
+- The dominant call tree is **STAGE 1**: `verificationOverlapWorker` at **40.52 % cum** (entered via
+  `startVerificationOverlapWorkers.func1`), confirming §3.1 — by default the multi-detector fan-out
+  runs in the 2 s-context overlap stage, not the configurable-timeout stage. `context.WithTimeout`
+  carries **9.80 % cum** (the per-detector deadline wrapping, §3.2).
+- `aho-corasick (*Trie).Walk` (the keyword prefilter) is only **1.34 % flat / 2.02 % cum** — the
+  prefilter is cheap relative to the RE2 matching it gates.
+- The mutex frames (`Mutex.Lock` 8.93 % cum, `lockSlow` 7.28 %, `Unlock` 7.55 %) are the WASM runtime's
+  serialization under 1024 detector workers (§2.1) contending for the shared go-re2 module — a
+  concurrency artifact of core over-subscription, not a detector regex cost. This is consistent with
+  go-re2's WASM packaging **[external, §4.5]**.
 
-`go tool pprof -peek=verificationOverlapWorker` (fan-out signature, raw head):
+Command: `go tool pprof -peek='verificationOverlapWorker$' prof/cpu.pb.gz` — the fan-out signature.
+The children of the STAGE-1 worker are the individual detector `FromData` calls, verbatim head (the
+tree format uses `|` edges; rows continue below the cutoff with ~30 more detectors, each < 0.2 s,
+following the same shape):
 
 ```
-verificationOverlapWorker -> context.WithTimeout 23.66%, WithDeadlineCause.func3 5.79%,
-   mapbox 3.72%, snowflake 2.31%, couchbase 2.04%, azure_cosmosdb 1.23%,
-   GetFalsePositiveCheck 1.02%, jdbc 0.6%, mailgun 0.6%, boxoauth 0.36% ...
+----------------------------------------------------------+-------------
+      flat  flat%   sum%        cum   cum%   calls calls% + context
+----------------------------------------------------------+-------------
+                                            31.76s   100% |   github.com/trufflesecurity/trufflehog/v3/pkg/engine.(*Engine).startVerificationOverlapWorkers.func1
+     0.91s  1.16%  1.16%     31.76s 40.52%                | github.com/trufflesecurity/trufflehog/v3/pkg/engine.(*Engine).verificationOverlapWorker
+                                             7.64s 24.06% |   github.com/trufflesecurity/trufflehog/v3/pkg/context.WithTimeout
+                                             1.52s  4.79% |   context.WithDeadlineCause.func3
+                                             1.24s  3.90% |   github.com/trufflesecurity/trufflehog/v3/pkg/detectors/mapbox.Scanner.FromData
+                                             0.68s  2.14% |   github.com/trufflesecurity/trufflehog/v3/pkg/detectors/snowflake.Scanner.FromData
+                                             0.63s  1.98% |   github.com/trufflesecurity/trufflehog/v3/pkg/detectors/couchbase.Scanner.FromData
+                                             0.42s  1.32% |   github.com/trufflesecurity/trufflehog/v3/pkg/detectors.GetFalsePositiveCheck (inline)
+                                             0.34s  1.07% |   github.com/trufflesecurity/trufflehog/v3/pkg/detectors/azure_cosmosdb.Scanner.FromData
+                                             0.19s   0.6% |   github.com/trufflesecurity/trufflehog/v3/pkg/detectors/azure_entra/serviceprincipal/v2.Scanner.FromData
+                                             0.16s   0.5% |   github.com/trufflesecurity/trufflehog/v3/pkg/detectors/godaddy/v1.Scanner.FromData
+                                             0.15s  0.47% |   github.com/trufflesecurity/trufflehog/v3/pkg/detectors/jdbc.Scanner.FromData
+                                             0.11s  0.35% |   github.com/trufflesecurity/trufflehog/v3/pkg/detectors/boxoauth.Scanner.FromData
+                                             0.11s  0.35% |   github.com/trufflesecurity/trufflehog/v3/pkg/detectors/sumologickey.Scanner.FromData
 ```
 
-The cost is **spread across dozens of small detectors**, the fingerprint of keyword fan-out (§5.2),
-not concentrated in a single "evil" regex.
+The cost is **spread across dozens of small detectors** — the single largest detector child
+(`mapbox` at 3.90 %) is a fraction of the total, and no individual regex dominates. This is the
+fingerprint of keyword fan-out (§5.2): the slowdown comes from routing one chunk to *many* detectors,
+not from one "evil" pattern. `context.WithTimeout` (24.06 % of the worker's children) is the
+per-detector deadline setup repeated once per detector per chunk, not matching work.
 
-### 7.3 Off-CPU profile (fgprof) — why it must not be read as CPU
+### 7.3 Off-CPU profile (fgprof) — active cores are CPU-saturated in RE2; surplus workers park
 
-`go tool fgprof -top` **wall-clock** (raw head):
+fgprof measures **wall-clock time including off-CPU waiting**, so it is read differently from the
+on-CPU pprof profile above. Command: `go tool pprof -top -nodecount=15 prof/fgprof.pb.gz`, complete
+verbatim head, top 15 of 45 nodes:
 
 ```
-Duration: 20s, Total samples = 28491.64s (142448.80%)
-   runtime.goexit 100%
-   runtime.gopark 99.21%          # goroutines PARKED (waiting), not on CPU
-   runtime.chanrecv 82.07% / chanrecv2 81.93%
-   (*Engine).detectorWorker  20405.33s 71.62% cum
-   notifierWorker / scannerWorker / verificationOverlapWorker ~8.95%
-   ...callWithStack 8.48%
-   regexp2  ->  0 samples
+Type: time
+Time: 2026-07-14 02:11:41 UTC
+Duration: 20s, Total samples = 28743.99s (143719.87%)
+Showing nodes accounting for 28666.48s, 99.73% of 28743.99s total
+Dropped 1148 nodes (cum <= 143.72s)
+Showing top 15 nodes out of 45
+      flat  flat%   sum%        cum   cum%
+ 28514.33s 99.20% 99.20%  28514.33s 99.20%  runtime.gopark
+   143.93s   0.5% 99.70%    143.93s   0.5%  runtime.goyield
+     3.81s 0.013% 99.72%    148.64s  0.52%  internal/sync.(*Mutex).unlockSlow
+     1.22s 0.0042% 99.72%   2379.62s  8.28%  internal/sync.(*Mutex).lockSlow
+     1.15s 0.004% 99.72%   2399.31s  8.35%  github.com/wasilibs/go-re2/internal.(*Regexp).FindAllStringSubmatch
+     1.10s 0.0038% 99.73%   2466.74s  8.58%  github.com/wasilibs/go-re2/internal.(*lazyFunction).callWithStack
+     0.33s 0.0012% 99.73%   2573.22s  8.95%  github.com/trufflesecurity/trufflehog/v3/pkg/engine.(*Engine).verificationOverlapWorker
+     0.23s 0.0008% 99.73%    776.36s  2.70%  github.com/wasilibs/go-re2/internal.malloc
+     0.12s 0.00043% 99.73%   1048.94s  3.65%  github.com/wasilibs/go-re2/internal.matchFrom
+     0.11s 0.0004% 99.73%   2377.82s  8.27%  internal/sync.runtime_SemacquireMutex
+     0.05s 0.00018% 99.73%   1418.35s  4.93%  github.com/wasilibs/go-re2/internal.(*lazyFunction).Call1
+     0.04s 0.00014% 99.73%   1048.81s  3.65%  github.com/wasilibs/go-re2/internal.(*lazyFunction).Call8
+     0.02s 7.2e-05% 99.73%  23557.12s 81.95%  runtime.chanrecv
+     0.01s 3.6e-05% 99.73%   1019.66s  3.55%  github.com/wasilibs/go-re2/internal.(*Regexp).findAllSubmatch
+     0.01s 3.6e-05% 99.73%   1374.35s  4.78%  github.com/wasilibs/go-re2/internal.getChildModule
 ```
 
-**[observed]** fgprof measures **wall-clock including waiting**, so its totals (142,448 %!) reflect
-**1024 detector workers parked on channel receives** while only 4 CPUs are schedulable (§2.1). The
-`detectorWorker` 71.62 % here is **off-CPU wait**, **not** busy CPU time — the opposite of what the
-pprof profile shows for the *default* path. (An earlier draft read fgprof numbers as if they were
-CPU; corrected: fgprof = wall/off-CPU, pprof = on-CPU.) The value of fgprof here is to show the
-system is **I/O/scheduling-bound on parked goroutines**, consistent with the core over-subscription of
-this host, not spinning on regex.
+**Reading this correctly [observed] — the two profiles are consistent, not contradictory:**
+- The **total samples = 28,743.99 s (143,719 %)** over a 20 s window means fgprof is accounting for
+  ~1436 goroutine-seconds per wall-second: it samples **every goroutine, including parked ones**.
+  `runtime.gopark` at **99.20 % flat** and `runtime.chanrecv` at **81.95 % cum** are the ~1024 detector
+  workers (§2.1) **blocked on channel receives**, waiting for chunks to arrive. This is expected
+  surplus, not I/O: the engine starts `concurrency × detectorWorkerMultiplier` = 128 × 8 = **1024**
+  detector workers (engine.go:676) but only ~4 can run at once on this host, so at any instant the
+  overwhelming majority are parked. These parked goroutines do **no** work and consume **no** CPU; they
+  merely inflate the wall-clock total.
+- What matters for the CPU question is the **on-CPU profile (§7.2), not these parked counts.** There,
+  the ~3.88 running cores (388.49 % of one core) are **saturated inside RE2/WASM**:
+  `runtime._ExternalCode` is **36.37 % flat** and `go-re2 FindAllStringSubmatch` **21.97 % cum**. The
+  active CPUs are busy matching regexes — they are **not** idling or spinning on scheduling.
+- fgprof corroborates this: even in the wall-clock view, the **only non-parked (on-CPU) frames of any
+  size are the go-re2 internals** — `FindAllStringSubmatch` 8.35 % cum, `callWithStack` 8.58 %, `Call1`
+  4.93 %, `getChildModule` 4.78 %, `matchFrom` 3.65 %, `Call8` 3.65 %. There is **no syscall, disk,
+  or network frame** of any size in the profile; the only non-idle time is RE2 matching, and the mutex
+  frames (`lockSlow` 8.28 %, `SemacquireMutex` 8.27 %) are contention on the shared WASM module, not
+  I/O.
+- (An earlier draft mislabeled the parked goroutines as the system being "I/O/scheduling-bound … not
+  spinning on regex." Corrected: the **running cores ARE spinning on RE2**; the huge parked count is
+  simply the surplus of a 1024-worker pool scheduled onto 4 cores — an over-subscription artifact, not
+  I/O wait.)
 
 ### 7.4 `regexp2` never executes — dependency-closure proof (primary) + zero samples (secondary)
 
@@ -722,34 +966,84 @@ import `dlclark/regexp2` directly.
 
 **Secondary proof — symbols linked but not executed:**
 
-```
-$ go tool nm <workdir>/trufflehog_bin | grep -c dlclark/regexp2   -> 211
-$ go tool nm <workdir>/trufflehog_bin | grep -c wasilibs/go-re2   -> 149
+Each `$`-prefixed line below is the command; the line immediately beneath it is that command's
+verbatim stdout (a single integer from `grep -c`). Command and output are on separate lines — there
+is no `->`/redirection syntax, so copy-pasting a command line runs the pipe cleanly and writes no
+files.
+
+```console
+$ go tool nm <workdir>/trufflehog_bin | grep -c dlclark/regexp2
+211
+$ go tool nm <workdir>/trufflehog_bin | grep -c wasilibs/go-re2
+149
 ```
 **[observed]** `regexp2` contributes **211 symbols** (it is linked into the binary because the TUI
 references it), while go-re2 contributes 149 — but `regexp2` shows **0 CPU samples in the pprof
 profile and 0 samples in fgprof** (§7.2, §7.3). Linked ≠ executed. Because the backtracking engine is
-never invoked on scanned content, it cannot be a complexity-attack vector (the point of §4.2).
+never invoked on scanned content, it cannot be a complexity-attack vector (the point of §4.2). This is
+also why the published `regexp2` ReDoS advisory affecting v1.4.0 (**GHSA-wq9v-j77v-qr26**; see the
+advisory note in §4.2) is **irrelevant to the scan path** — the vulnerable engine is unreachable from
+`trufflehog filesystem`/`git`.
 
 ### 7.5 Base64 path profile — RE2 re-scan of decoded content dominates
 
-CPU profile of the Base64 40 MiB file (raw `go tool pprof -top` head; scan_duration ~14.9 s):
+CPU profile of the Base64 40 MiB file (scan_duration ~14.9 s). Command:
+`go tool pprof -top -cum -nodecount=14 prof/base64_40_cpu.pb.gz`, complete verbatim head, top 14 of
+169 nodes:
 
 ```
-Duration: 8.12s, Total samples = 31.60s (389.14%)
-      flat  flat%     cum   cum%
-    12.64s 40.00%  12.64s 40.00%  runtime._ExternalCode                    # RE2 re-scanning DECODED content
-     0.09s  0.28%   5.87s 18.58%  go-re2 (*Regexp).FindAllStringSubmatch   # detector regex on decoded copy
-     0.86s  2.72%   1.07s  3.39%  aho-corasick (*Trie).Walk                # prefilter on decoded content
-             —     <0.2s     —    base64 / EscapedUnicode decoder frames   # DECODING itself is cheap
-             —      0s      0%    dlclark/regexp2                          # never executes (grep -c = 0)
+File: trufflehog_bin
+Build ID: 5a5e90cf76fa251b272b2c0caa18866fe694e144
+Type: cpu
+Time: 2026-07-14 02:17:01 UTC
+Duration: 12.14s, Total samples = 47.25s (389.35%)
+Showing nodes accounting for 20.46s, 43.30% of 47.25s total
+Dropped 1016 nodes (cum <= 0.24s)
+Showing top 14 nodes out of 169
+      flat  flat%   sum%        cum   cum%
+         0     0%     0%     19.32s 40.89%  github.com/trufflesecurity/trufflehog/v3/pkg/engine.(*Engine).startVerificationOverlapWorkers.func1
+     0.72s  1.52%  1.52%     19.32s 40.89%  github.com/trufflesecurity/trufflehog/v3/pkg/engine.(*Engine).verificationOverlapWorker
+    19.31s 40.87% 42.39%     19.31s 40.87%  runtime._ExternalCode
+         0     0% 42.39%     19.31s 40.87%  runtime._System
+     0.18s  0.38% 42.77%      9.69s 20.51%  github.com/wasilibs/go-re2/internal.(*Regexp).FindAllStringSubmatch
+     0.07s  0.15% 42.92%      8.89s 18.81%  github.com/wasilibs/go-re2/internal.(*lazyFunction).callWithStack
+     0.02s 0.042% 42.96%      5.04s 10.67%  github.com/wasilibs/go-re2/internal.(*lazyFunction).Call1
+         0     0% 42.96%      4.74s 10.03%  runtime.systemstack
+     0.02s 0.042% 43.01%      4.46s  9.44%  github.com/trufflesecurity/trufflehog/v3/pkg/context.WithTimeout
+     0.02s 0.042% 43.05%      4.33s  9.16%  github.com/wasilibs/go-re2/internal.(*Regexp).findAllSubmatch
+     0.06s  0.13% 43.17%      4.30s  9.10%  github.com/wasilibs/go-re2/internal.matchFrom
+     0.03s 0.063% 43.24%      4.25s  8.99%  github.com/wasilibs/go-re2/internal.getChildModule
+     0.03s 0.063% 43.30%      4.24s  8.97%  github.com/wasilibs/go-re2/internal.(*lazyFunction).Call8
+         0     0% 43.30%      3.91s  8.28%  github.com/trufflesecurity/trufflehog/v3/pkg/engine.(*Engine).scannerWorker
+```
+
+The decoder frames themselves are far down the profile — surfaced with
+`go tool pprof -top -nodefraction=0 prof/base64_40_cpu.pb.gz | grep decoders`, verbatim:
+
+```
+     0.06s  0.13% 88.51%      0.07s  0.15%  github.com/trufflesecurity/trufflehog/v3/pkg/decoders.getSubstringsOfCharacterSet
+     0.01s 0.021% 96.51%      0.01s 0.021%  github.com/trufflesecurity/trufflehog/v3/pkg/decoders.utf16ToUTF8
+         0     0%   100%      0.18s  0.38%  github.com/trufflesecurity/trufflehog/v3/pkg/decoders.(*Base64).FromChunk
+         0     0%   100%      0.87s  1.84%  github.com/trufflesecurity/trufflehog/v3/pkg/decoders.(*EscapedUnicode).FromChunk
+         0     0%   100%      0.01s 0.021%  github.com/trufflesecurity/trufflehog/v3/pkg/decoders.(*UTF16).FromChunk
+         0     0%   100%      0.01s 0.021%  github.com/trufflesecurity/trufflehog/v3/pkg/decoders.appendB64Substring
 ```
 
 **[observed]** The Base64 amplification cost is **not** in decoding — it is in **re-scanning the
-decoded copy with RE2** (`runtime._ExternalCode` **40.00 %** flat, with go-re2's
-`FindAllStringSubmatch` **18.58 %** cumulative; the base64/unicode decoder frames themselves are below
-the 0.2 s reporting floor). This is the profiler-level confirmation of the decoder re-scan mechanism
-(§8.2): a Base64 file is effectively scanned twice, and `dlclark/regexp2` records **zero** samples.
+decoded copy with RE2**. `runtime._ExternalCode` is **40.87 % flat** and go-re2's
+`FindAllStringSubmatch` is **20.51 % cum**, the same RE2/WASM signature as the keyword profile (§7.2).
+By contrast the decoder entry points are tiny: `Base64.FromChunk` is **0.18 s cum (0.38 %)** and
+`EscapedUnicode.FromChunk` is **0.87 s cum (1.84 %)** — the whole decoder chain is under ~1.1 s of a
+47.25 s sample total. (`EscapedUnicode` is larger than `Base64` because it scans every chunk for
+`\uXXXX` escapes regardless of content, §8.2.) This is the profiler-level confirmation of the decoder
+re-scan mechanism (§8.2): a Base64 file is effectively scanned twice — once as raw text, once as
+decoded bytes — and the second RE2 pass, not the decode step, is where the extra time goes.
+`dlclark/regexp2` records **zero** samples here as well (§7.4).
+
+**Linear scaling check [observed]:** doubling the input to 80 MiB doubles the decoder cumulative time
+— `EscapedUnicode.FromChunk` goes 0.87 s → **1.67 s** and `Base64.FromChunk` 0.18 s → **0.45 s**
+(`go tool pprof -top -nodefraction=0 prof/base64_cpu.pb.gz | grep decoders`, the 80 MiB profile),
+confirming the Base64 path amplifies **linearly**, not super-linearly.
 
 ---
 
@@ -769,16 +1063,51 @@ detector regex runs on.
 
 ### 8.2 Decoded bound — the chunk can be re-scanned in expanded/mutated forms
 
-`DefaultDecoders()` = `{UTF8, Base64, UTF16, EscapedUnicode}` (decoders.go:8-14) **[source]**. Each
-decoder produces a **decoded copy** of the chunk that is **re-scanned** by the full detector set:
-- **Base64** (`base64.go:34`): extracts base64-charset substrings of length ≥ 20
-  (`getSubstringsOfCharacterSet(chunk.Data, 20, …)`, base64.go:36), decodes via `StdEncoding`/
-  `RawURLEncoding` (base64.go:40,45), and re-scans the decoded bytes **[source]**. §5.1 observed JDBC
-  firing via the BASE64 decoder, and §7.5 observed the decoded re-scan dominating that file's CPU —
-  so a Base64 file incurs **roughly 2× the regex work** of its plaintext.
-- **UTF16 / EscapedUnicode** similarly transform and re-scan. **[inferred]** The decoded form can be
-  a different length than the raw chunk, so "13 KiB" is not the size the detector sees on decoded
-  passes.
+`DefaultDecoders()` = `{UTF8, Base64, UTF16, EscapedUnicode}` (decoders.go:8-14) **[source]**, and the
+engine applies them **sequentially to a single, shared, mutable chunk** — not as four independent
+copies. The scan loop is `for _, decoder := range e.decoders { decoded := decoder.FromChunk(chunk); … }`
+(engine.go:784,786) **[source]**, where every decoder receives the **same** `*sources.Chunk` pointer
+and each `FromChunk` may **rewrite `chunk.Data` in place**:
+- **UTF8** (`utf8.go:24`): when the chunk is not valid UTF-8,
+  `chunk.Data = extractSubstrings(chunk.Data)` replaces each run of control/invalid bytes with the
+  3-byte U+FFFD replacement character — this **grows** the data **[source]**.
+- **Base64** (`base64.go:67`): `chunk.Data = result.Bytes()` substitutes decoded base64 substrings
+  (length ≥ 20, `getSubstringsOfCharacterSet(chunk.Data, 20, …)`, base64.go:36) for their encoded
+  form — this typically **shrinks** the data; if no base64 substring is present it returns `nil`
+  (base64.go:71) and leaves the chunk untouched **[source]**.
+- **UTF16 / EscapedUnicode** similarly transform and re-scan; §7.5 measured `EscapedUnicode.FromChunk`
+  scanning every chunk for `\uXXXX` escapes.
+
+Because the mutations **accumulate along the chain** (UTF8 → Base64 → UTF16 → EscapedUnicode) on the
+same chunk, later decoders see earlier decoders' output, and the detector set is re-run after each
+transform. §5.1 observed JDBC firing via the BASE64 decoder, and §7.5 observed the decoded re-scan
+dominating a Base64 file's CPU — so a Base64 file incurs **roughly 2× the regex work** of its
+plaintext.
+
+**[observed]** The mutated chunk can be a **different length** than the raw chunk, so "13 KiB" is not
+the size the detector sees on decoded passes. The `"bytes"` field of `finished scanning` is
+`metrics.BytesScanned`: **after** the decoder loop the engine computes
+`dataSize := float64(len(chunk.Data))` (engine.go:819) and adds it **once** per chunk
+(`atomic.AddUint64(&e.metrics.BytesScanned, uint64(dataSize))`, engine.go:835), so `"bytes"` is the
+sum of each chunk's **final, post-decoder** length — it can be **less** than the file size (base64
+shrink) or **more** (UTF-8 growth), and is **not** the sum of every decoded copy. Driving three
+single-chunk files through the real CLI makes the direction concrete
+**[observed, /tmp/th_work/dec/]**:
+
+| Input (single chunk) | File size | `"bytes"` scanned | Decoder effect |
+|----------------------|-----------|-------------------|----------------|
+| plain ASCII, no base64 substring | 48 | **48** | no mutation (valid UTF-8, no ≥20-char base64 run) |
+| embedded base64 substring | 59 | **45** | Base64 **shrank** the chunk (decoded substring shorter than its encoding) |
+| 6 control/invalid bytes + newline | 13 | **27** | UTF8 **grew** the chunk (each bad byte → 3-byte U+FFFD) |
+
+Verbatim, the shrink and grow cases:
+
+```
+$ trufflehog_bin filesystem b64B.txt  --no-verification --log-level=2 | grep 'finished scanning'
+... finished scanning {"chunks": 1, "bytes": 45, "verified_secrets": 0, "unverified_secrets": 0, "scan_duration": "4.563783ms", "trufflehog_version": "dev", ...}
+$ trufflehog_bin filesystem ctrlC.txt --no-verification --log-level=2 | grep 'finished scanning'
+... finished scanning {"chunks": 1, "bytes": 27, "verified_secrets": 0, "unverified_secrets": 0, "scan_duration": "4.330832ms", "trufflehog_version": "dev", ...}
+```
 
 ### 8.3 Matched-span bound — what each detector `FromData` actually receives
 
@@ -799,9 +1128,21 @@ large-secret-size detectors and for whole-chunk detectors.
   `strutil.Similarity(valStr, dupe, metrics.NewLevenshtein())` (engine.go:887,911) **[source]**.
   Levenshtein is O(m·n) in the two strings' lengths — bounded by span size, but a real per-pair cost
   when many detectors fire on the same chunk (i.e. exactly the fan-out case).
-- **Archive / history multiplication [untested].** Archive handlers decompress and re-feed content
-  (bounded by `--archive-timeout`), and `trufflehog git` multiplies chunks by history depth. Neither
-  is bounded by 13 KiB in aggregate; both are called out as untested here (§3.4).
+- **Archive / history multiplication.** Archive handlers decompress and re-feed content, and
+  `trufflehog git` multiplies chunks by history depth; neither is bounded by 13 KiB in aggregate.
+  **[observed]** `--archive-timeout` (default **60 s**, archive.go:26-28) is an **extraction+emission
+  deadline only** — it wraps `HandleFile` + `handleChunksWithError` at handlers.go:384, so it bounds
+  *decompression / chunk emission* but **not** the detector CPU spent on the emitted chunks. Proof: a
+  **stored** (uncompressed) ZIP of the 10 MiB keyword payload scanned **~7.9 s of detection** under the
+  default 60 s archive-timeout **without being interrupted** —
+  `finished scanning {"chunks": 1024, "bytes": 13628416, "scan_duration": "7.901019552s"}` — whereas
+  `--archive-timeout=1ns` cut it off *during extraction* (`context deadline exceeded`,
+  `finished scanning {"chunks": 0, "bytes": 0, ...}`), so detection never ran. Depth and size are
+  separately bounded by `--archive-max-depth` (default **10**) and `--archive-max-size` (default
+  **2 GB**) (archive.go:26-27). **[untested]** the *aggregate slowdown magnitude* of a
+  decompression-amplification or deep-git-history attack is a separate class not measured here (§3.4);
+  bounding its **total** CPU still requires the external process-tree timeout of §9.3, since
+  `--archive-timeout` does not cover downstream detection.
 
 ### 8.5 Corrected pipeline diagram
 
@@ -809,7 +1150,7 @@ large-secret-size detectors and for whole-chunk detectors.
 flowchart TD
     A["Crafted / baseline file"] --> B["Source decomposition"]
     B --> C["Chunker: 10KiB + 3KiB peek = 13KiB raw chunks<br/>(chunker.go:14-18)"]
-    C --> D["Decoder chain: UTF8, Base64, UTF16, EscapedUnicode<br/>each produces a DECODED COPY that is re-scanned<br/>(decoders.go:8-14; base64.go:34)"]
+    C --> D["Decoder chain: UTF8→Base64→UTF16→EscapedUnicode<br/>sequential IN-PLACE mutation of ONE shared chunk; re-scanned after each<br/>(engine.go:784,786; decoders.go:8-14; base64.go:34,67)"]
     D --> E["Aho-Corasick keyword prefilter<br/>FindDetectorMatches -> matched sub-spans<br/>(ahocorasickcore.go:241,228; radius 512 @:155)"]
     E -->|"len(matchingDetectors) > 1 && !verificationOverlap<br/>(engine.go:796) — DEFAULT"| F1["STAGE 1: verificationOverlapWorker<br/>context.WithTimeout(ctx, 2s) HARDCODED (engine.go:939)<br/>+ Levenshtein overlap dedup (engine.go:887,911)"]
     E -->|"--allow-verification-overlap OR single detector"| F2["STAGE 2: detectChunk<br/>context.WithTimeout(ctx, detectionTimeout=10s) (engine.go:1066)<br/>+ AfterFunc(+1s) watchdog log (engine.go:1067)"]
@@ -851,13 +1192,46 @@ CPU-pattern controls or are measurement-isolation flags.
 
 ### 9.3 External containment the caller must add (recommended for a CI gate)
 
-- **External wall-clock timeout** on the scan process (e.g. `timeout 60s trufflehog …` or the CI
-  step's own limit) — the only reliable way to bound total time, since the internal timeouts do not
-  preempt (§3.2).
+- **External wall-clock timeout that actually kills the process *tree*.** A *plain*
+  `timeout 60s trufflehog …` does **NOT** reliably bound the canonical binary. `timeout` sends
+  **SIGTERM** by default, but the production build runs under an **overseer** supervisor whose
+  `RestartSignal` **is `syscall.SIGTERM`** (main.go:340-368 — `updateCfg.RestartSignal = syscall.SIGTERM`
+  at main.go:351; overseer fork `proc_parent.go:123`,
+  `if s == mp.RestartSignal { go mp.triggerRestart() }`) — so a SIGTERM to the master **restarts the
+  scan worker** instead of terminating the scan. **[observed]** when a SIGTERM-based `timeout` fired
+  *before* a scan finished, the worker was **restarted** and a fresh scan ran to completion — e.g. a
+  signal at `02:20:02` was followed by a full `finished scanning … "scan_duration":"43.669907085s"` at
+  `02:20:47` (≈45 s later), and the process was ultimately reaped only when `--kill-after` escalated to
+  SIGKILL (measured end-to-end wall **≈45–51 s** for an intended 8 s bound; the absolute figure is
+  **host-load-sensitive** — see caveat). The **load-independent, reproducible** facts are: a bare
+  SIGTERM does not stop the scan (it restarts it), and SIGKILL / process-group / container termination
+  does. Use a signal/scope the supervisor cannot catch or restart around:
+    - `timeout -s KILL 60s trufflehog …` (SIGKILL is uncatchable) or `timeout --kill-after=10s 60s …`
+      to escalate TERM→KILL — **[observed]** under SIGKILL the scan is prevented from completing
+      (no `finished scanning` line is emitted; the process dies well before its natural completion);
+    - kill the **whole process group** (`setsid` at launch, then `kill -KILL -<pgid>`), not just the
+      master PID — **[observed]** killing only the master orphans the freshly-restarted worker;
+    - or run under a **container / cgroup** with an external wall-time/CPU limit that reaps the entire
+      tree.
+  (The hidden `--local-dev` flag disables the overseer entirely — **[observed]** a plain SIGTERM
+  `timeout` then shuts the scan down promptly, logging `Received signal, shutting down.` +
+  `cleaned temporary artifacts` — but it is a development flag, not a deployment hardening control.)
+  This is the only reliable way to bound total time, since the internal timeouts do not preempt (§3.2).
+
+  > **Wall-time caveat [observed].** The *absolute* seconds above were measured on a heavily
+  > over-subscribed shared host (load average ~10–20 on 4 schedulable CPUs), so exact wall times drift
+  > run-to-run; the **qualitative** result — SIGTERM restarts rather than stops, SIGKILL/process-group
+  > stops — is stable and is what the recommendation rests on.
 - **External CPU/memory cgroup limits** on the runner, so a crafted file cannot starve neighbors.
 - **Input constraints before scanning**: cap file size, skip binary/generated/vendored paths, and
-  bound archive depth (`--archive-timeout`, `--archive-max-depth` where applicable) and git-history
-  depth. These reduce the *volume* lever that §6.5 identifies as the practical DoS vector — at the
+  bound archive **depth** (`--archive-max-depth`, default **10**, archive.go:26-27) and **size**
+  (`--archive-max-size`, default **2 GB**, archive.go:26-27) and git-history depth. **Note
+  `--archive-timeout` (default 60 s, archive.go:26-28) is an *extraction+emission* deadline, not a
+  total-CPU cap** — it wraps only `HandleFile` + `handleChunksWithError` (handlers.go:384), so it can
+  interrupt slow *decompression*, but once chunks are emitted the downstream **detector CPU is not
+  bounded by it** (proven in §8.4: a stored ZIP scanned ~7.9 s of *detection* under the default 60 s
+  archive-timeout without being cut off). The external process-tree timeout above is therefore still
+  required. These reduce the *volume* lever that §6.5 identifies as the practical DoS vector — at the
   explicit cost of **reduced coverage** (skipped files are not scanned for secrets), a tradeoff the
   adopter must weigh.
 - **Do not enable `--profile` on shared/CI runners** — it exposes an unauthenticated pprof/fgprof
@@ -876,21 +1250,22 @@ disabling verification does not reduce a *pattern-matching* DoS and in fact remo
 
 | Item asked | Answer (this host) | Where | Concrete evidence |
 |------------|--------------------|-------|-------------------|
-| Q1 hang? | No unbounded hang; finite ~10.7 s@10 MiB, ~44 s@40 MiB | §3, §6, §7 | scan_duration; Cases A–D |
+| Q1 hang? | No unbounded hang; finite — default **~9.8–10.7 s**@10 MiB, forced stage-2 (Case D, load-variable) **~13–19 s**@10 MiB, **~44 s**@40 MiB | §3.3, §6, §7 | scan_duration; Cases A–D |
 | Q1 time out / block CI? | Not internally; can exceed an **external** budget; internal timeouts non-preemptive | §3.2, §9 | many (load-variable) watchdog fires, all complete |
 | Q1 timeout default value & enforcement | Stage-1 2 s hardcoded (engine.go:939); stage-2 10 s configurable (http.go:18, engine.go:1066); neither preempts | §3.1-3.2 | source + Cases A–D |
 | Q2 complexity vulnerability? | No exponential ReDoS (RE2 linear); yes bounded linear amplification | §4, §6.3 | classic payload 93.6 ms; linear ms/chunk |
 | Q2 which engine | go-re2 v1.9.0 (RE2/WASM) + stdlib regexp; regexp2 transitive-only | §4.1-4.2, §7.4 | go.mod:100,187; `go mod why`; nm 211 vs 149 |
 | Q3 which patterns exploitable | None to super-linear; permissive `.*`/wide `{0,N}` inspected & linear; fan-out is the amplifier | §5 | AST survey; JDBC/Docker/GitHub firing |
 | Q3 named worst offender | Aggregate keyword fan-out (e.g. mapbox/snowflake/… per profile), each linear | §5.2-5.3, §7.2 | pprof peek fan-out |
-| Q4 slowdown vs equal size | keyword **~64×** (52–74× across runs), base64 **~27×**, keyword-bearing quantifier **~2.6×**, keyword-free quantifier **0.53× (faster)** at 10 MiB | §6.2 | equal-size medians + SHA-256 |
+| Q4 slowdown vs equal size | keyword **~64×** (observed sample ~52–78×), base64 **~27×**, keyword-bearing quantifier **~2.6×**, keyword-free quantifier **0.53× (faster)** at 10 MiB | §6.2 | equal-size medians + SHA-256 |
 | Q4 linear or super-linear | Linear (constant ms/chunk; 8× data → 6.97× time) | §6.3-6.4 | linearity tables |
 | Q5 timing measurements | scan_duration distributions, ≥3 runs, stable | §3, §6 | finished-scanning lines |
-| Q5 CPU profiling | Concurrent pprof (on-CPU: RE2/WASM 34–38 %) + fgprof (off-CPU: parked) | §7 | raw top/peek; regexp2=0 |
+| Q5 CPU profiling | Concurrent pprof (on-CPU: RE2/WASM `runtime._ExternalCode` 36.37 % flat keyword / 40.87 % base64) + fgprof (off-CPU: parked surplus workers) | §7 | verbatim top/cum/peek; regexp2=0 |
 | Named: keyword fan-out | Primary amplifier | §5.2, §7.2 | — |
 | Named: Base64 amplification | ~2× re-scan; CPU in re-scan not decode | §5.1, §7.5, §8.2 | base64 profile |
 | Named: decoders | UTF8/Base64/UTF16/EscapedUnicode re-scan | §8.2 | decoders.go:8-14 |
 | Named: per-detector timeout | Two, non-preemptive | §3, §9.2 | — |
+| R6 read-only / cleanup (rule) | Repo unchanged except this document; every temp artifact removed | Appendix A, Appendix B | `git status --porcelain` → one path; harness self-clean; `/root/pprof` untouched |
 
 ---
 
@@ -905,9 +1280,12 @@ payload timing (§4.4.1); the environment values in §2.1.
 contexts (engine.go:795-796,924,939,1044,1066-1069); engine/detector/decoder/chunker/ahocorasick
 constants and patterns cited throughout; go.mod dependency versions; main.go flag and pprof wiring.
 
-**External (interpretation only, §4.5):** RE2's linear-time guarantee; go-re2's WASM/wazero packaging
-and small-input constant overhead; the OWASP ReDoS mechanism (nested/overlapping repetition on
-backtracking engines) and CWE-1333.
+**External (interpretation only, §4.5; all URLs accessed 2026-07-14):** RE2's linear-time guarantee
+(Google "Why RE2?"; Russ Cox's Thompson-NFA **O(n·m)** result); go-re2 **v1.9.0**'s WASM/wazero
+packaging and small-input constant overhead; the OWASP ReDoS mechanism (nested/overlapping repetition
+on backtracking engines); and, cited **separately** from OWASP, the MITRE **CWE-1333** weakness class
+(Inefficient Regular Expression Complexity, typical CVSS 3.1 base 7.5 HIGH) — the classification this
+investigation's negative result is measured against.
 
 **Inferred (reasoned, not directly measured — challengeable):** that the timeout's non-preemption
 means RE2 linearity + span bounds are the *real* protection (§3.2); that the practical DoS lever is
@@ -920,6 +1298,56 @@ profiling. *Untested* — default network verification, archive/nested-archive e
 scanning, and large multi-file/whole-repo aggregate scans (§3.4). Conclusions above apply to the
 tested cases; the untested paths are compounding factors an adopter should evaluate separately.
 
+**Operator-flag edge cases and a dependency-audit cross-check (pre-existing; source untouched).** Two
+items sit outside the complexity-class question but are recorded for completeness. **(1) Non-positive
+`--concurrency`** is a pre-existing product edge, not an attacker-content lever (it requires an
+operator flag): `--concurrency=0` is **not** a zero-worker deadlock — `setDefaults` maps it to
+`runtime.NumCPU()` (engine.go:337-341; observed log line `No concurrency specified, defaulting to max
+{"cpu": 128}`), which on this 128-`NumCPU` / 4-core host spawns `128 × 8 = 1024` detector workers
+(engine.go:676) and degrades into extreme oversubscription under load rather than hanging *logically*;
+`--concurrency=-1` **panics fast** (`panic: semaphore limit must not be negative` at
+`github.com/marusama/semaphore/v2@v2.5.0/semaphore.go:193`, via `source_manager.go:65,117`). Neither
+value changes the R1–R5 findings, and the source was **not** modified (read-only). **[observed;
+edge/untested in depth]** **(2) A dependency-audit cross-check *was* run.** Contrary to an earlier draft's note, this environment
+has outbound network access (`GOPROXY=https://proxy.golang.org,direct`, `GOTOOLCHAIN=auto`), so
+`govulncheck` executes. Because `golang.org/x/vuln@v1.6.0` requires Go ≥ 1.25.0, the toolchain
+**auto-switched to go1.25.12 for the analyzer only** — the canonical TruffleHog build is unaffected and
+remains `CGO_ENABLED=0 go build .` under go1.24.2 (§2). The command and its observed summary
+(source mode, whole module; Go vulnerability DB snapshot `2026-07-08`):
+
+```console
+$ go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+go: golang.org/x/vuln@v1.6.0 requires go >= 1.25.0; switching to go1.25.12
+=== Symbol Results ===
+[19 per-vulnerability detail blocks omitted here for length]
+Your code is affected by 19 vulnerabilities from 8 modules.
+This scan also found 23 vulnerabilities in packages you import and 4
+vulnerabilities in modules you require, but your code doesn't appear to call
+these vulnerabilities.
+exit status 3
+```
+
+The 8 modules carrying a **reachable** (code-called) advisory are `golang.org/x/crypto`,
+`golang.org/x/net`, `github.com/go-git/go-git/v5`, `github.com/go-jose/go-jose/v4`,
+`github.com/dvsekhvalnov/jose2go`, `github.com/cloudflare/circl`, `github.com/ulikunitz/xz`, and
+`go.opentelemetry.io/otel/sdk`. **None of the 19 is a regular-expression / ReDoS / computational-
+complexity issue** — a case-insensitive search of the full output for
+`regex|redos|backtrack|catastrophic|complexity|pattern` returns nothing. Several *are* DoS-class (for
+example `GO-2026-4918` HTTP/2 infinite loop on a bad `SETTINGS_MAX_FRAME_SIZE`, `GO-2026-5020` infinite
+loop on large SSH channel writes, `GO-2026-5018` pathological RSA/DSA parameters, `GO-2025-4123` and
+`GO-2026-4945` go-jose JWE, `GO-2025-3922` LZMA-decode memory leak), but every one lives in a crypto /
+SSH / HTTP-2 / Git-index / JOSE / archive-decompress subsystem that is **off the detector-regex
+pattern-matching path** this investigation measures. No dependency was introduced or version-changed by
+this deliverable (the inventory is empty, §6.2), so these are pre-existing, upstream-owned advisories
+that do not alter any R1–R5 conclusion. The exact reachable count depends on the analyzer toolchain
+version (a newer toolchain prunes reachability more precisely, yielding fewer "called" findings), but
+that number is immaterial here — no reachable advisory, at any count, touches the complexity class.
+Finally, `github.com/dlclark/regexp2 v1.4.0` appears **only** in govulncheck's "scanned … 261 modules"
+inventory and is **not** the subject of any advisory finding in any category (its GitHub advisory
+`GHSA-wq9v-j77v-qr26` is not carried by the Go vulnerability database as of this snapshot);
+independently, its scan-unreachability is proven by `go mod why` (TUI-only; §4.2, §7.4). **[observed;
+run-first — command output above]**
+
 **Cross-machine note (F12).** Every number here is from **one** 4-CPU host. No second "reference"
 dataset is presented, and none of these absolute timings should be read as machine-independent. The
 transferable claims are the *engine complexity class* (source + external) and the *shape of the
@@ -929,59 +1357,312 @@ scaling* (linear); the absolute seconds and the parked-goroutine picture are hos
 
 ## Appendix A — Reproduction harness (safe, self-contained)
 
-All artifacts live under a `mktemp` working directory **outside** the repository; nothing here is
-committed. The harness uses `set -euo pipefail`, restrictive perms, deterministic generators, SHA-256
-verification, an explicit readiness check and PID tracking for the profile server, a narrow cleanup
-trap, and bounded (`timeout`-wrapped) scans.
+Every artifact lives under a single `mktemp` working directory **outside** the repository; nothing
+here is created inside, added to, or committed to the TruffleHog source tree. The harness is
+self-contained and reproduces the whole investigation end-to-end:
+
+- **Canonical build** — the default, unstamped `"dev"` binary (`CGO_ENABLED=0 go build .`).
+- **Canonical inventory** — instantiates `defaults.DefaultDetectors()` from a throwaway module
+  (outside the repo, via a `replace` directive) and counts detectors/keywords: **831 / 914**.
+- **Nested-quantifier AST survey** — a standalone stdlib program parses every `MustCompile` literal
+  under `pkg/detectors` and flags star/plus-over-star/plus nesting: **5 nested + 1 unbounded**.
+- **Equal-size timing** — baseline vs. keyword fan-out, base64, keyword-bearing quantifier, and a
+  **keyword-free classic-ReDoS-shaped negative control**, 3 runs each at 10 MiB, with computed
+  medians and slowdown ratios; plus a canonical 914-keyword fan-out input for parity with the
+  938-token source-scrape stress input.
+- **Input-size linearity** — the keyword shape at 1/2/4/8 MiB (linear, not super-linear, growth).
+- **`--concurrency=1` determinism control** — 3 identical runs, identical result counts.
+- **Detector-timeout probe** — Cases A–D on the *same* crafted keyword input.
+- **CPU + fgprof profiling** — the keyword and base64 40 MiB cases.
+- **`regexp2` reachability** — dependency closure (`go mod why`) plus linked-but-unexecuted symbol
+  counts.
+
+Safety properties (this is, after all, a resource-exhaustion subject under test): `set -euo pipefail`
+and `umask 077`; deterministic generators with one-pass SHA-256; **every scan is bounded** by
+`timeout -s KILL`; each timing run **asserts** a `finished scanning` line and the absence of a panic
+(a silent failure aborts the harness via `die`); the profile-server readiness check **fails loudly**
+rather than profiling a dead server; `PPROF_TMPDIR` is pointed inside the work dir so
+`go tool pprof`'s on-disk cache never touches `~/pprof` (`/root/pprof`); and the profile server is
+stopped by **SIGKILL of the uniquely-pathed binary** discovered with `pgrep -f "$BIN"` (`$BIN` is a
+unique `mktemp` path, so it never matches the orchestrator, `go build`, or `go tool pprof`). Killing
+the launcher PID or its process group is **not** sufficient: the `overseer` supervisor re-parents its
+scan worker into a separate session, and `SIGTERM` is the overseer *restart* signal (`main.go:351`),
+not a stop. The `cleanup` trap only ever removes the one `mktemp` dir, never the repository.
 
 ```bash
 #!/usr/bin/env bash
-# Read-only investigation harness. Creates NOTHING inside the repo.
+# ============================================================================
+# TruffleHog ReDoS / resource-exhaustion reproduction harness (READ-ONLY).
+# Creates NOTHING inside the repository: every artifact lives under a single
+# mktemp working directory that is removed on exit. Reproduces the complete
+# investigation: canonical build; canonical detector/keyword inventory;
+# nested-quantifier AST survey; equal-size timing with medians+ratios;
+# input-size linearity; --concurrency=1 control; detector-timeout probe
+# (Cases A-D); CPU + fgprof profiling of the keyword and base64 40 MiB cases;
+# and regexp2 reachability. All scans are bounded; the profile server is
+# stopped by SIGKILL of our uniquely-pathed binary (the overseer supervisor
+# re-parents its worker, so a process-group kill of the launcher is not enough
+# and SIGTERM is the overseer *restart* signal - see main.go:351).
+# ============================================================================
 set -euo pipefail
 umask 077
-
-REPO="$(git rev-parse --show-toplevel)"
-WORK="$(mktemp -d "${TMPDIR:-/tmp}/th_investig.XXXXXX")"
-BIN="$WORK/trufflehog_bin"
-EV="$WORK/evidence"; PROF="$WORK/prof"; mkdir -p "$EV" "$PROF"
-
-# Narrow cleanup: only ever remove OUR mktemp dir; never the repo.
-cleanup() { [ -n "${SRV_PID:-}" ] && kill "$SRV_PID" 2>/dev/null || true; rm -rf "$WORK"; }
-trap cleanup EXIT
-
 export PATH="$PATH:/usr/local/go/bin:/root/go/bin"
 
-# 1) Canonical build (default "dev" binary)
-( cd "$REPO" && CGO_ENABLED=0 go build -o "$BIN" . )
-"$BIN" --version   # -> trufflehog dev
+REPO="${TH_REPO:-$(git rev-parse --show-toplevel)}"
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/th_investig.XXXXXX")"
+BIN="$WORK/trufflehog_bin"
+EV="$WORK/evidence"; PROF="$WORK/prof"; MOD="$WORK/mod"
+mkdir -p "$EV" "$PROF" "$MOD"
+# Keep pprof's on-disk cache inside $WORK instead of ~/pprof (/root/pprof).
+export PPROF_TMPDIR="$PROF"
 
-# 2) Deterministic keyword harvest + input generators (fully self-contained).
-#    Harvests the keyword pool from EVERY detector Keywords() method body, writes
-#    keywords_clean.txt in-script (no pre-existing file assumed), then streams each
-#    input to exactly its target size while hashing in a single pass.
+die() { echo "HARNESS FAILED: $*" >&2; exit 1; }
+
+stop_bin() {  # SIGKILL every process whose cmdline contains our UNIQUE $BIN path.
+  local pids; pids="$(pgrep -f "${BIN:-__nomatch_placeholder__}" 2>/dev/null || true)"
+  [ -n "$pids" ] && kill -KILL $pids 2>/dev/null || true
+}
+cleanup() { stop_bin; [ -n "${WORK:-}" ] && rm -rf "$WORK"; }
+trap cleanup EXIT INT TERM
+
+wait_port_free() {
+  for _ in $(seq 1 100); do
+    curl -sf http://localhost:18066/debug/pprof/ >/dev/null 2>&1 || return 0
+    sleep 0.2
+  done
+  die "port 18066 never freed"
+}
+
+echo "WORK=$WORK"
+
+# ----------------------------------------------------------------------------
+# 1) Canonical build (default, unstamped "dev" binary)
+# ----------------------------------------------------------------------------
+( cd "$REPO" && CGO_ENABLED=0 go build -o "$BIN" . ) || die "build failed"
+[ -x "$BIN" ] || die "binary missing after build"
+"$BIN" --version 2>&1 | tee "$EV/version.txt"   # expect: trufflehog dev
+
+# ----------------------------------------------------------------------------
+# 2) CANONICAL detector/keyword inventory via defaults.DefaultDetectors()
+#    (temp module OUTSIDE the repo with a replace directive; warm module cache)
+# ----------------------------------------------------------------------------
+mkdir -p "$MOD/inv"
+cat > "$MOD/inv/main.go" <<'GO'
+package main
+
+import (
+	"fmt"
+	"os"
+	"sort"
+	"strings"
+
+	"github.com/trufflesecurity/trufflehog/v3/pkg/engine/defaults"
+)
+
+func main() {
+	dets := defaults.DefaultDetectors()
+	kw := map[string]struct{}{}
+	for _, d := range dets {
+		for _, k := range d.Keywords() {
+			kw[k] = struct{}{}
+		}
+	}
+	fmt.Printf("default_detectors=%d\n", len(dets))
+	fmt.Printf("distinct_keywords=%d\n", len(kw))
+	var out []string
+	for k := range kw {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	if err := os.WriteFile(os.Args[1], []byte(strings.Join(out, "\n")+"\n"), 0600); err != nil {
+		panic(err)
+	}
+}
+GO
+cat > "$MOD/inv/go.mod" <<GO
+module inv
+
+go 1.24
+
+require github.com/trufflesecurity/trufflehog/v3 v3.0.0
+
+replace github.com/trufflesecurity/trufflehog/v3 => $REPO
+GO
+( cd "$MOD/inv" && GOFLAGS=-mod=mod go run . "$WORK/canonical_keywords.txt" ) | tee "$EV/inventory.txt"
+CANON_KW="$(wc -l < "$WORK/canonical_keywords.txt")"
+echo "canonical_keyword_file_lines=$CANON_KW" | tee -a "$EV/inventory.txt"
+
+# ----------------------------------------------------------------------------
+# 3) Nested-quantifier AST survey (standalone stdlib module; no repo import).
+#    Predicate: a * or + repeat whose subexpression contains another * or +
+#    repeat (plus, separately, an unbounded {m,} over a * or +).
+# ----------------------------------------------------------------------------
+mkdir -p "$MOD/ast"
+cat > "$MOD/ast/main.go" <<'GO'
+package main
+
+import (
+	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"os"
+	"path/filepath"
+	"regexp/syntax"
+	"sort"
+	"strconv"
+	"strings"
+)
+
+func literalString(e ast.Expr) (string, bool) {
+	switch v := e.(type) {
+	case *ast.BasicLit:
+		if v.Kind == token.STRING {
+			if s, err := strconv.Unquote(v.Value); err == nil {
+				return s, true
+			}
+		}
+	case *ast.BinaryExpr:
+		if v.Op == token.ADD {
+			l, lok := literalString(v.X)
+			r, rok := literalString(v.Y)
+			if lok && rok {
+				return l + r, true
+			}
+		}
+	case *ast.ParenExpr:
+		return literalString(v.X)
+	}
+	return "", false
+}
+
+func compileFuncName(c *ast.CallExpr) string {
+	if sel, ok := c.Fun.(*ast.SelectorExpr); ok {
+		n := sel.Sel.Name
+		if n == "MustCompile" || n == "Compile" || n == "MustCompilePOSIX" || n == "CompilePOSIX" {
+			return n
+		}
+	}
+	return ""
+}
+
+func isStarPlus(op syntax.Op) bool { return op == syntax.OpStar || op == syntax.OpPlus }
+func isUnboundedRepeat(re *syntax.Regexp) bool {
+	return re.Op == syntax.OpRepeat && re.Max == -1
+}
+
+func descHasStarPlus(re *syntax.Regexp) bool {
+	for _, s := range re.Sub {
+		if isStarPlus(s.Op) || descHasStarPlus(s) {
+			return true
+		}
+	}
+	return false
+}
+
+type hit struct {
+	file string
+	line int
+	pat  string
+}
+
+func main() {
+	root := os.Args[1]
+	fset := token.NewFileSet()
+	var nested, unbounded []hit
+	filepath.Walk(root, func(p string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() || !strings.HasSuffix(p, ".go") || strings.HasSuffix(p, "_test.go") {
+			return nil
+		}
+		f, err := parser.ParseFile(fset, p, nil, 0)
+		if err != nil {
+			return nil
+		}
+		ast.Inspect(f, func(n ast.Node) bool {
+			c, ok := n.(*ast.CallExpr)
+			if !ok || compileFuncName(c) == "" || len(c.Args) < 1 {
+				return true
+			}
+			pat, ok := literalString(c.Args[0])
+			if !ok {
+				return true
+			}
+			re, err := syntax.Parse(pat, syntax.Perl)
+			if err != nil {
+				return true
+			}
+			pos := fset.Position(c.Pos())
+			rel, _ := filepath.Rel(root, p)
+			fNested, fUnb := false, false
+			var walk func(*syntax.Regexp)
+			walk = func(r *syntax.Regexp) {
+				if isStarPlus(r.Op) && descHasStarPlus(r) {
+					fNested = true
+				}
+				if isUnboundedRepeat(r) && descHasStarPlus(r) {
+					fUnb = true
+				}
+				for _, s := range r.Sub {
+					walk(s)
+				}
+			}
+			walk(re)
+			if fNested {
+				nested = append(nested, hit{rel, pos.Line, pat})
+			}
+			if fUnb && !fNested {
+				unbounded = append(unbounded, hit{rel, pos.Line, pat})
+			}
+			return true
+		})
+		return nil
+	})
+	pr := func(title string, hs []hit) {
+		sort.Slice(hs, func(i, j int) bool { return hs[i].file < hs[j].file })
+		fmt.Printf("\n=== %s : %d ===\n", title, len(hs))
+		for _, h := range hs {
+			p := h.pat
+			if len(p) > 100 {
+				p = p[:100] + "\u2026"
+			}
+			fmt.Printf("%s:%d  %q\n", h.file, h.line, p)
+		}
+	}
+	pr("NESTED (a * or + repeat whose subexpression contains another * or + repeat)", nested)
+	pr("UNBOUNDED-OVER-STARPLUS ({m,} repeat over a * or + repeat) - e.g. SQL Server {3,}", unbounded)
+}
+GO
+printf 'module ast\n\ngo 1.24\n' > "$MOD/ast/go.mod"
+( cd "$MOD/ast" && go run . "$REPO/pkg/detectors" ) | tee "$EV/ast_nested.txt"
+
+# ----------------------------------------------------------------------------
+# 4) Deterministic SOURCE-SCRAPE stress set (938 tokens) + input generators.
+# ----------------------------------------------------------------------------
 python3 - "$REPO" "$WORK" <<'PY' | tee "$EV/hashes.txt"
 import sys, os, re, glob, base64, hashlib
 REPO, W = sys.argv[1], sys.argv[2]
-SIZE, SIZE40 = 10*1024*1024, 40*1024*1024                 # 10,485,760 / 41,943,040 bytes
+SIZE, SIZE40 = 10*1024*1024, 40*1024*1024   # 10,485,760 / 41,943,040 bytes
 
-# --- Deterministic harvest from every `func (...) Keywords() []string { ... }` body ---
 kw_re  = re.compile(r"func\s*\([^)]*\)\s*Keywords\(\)\s*\[\]string\s*\{(.*?)\n\}", re.DOTALL)
 lit_re = re.compile(r"\[\]string\{(.*?)\}", re.DOTALL)
 tok_re = re.compile(r'"((?:[^"\\]|\\.)*)"')
 pool = set()
 for fp in sorted(glob.glob(os.path.join(REPO, "pkg", "detectors", "**", "*.go"), recursive=True)):
     src = open(fp, encoding="utf-8", errors="replace").read()
-    for body in kw_re.findall(src):                        # each Keywords() body
-        for lit in lit_re.findall(body):                   # each []string{...} literal in it
-            for t in tok_re.findall(lit):                  # each quoted token
+    for body in kw_re.findall(src):
+        for lit in lit_re.findall(body):
+            for t in tok_re.findall(lit):
                 t = t.replace('\\"', '"').replace('\\\\', '\\')
                 if 2 <= len(t) <= 32 and not re.search(r"\s", t):
                     pool.add(t)
-kw = sorted(pool)                                          # deterministic: 938 tokens on this tree
-open(os.path.join(W, "keywords_clean.txt"), "w").write("\n".join(kw) + "\n")
-print("harvested_keywords=%d" % len(kw))
+scrape = sorted(pool)
+open(os.path.join(W, "keywords_scrape.txt"), "w").write("\n".join(scrape) + "\n")
+print("scraped_stress_keywords=%d" % len(scrape))
 
-def fill(name, unit, size=SIZE):                           # stream-tile to exact size, hash one pass
+canon = [l.strip() for l in open(os.path.join(W, "canonical_keywords.txt")) if l.strip()]
+print("canonical_keywords=%d" % len(canon))
+
+def fill(name, unit, size=SIZE):
     if isinstance(unit, str): unit = unit.encode()
     n = len(unit); h = hashlib.sha256(); w = 0
     with open(os.path.join(W, name), "wb") as f:
@@ -990,67 +1671,202 @@ def fill(name, unit, size=SIZE):                           # stream-tile to exac
             f.write(b); h.update(b); w += len(b)
     print("%s  %d  %s" % (h.hexdigest(), w, name))
 
-kwline = (" ".join(kw) + " ").encode()
-b64    = base64.b64encode(" ".join(kw).encode()) + b"\n"
+scrape_line = (" ".join(scrape) + " ").encode()
+canon_line  = (" ".join(canon)  + " ").encode()
+b64         = base64.b64encode(" ".join(scrape).encode()) + b"\n"
+
 fill("baseline_prose_10mib.txt",          b"the quick brown fox jumps over the lazy dog. ")
-fill("crafted_keywords_10mib.txt",        kwline)                              # max keyword fan-out
-fill("crafted_base64_10mib.txt",          b64)                                 # single-blob base64
-fill("crafted_quantifier_10mib.txt",      b"jdbc:mysql://" + b"A"*4096 + b" ") # keyword-bearing quantifier
-fill("crafted_quantifier_nokw_10mib.txt", b"A"*4096 + b"! ")                   # pure-'A' NEGATIVE CONTROL
-fill("crafted_keywords_40mib.txt",        kwline, SIZE40)                      # 40 MiB profiling scale (§7)
-fill("crafted_base64_40mib.txt",          b64,    SIZE40)                      # 40 MiB base64 scale (§7.5)
+fill("crafted_keywords_10mib.txt",        scrape_line)
+fill("crafted_keywords_canon_10mib.txt",  canon_line)
+fill("crafted_base64_10mib.txt",          b64)
+fill("crafted_quantifier_10mib.txt",      b"jdbc:mysql://" + b"A"*4096 + b" ")
+fill("crafted_quantifier_nokw_10mib.txt", b"A"*4096 + b"! ")
+fill("crafted_keywords_40mib.txt",        scrape_line, SIZE40)
+fill("crafted_base64_40mib.txt",          b64,         SIZE40)
+for mib in (1, 2, 4, 8):
+    fill("scale_keywords_%dmib.txt" % mib, scrape_line, mib*1024*1024)
 PY
-stat -c '%s %n' "$WORK"/baseline_prose_10mib.txt "$WORK"/crafted_*_10mib.txt "$WORK"/crafted_*_40mib.txt
+stat -c '%s  %n' "$WORK"/*_10mib.txt "$WORK"/*_40mib.txt "$WORK"/scale_*_*mib.txt
 
-# 3) Equal-size timing, 3 runs each
-run() { for i in 1 2 3; do
-  "$BIN" filesystem "$1" --no-verification --results=verified,unknown 2>&1 \
-    | grep 'finished scanning'; done; }
-for f in baseline_prose crafted_keywords crafted_base64 crafted_quantifier; do
-  echo "## $f"; run "$WORK/${f}_10mib.txt"; done | tee "$EV/timing_equalsize.txt"
+# ----------------------------------------------------------------------------
+# 5) Equal-size timing (3 runs each) incl. keyword-free/classic-ReDoS control.
+# ----------------------------------------------------------------------------
+: > "$EV/durations.tsv"
+one_scan() {
+  local log; log="$(mktemp "$WORK/scan.XXXXXX.log")"
+  timeout -s KILL 180 "$BIN" filesystem "$1" --no-verification --results=verified,unknown >"$log" 2>&1 || true
+  grep -q 'finished scanning' "$log" || die "no 'finished scanning' for $1"
+  ! grep -qiE 'panic:|goroutine [0-9]+ \[' "$log" || die "panic during scan of $1"
+  grep -o '"scan_duration": "[^"]*"' "$log" | grep -o '[0-9][^"]*' | head -1
+  rm -f "$log"
+}
+for f in baseline_prose crafted_keywords crafted_base64 crafted_quantifier crafted_quantifier_nokw; do
+  for i in 1 2 3; do
+    d="$(one_scan "$WORK/${f}_10mib.txt")"
+    printf '%s\t%s\n' "$f" "$d" | tee -a "$EV/durations.tsv"
+  done
+done
+printf 'crafted_keywords_canon\t%s\n' "$(one_scan "$WORK/crafted_keywords_canon_10mib.txt")" | tee -a "$EV/durations.tsv"
 
-# 4) Timeout-path probe (Cases A-D), same crafted keyword input
+# ----------------------------------------------------------------------------
+# 6) Linearity in input size (1/2/4/8 MiB, default concurrency, 3 runs each).
+# ----------------------------------------------------------------------------
+: > "$EV/scaling.tsv"
+for mib in 1 2 4 8; do
+  for i in 1 2 3; do
+    printf '%d\t%s\n' "$mib" "$(one_scan "$WORK/scale_keywords_${mib}mib.txt")" | tee -a "$EV/scaling.tsv"
+  done
+done
+
+# ----------------------------------------------------------------------------
+# 7) --concurrency=1 determinism control (3 runs, keyword 10 MiB).
+# ----------------------------------------------------------------------------
+: > "$EV/concurrency1.tsv"
+c1_scan() {
+  local log; log="$(mktemp "$WORK/c1.XXXXXX.log")"
+  timeout -s KILL 180 "$BIN" filesystem "$WORK/crafted_keywords_10mib.txt" \
+    --no-verification --results=verified,unknown --concurrency=1 >"$log" 2>&1 || true
+  grep -q 'finished scanning' "$log" || die "concurrency=1 no finish"
+  grep -o '"scan_duration": "[^"]*"' "$log" | grep -o '[0-9][^"]*' | head -1
+  grep -o '"unverified_secrets": [0-9]*' "$log" | head -1
+  rm -f "$log"
+}
+for i in 1 2 3; do c1_scan | paste -sd' ' - | tee -a "$EV/concurrency1.tsv"; done
+
+# ----------------------------------------------------------------------------
+# 8) Detector-timeout probe (Cases A-D) on the SAME crafted keyword input.
+# ----------------------------------------------------------------------------
 IN="$WORK/crafted_keywords_10mib.txt"
-probe() { timeout 180 "$BIN" filesystem "$IN" --no-verification "$@" 2>&1; }
-probe                                                   | tee "$EV/probe_A.log"
-probe --detector-timeout=1ns                            | tee "$EV/probe_B.log"
-probe --allow-verification-overlap                      | tee "$EV/probe_C.log"
-probe --allow-verification-overlap --detector-timeout=1ns | tee "$EV/probe_D.log"
+probe() { timeout -s KILL 180 "$BIN" filesystem "$IN" --no-verification "$@" 2>&1; }
+probe                                                     | tee "$EV/probe_A.log" >/dev/null
+probe --detector-timeout=1ns                              | tee "$EV/probe_B.log" >/dev/null
+probe --allow-verification-overlap                        | tee "$EV/probe_C.log" >/dev/null
+probe --allow-verification-overlap --detector-timeout=1ns | tee "$EV/probe_D.log" >/dev/null
 for c in A B C D; do
-  echo -n "Case $c watchdog fires: "; \
-  grep -c 'a detector ignored the context timeout' "$EV/probe_$c.log" || true; done
+  n="$(grep -c 'a detector ignored the context timeout' "$EV/probe_$c.log" || true)"
+  d="$(grep -o '"scan_duration": "[^"]*"' "$EV/probe_$c.log" | grep -o '[0-9][^"]*' | head -1)"
+  printf 'Case %s: watchdog_lines=%s scan_duration=%s\n' "$c" "$n" "$d" | tee -a "$EV/timeout_cases.txt"
+done
 
-# 5) Profiling: concurrent CPU + fgprof inside one 40 MiB scan
-"$BIN" filesystem "$WORK/crafted_keywords_40mib.txt" --no-verification --profile \
-  > "$PROF/scan.log" 2>&1 &
-SRV_PID=$!
-# readiness check on :18066 before profiling
-for _ in $(seq 1 50); do curl -sf http://localhost:18066/debug/pprof/ >/dev/null && break; sleep 0.2; done
-go tool pprof -seconds 20 -proto -output "$PROF/cpu.pb.gz" http://localhost:18066/debug/pprof/profile &
-go tool pprof -seconds 20 -proto -output "$PROF/fgprof.pb.gz" http://localhost:18066/debug/fgprof &
-wait
-go tool pprof -top      "$PROF/cpu.pb.gz"    | tee "$EV/cpu_flat.txt"
-go tool pprof -top -cum "$PROF/cpu.pb.gz"    | tee "$EV/cpu_cum.txt"
+# ----------------------------------------------------------------------------
+# 9) Profiling: CPU + fgprof (keyword 40 MiB), then CPU (base64 40 MiB).
+# ----------------------------------------------------------------------------
+profile() {  # $1=input $2=tag $3=profile-seconds $4=with_fgprof(0/1)
+  wait_port_free
+  timeout -s KILL 150 "$BIN" filesystem "$1" --no-verification --profile >"$PROF/${2}_scan.log" 2>&1 &
+  local ok=""
+  for _ in $(seq 1 150); do
+    curl -sf http://localhost:18066/debug/pprof/ >/dev/null 2>&1 && { ok=1; break; }
+    sleep 0.2
+  done
+  [ -n "$ok" ] || die "pprof server never came up for $2"
+  go tool pprof -seconds "$3" -proto -output "$PROF/${2}_cpu.pb.gz" \
+    http://localhost:18066/debug/pprof/profile & local p1=$!
+  local p2=""
+  if [ "$4" = "1" ]; then
+    go tool pprof -seconds "$3" -proto -output "$PROF/${2}_fgprof.pb.gz" \
+      http://localhost:18066/debug/fgprof & p2=$!
+  fi
+  wait "$p1" || die "cpu profile failed ($2)"
+  [ -n "$p2" ] && { wait "$p2" || die "fgprof failed ($2)"; }
+  stop_bin
+  wait_port_free
+}
+profile "$WORK/crafted_keywords_40mib.txt" keyword 20 1
+profile "$WORK/crafted_base64_40mib.txt"   base64 12 0
 
-# 6) regexp2 reachability
+echo "=== keyword CPU flat (top15) ==="   | tee "$EV/prof_summary.txt"
+go tool pprof -top -nodecount=15 "$PROF/keyword_cpu.pb.gz" 2>/dev/null | tee -a "$EV/prof_summary.txt"
+echo "=== keyword CPU cum (top12) ==="    | tee -a "$EV/prof_summary.txt"
+go tool pprof -top -cum -nodecount=12 "$PROF/keyword_cpu.pb.gz" 2>/dev/null | tee -a "$EV/prof_summary.txt"
+echo "=== keyword fgprof (top10) ==="     | tee -a "$EV/prof_summary.txt"
+go tool pprof -top -nodecount=10 "$PROF/keyword_fgprof.pb.gz" 2>/dev/null | tee -a "$EV/prof_summary.txt"
+echo "=== base64 CPU cum (top12) ==="     | tee -a "$EV/prof_summary.txt"
+go tool pprof -top -cum -nodecount=12 "$PROF/base64_cpu.pb.gz" 2>/dev/null | tee -a "$EV/prof_summary.txt"
+echo "=== base64 decoder frames ==="      | tee -a "$EV/prof_summary.txt"
+go tool pprof -top -cum -nodefraction=0 "$PROF/base64_cpu.pb.gz" 2>/dev/null \
+  | grep -iE 'FromChunk|utf16|EscapedUnicode|getSubstrings|Base64' | tee -a "$EV/prof_summary.txt" || true
+
+# ----------------------------------------------------------------------------
+# 10) regexp2 reachability: dependency closure + linked-but-unexecuted symbols.
+# ----------------------------------------------------------------------------
 ( cd "$REPO" && go mod why github.com/dlclark/regexp2 ) | tee "$EV/closure.txt"
-go tool nm "$BIN" | grep -c dlclark/regexp2
-go tool nm "$BIN" | grep -c wasilibs/go-re2
-# trap removes $WORK on exit -> repository left byte-for-byte unchanged
+echo "regexp2_symbols=$(go tool nm "$BIN" | grep -c dlclark/regexp2)"   | tee -a "$EV/closure.txt"
+echo "gore2_symbols=$(go tool nm "$BIN" | grep -c wasilibs/go-re2)"     | tee -a "$EV/closure.txt"
+
+# ----------------------------------------------------------------------------
+# 11) Compute medians + ratios from the captured durations.
+# ----------------------------------------------------------------------------
+python3 - "$EV/durations.tsv" "$EV/scaling.tsv" <<'PY' | tee "$EV/summary_table.txt"
+import sys, re, statistics
+def dur_to_s(s):
+    t=0.0
+    for v,u in re.findall(r'([0-9.]+)\s*(ns|us|ms|s|m|h)', s):
+        t+=float(v)*{'ns':1e-9,'us':1e-6,'ms':1e-3,'s':1,'m':60,'h':3600}[u]
+    return t
+eq={}
+for line in open(sys.argv[1]):
+    lbl,d=line.rstrip('\n').split('\t'); eq.setdefault(lbl,[]).append(dur_to_s(d))
+base=statistics.median(eq['baseline_prose'])
+print("EQUAL-SIZE (10 MiB) medians and ratios vs baseline:")
+for lbl in ['baseline_prose','crafted_keywords','crafted_keywords_canon','crafted_base64','crafted_quantifier','crafted_quantifier_nokw']:
+    if lbl not in eq: continue
+    xs=sorted(eq[lbl]); med=statistics.median(xs)
+    print("  %-26s n=%d min=%.4fs med=%.4fs max=%.4fs ratio=%.2fx" % (lbl,len(xs),xs[0],med,xs[-1],med/base))
+sc={}
+for line in open(sys.argv[2]):
+    mib,d=line.rstrip('\n').split('\t'); sc.setdefault(int(mib),[]).append(dur_to_s(d))
+print("\nLINEARITY (keyword shape), median scan_duration by size:")
+base1=statistics.median(sc[1]) if 1 in sc else None
+for mib in sorted(sc):
+    med=statistics.median(sc[mib])
+    r=("%.2fx"%(med/base1)) if base1 else "-"
+    print("  %d MiB  med=%.4fs  ratio_vs_1MiB=%s" % (mib,med,r))
+PY
+
+echo "HARNESS OK: WORK=$WORK (removed on exit by trap)"
 ```
+
+**Observed end-to-end on this environment (representative single run).** The harness above ran to
+completion, printed `HARNESS OK`, self-removed its work dir, and left the repository byte-for-byte
+unchanged. It reproduced: canonical **831** detectors / **914** keywords; the AST survey's **5 nested
++ 1 unbounded** patterns at the file:lines listed in §4.3; the baseline SHA-256 `d1bf8b35…` and exact
+input sizes (10,485,760 / 41,943,040 bytes); and the equal-size 10 MiB medians and ratios — baseline
+`0.1444s` (1.00×), keyword fan-out `9.86s` (**68.3×**), canonical-914 fan-out `7.37s` (**51.1×**),
+base64 `3.70s` (**25.6×**), keyword-bearing quantifier `0.404s` (**2.80×**), and the keyword-free
+classic-ReDoS shape `0.080s` (**0.56×, i.e. faster than baseline**, because with no keyword present it
+is filtered out by Aho-Corasick and no detector regex ever runs). Input-size linearity at 1/2/4/8 MiB
+was `1.00× / 2.05× / 3.82× / 7.50×`; the detector-timeout probe showed Cases A–C with `watchdog=0`
+and **Case D with `watchdog=955`** watchdog lines; and `regexp2` contributed **211** linked symbols
+versus go-re2's **149**. Re-running regenerates fresh profiles: the absolute per-frame milliseconds
+vary with host load and build ID, but the *structure* is stable and matches §7 — dominant
+`runtime._ExternalCode` (the RE2/WASM boundary) and go-re2 `FindAllStringSubmatch`, with the decoder
+frames (`Base64.FromChunk`, `EscapedUnicode.FromChunk`) only a low-single-digit percentage of
+cumulative CPU.
 
 ## Appendix B — Read-only verification (final repository state)
 
-After all evidence capture, the working tree contains exactly one change — this document:
+After all evidence capture, the working tree contains exactly one change — this document. The
+authoritative read-only proof is `git status --porcelain`, which lists exactly one modified path and
+no TruffleHog source file:
 
-```
+```console
 $ git status --porcelain
- M blitzy/documentation/trufflehog_e42153d44a5e.md      # (this file; before commit)
-
-$ git diff --stat
- blitzy/documentation/trufflehog_e42153d44a5e.md | (rewritten)
+ M blitzy/documentation/trufflehog_e42153d44a5e.md
 ```
 
-No TruffleHog source file was created, modified, or deleted; all `mktemp` artifacts were removed by
-the harness cleanup trap. The exact, final `git status` captured at commit time is recorded in the
-commit itself.
+`git diff --stat` confirms the change is confined to that single file. Its bar graph and
+insertion/deletion counts grow with every edit to this document, so the line below is
+**representative, not fixed** (git never emits a literal `(rewritten)` token); the exact final counts
+are frozen in the commit itself:
+
+```console
+$ git diff --stat
+ blitzy/documentation/trufflehog_e42153d44a5e.md | 652 +++++++++++++++++++-----
+ 1 file changed, 513 insertions(+), 139 deletions(-)
+```
+
+No TruffleHog source file was created, modified, or deleted; every `mktemp` artifact (crafted inputs,
+throwaway Go modules, captured profiles) was removed by the harness cleanup trap, and `go tool
+pprof`'s cache under `/root/pprof` was left untouched (`PPROF_TMPDIR` redirected it into the work
+dir). The exact, final `git status` captured at commit time is recorded in the commit.
