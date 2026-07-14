@@ -136,6 +136,8 @@ TruffleHog dispatched `POST /latest/meta-data/iam/security-credentials/` with th
 
 ## Q2 — TLS certificate validation / man-in-the-middle
 
+**User question:** *"When verification requests are made over HTTPS, what certificate validation does TruffleHog perform? Could a network-path attacker intercept the traffic?"*
+
 **Direct answer.** Over HTTPS the webhook performs **full, standard TLS verification** — Go's `crypto/tls` defaults: the server chain is validated against the **host's system CA store** *and* the hostname/SAN is checked. The `unsafe` flag does **not** weaken this (it governs only the `http://` scheme gate). Therefore a passive or active network-path attacker **cannot** intercept HTTPS verification on the direct hop **unless they already hold a certificate that chains to a CA in the host's trust store (or have compromised that store)**. Two important qualifiers below the headline: (1) there is **no certificate pinning** for webhooks, so *any* CA the host trusts — including a corporate/MITM interception CA — is accepted; and (2) TruffleHog **follows HTTP redirects**, and a `307`/`308` from the configured HTTPS endpoint to an `http://` URL causes the **secret (and any configured `Authorization` header) to be re-sent over cleartext** — an attacker-triggerable downgrade that a config author controls.
 
 All results below use a threaded HTTPS mock that counts **app-layer requests** (handshake completed) separately from **TLS handshake failures**; each case run twice.
@@ -202,6 +204,8 @@ Plaintext P2 headers on the 307 hop: `User-Agent: TruffleHog`, **`Authorization:
 ---
 
 ## Q3 — Verification multiplicity and rate limiting
+
+**User question:** *"When a detector has multiple matching patterns in the same file, does it verify once or something more complex? Is there any limit on how many requests can be triggered?"*
 
 **Direct answer.** When a detector matches multiple patterns, it does **not** verify "once." It fires **one verification attempt per _permutation_**, where a permutation is one selection from the **Cartesian product** of the per‑named‑regex match lists found **within a single match span**. There **is** a limit, but it is **not** a global cap of 100: `maxTotalMatches = 100` clamps the permutation count **inside one `productIndices` call — i.e. per span (per `FromData` invocation)**, and a single file produces **many** spans (one per keyword region, merged) across **one or more** chunks. Consequently the total number of outbound requests a file can trigger is **unbounded by 100** and is governed by the formula below. There is **no throttling, no inter‑request delay, and no token‑bucket/rate‑limit anywhere** in the path.
 
@@ -451,6 +455,8 @@ Found unverified result 🐷🔑❓        # NOT verified — only ==200 verifie
 
 ## Q5 — ReDoS / regex safety
 
+**User question:** *"How does TruffleHog handle a complex/custom regex pattern? Are there safeguards around regex execution?"*
+
 **Direct answer.** Custom detector patterns are compiled and executed with **Go's standard-library `regexp` package** [`import "regexp"`, `pkg/custom_detectors/custom_detectors.go:9`], whose engine uses **RE2 *syntax* and RE2's linear-time matching guarantee — no backtracking and no backreferences**. (It is Go's own pure-Go implementation of those principles, **not** a separately linked C++ RE2 library.) Because matching is a finite-automaton walk with time **linear in the input length**, there is **no pattern shape that can trigger catastrophic backtracking**, so the classic ReDoS class does not apply to this path. This is confirmed two ways below. The safety derives from the **engine**, not from the detection timeout or `MaxSecretSize` (those bound the *input*, and the context does not interrupt a running synchronous match — see the note).
 
 ### Condition A — an "evil" pattern stays flat as input grows [OBSERVED]
@@ -473,7 +479,7 @@ N(a's)   evil_wall(s)   benign_wall(s)   evil-benign
 
 Cause→effect: the evil-pattern wall time is **flat (~1.9–2.0 s) across an 8× input increase** and is **indistinguishable from the benign control** (`evil − benign ≈ 0`, within ±0.2 s scheduling noise). The ~1.9–2.0 s is fixed process/scan startup, so regex execution cost is negligible. A backtracking engine would exhaust minutes-to-eternity on `(a+)+$` at only a few dozen `a`s; TruffleHog processes **8000** `a`s in the same time as a trivial pattern — the signature of RE2 linear-time matching. **End-to-end vs isolated:** these are end-to-end scan times; the benign-control subtraction isolates the regex contribution to ≈ 0.
 
-### Condition C — a backreference is rejected at config load [OBSERVED]
+### Condition B — a backreference is rejected at config load [OBSERVED]
 
 RE2 does not support backreferences; Go's `regexp.Compile` therefore rejects them, and `ValidateRegex` compiles every pattern at load time [`pkg/custom_detectors/validation.go:23-33`].
 
@@ -488,13 +494,13 @@ Control: a valid pattern `(a)a` loads and scans normally (`exit_code=0`, no erro
 ### Where and how the regex runs (mechanism + citations)
 
 - Each named pattern is compiled with `regexp.Compile` [`custom_detectors.go:92`] and executed with `FindAllStringSubmatch` [`custom_detectors.go:97`] against the **span** passed to `FromData` — **not** the whole file. The default span is bounded by `MaxSecretSize()=1000` (+ keyword radius 512) [`custom_detectors.go:180-182`; `pkg/engine/ahocorasick/ahocorasickcore.go:80-113`]; `--scan-entire-chunk` widens the span to the whole chunk (≤ `ChunkSize` 10240).
-- Patterns are validated (compiled) at load time [`validation.go:23-33`], so a malformed/unsupported pattern fails fast (Condition C).
+- Patterns are validated (compiled) at load time [`validation.go:23-33`], so a malformed/unsupported pattern fails fast (Condition B).
 
 **Correcting the "safeguards."** The detection **timeout is not a regex-execution safeguard**: the 10 s per-span context is checked only via `common.IsDone(ctx)` **before** dispatch/verification [`custom_detectors.go:185,224`], never mid-match, so it cannot interrupt a synchronous `FindAllStringSubmatch` in progress. This is corroborated by the watchdog message `"a detector ignored the context timeout"` observed in the Q3/C3 evidence — the context timeout only *logs*, it does not preempt the running goroutine [`pkg/engine/engine.go:1067`] [INFERRED for a slow-regex case (RE2 cannot be made slow) + CORROBORATED by the observed watchdog]. Likewise `MaxSecretSize` bounds the **input length**, it is not a backtracking guard. The actual protection is the **RE2 linear-time engine**.
 
-**Scope.** "ReDoS" here means **catastrophic regex backtracking**, which RE2 structurally eliminates (Conditions A, C). This is distinct from the *permutation-count* config-DoS documented under Q3/C3 (which is a `productIndices` integer-overflow hang, unrelated to regex matching time).
+**Scope.** "ReDoS" here means **catastrophic regex backtracking**, which RE2 structurally eliminates (Conditions A, B). This is distinct from the *permutation-count* config-DoS documented under Q3/C3 (which is a `productIndices` integer-overflow hang, unrelated to regex matching time).
 
-**Coverage:** How are custom regexes handled? **Compiled+executed by Go stdlib `regexp` (RE2, linear-time)** on the span. Safeguards around execution? **The engine itself (no backtracking, no backreferences)** — validated at load (C), demonstrated linear at runtime (A); the timeout/`MaxSecretSize` bound input but do not guard matching.
+**Coverage:** How are custom regexes handled? **Compiled+executed by Go stdlib `regexp` (RE2, linear-time)** on the span. Safeguards around execution? **The engine itself (no backtracking, no backreferences)** — validated at load (B), demonstrated linear at runtime (A); the timeout/`MaxSecretSize` bound input but do not guard matching.
 
 ---
 
@@ -928,16 +934,18 @@ echo "=== request captured at fake standing in for 169.254.169.254 ==="
 sed 's/^/  /' "$LOG"
 ```
 
-**Repository-integrity proof.** Before and after the investigation:
+**Repository-integrity proof.** The source tree is left byte-for-byte unchanged; the only file this task adds is this document. Rather than embed a volatile working-HEAD short hash — which advances every time this document is committed and therefore cannot be reproduced afterward — the checks below are **durable**: they hold on any committed revision that contains this document, because the only path that ever differs from the frozen baseline `e42153d44a5e` is the deliverable itself.
 
 ```
-$ git -C <checkout> rev-parse --short HEAD
-a00a1112             # working HEAD (short); frozen baseline e42153d44a5e is an ancestor
 $ git -C <checkout> status --porcelain
-                     # empty → working tree clean; no source file created, edited, or deleted
+# (no output) → working tree clean; no source file created, edited, or deleted
+$ git -C <checkout> diff e42153d44a5e --name-status
+A	blitzy/documentation/trufflehog_e42153d44a5e.md
+$ git -C <checkout> merge-base --is-ancestor e42153d44a5e HEAD && echo "e42153d44a5e is an ancestor of HEAD"
+e42153d44a5e is an ancestor of HEAD
 ```
 
-The only file added by this task is this document, `blitzy/documentation/trufflehog_e42153d44a5e.md`.
+The frozen baseline `e42153d44a5e` is a permanent ancestor of every revision on this branch, so the single-path `diff … --name-status` and the empty `status --porcelain` above reproduce on any committed revision of the document; only the working-HEAD short hash advances with each commit, making it an investigation-time snapshot rather than a fixed reproducible value. The only file added by this task is this document, `blitzy/documentation/trufflehog_e42153d44a5e.md`.
 
 ---
 
