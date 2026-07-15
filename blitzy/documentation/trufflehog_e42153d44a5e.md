@@ -12,7 +12,7 @@
 
 - **ReDoS (catastrophic backtracking): NOT VULNERABLE.** TruffleHog compiles **865 production** detector patterns (plus 2 test files) with `github.com/wasilibs/go-re2` ([go.mod:L100]) and the remaining **3 production** detectors with Go's standard‑library `regexp`. Both are **RE2‑lineage engines that do not do unbounded backtracking**, so the "nested quantifier" constructs (`(x+)+`, overlapping alternation, `.*` around quantified groups) that are catastrophic under PCRE‑style engines cannot blow up here. This is confirmed three ways: (a) a size sweep showing **clean linear scaling** (§7.4); (b) maximally‑adversarial nested‑quantifier inputs completing in **sub‑second** time even at 8 MiB (§7.1–7.2); and (c) an engine‑contrast benchmark in which the two engines TruffleHog uses stay in the **microsecond** range while a genuine backtracking engine explodes exponentially (§7.6).
 
-- **Residual, *linear* (non‑catastrophic) degradation: YES, and worth noting for CI.** Because a scan's cost grows with the number of *matches* it must extract and report, an attacker who commits a large file of **unique, synthetic, credential‑shaped strings** (no real secret required — verification is off) can force TruffleHog to do a lot of match‑extraction and finding‑emission work. Measured: an **8 MiB** such file produced **201,431 findings** in **~5.6 s**, and **16 MiB → 402,901 findings in ~10.3 s** — i.e. **~0.66 s/MiB, growing linearly**. That is **~62×** slower than an equivalent‑size file that misses the keyword prefilter (§6). This is *bounded and linear*, not a hang; but on a large enough committed file it could push a fixed CI step past its timeout, and it floods the findings output. Note that TruffleHog **de‑duplicates identical matches**, so naïve repetition of one string is cheap (§3); the attacker must make each match *unique* to defeat the LRU cache.
+- **Residual, *linear* (non‑catastrophic) degradation: YES, and worth noting for CI.** Because a scan's cost grows with the number of *matches* it must extract and report, an attacker who commits a large file of **unique, synthetic, credential‑shaped strings** (no real secret required — verification is off) can force TruffleHog to do a lot of match‑extraction and finding‑emission work. Measured: an **8 MiB** such file produced **201,431 findings** in **~5.6 s**, and **16 MiB → 402,901 findings in ~10.3 s** — i.e. **~0.66 s/MiB, growing linearly**. That is **~62×** slower than an equivalent‑size file that misses the keyword prefilter (§6). This is *bounded and linear*, not a hang; but on a large enough committed file it could push a fixed CI step past its timeout, and it floods the findings output. Note that TruffleHog **de‑duplicates identical matches** only on the *output* side (collapsing emitted findings), **not** in cost: because `url.Parse` runs on every raw match *before* the dedup map ([mongodb.go:L49], [mongodb.go:L58], [mongodb.go:L81]), even naïve repetition of one string already amplifies (**~34×** baseline, **~3.0 s** at 8 MiB; §3, §6.2). Making each match *unique* amplifies *further* (~62×) by defeating the LRU cache on the reporting side, but it is **not required** to force a large (still linear, bounded) slowdown.
 
 - **Which patterns are exploitable for catastrophic blow‑up: NONE** (§5). The nested‑quantifier patterns an attacker would target — MongoDB `connStrPat` ([pkg/detectors/mongodb/mongodb.go:L32]), URI `keyPat` ([pkg/detectors/uri/uri.go:L33]), `databrickstoken` ([pkg/detectors/databrickstoken/databrickstoken.go:L27]), `azuresastoken` ([pkg/detectors/azuresastoken/azuresastoken.go:L32]) — all complete in **≤ ~1.1 s on 8 MiB** of purpose‑built adversarial input, whether the payload matches or fails, and whether or not the per‑keyword span window is bypassed with `--scan-entire-chunk`.
 
@@ -65,7 +65,7 @@ CGO_ENABLED=0 go build -o /tmp/trufflehog .
 
 **The realistic residual risk — a *linear* finding‑flood.** A scan's cost is dominated by how many *matches* it extracts and reports, not by regex execution. An attacker does **not** need a real secret: with `--no-verification` (the norm for a fast CI pass), every credential‑*shaped* string becomes an `unverified_secrets` finding. Two facts shape the attack:
 
-1. **Identical matches are de‑duplicated.** A file repeating the *same* connection string 131,072 times produced only **820** findings (one per chunk after LRU de‑duplication) and scanned in **~136 ms** at 8 MiB (§7.2). So naïve repetition is cheap.
+1. **Identical matches are de‑duplicated on *output*, but not in cost.** A file repeating the *same* connection string 131,072 times produces only **820** *emitted* findings (one per chunk after LRU de‑duplication) — yet it still scans in **~3.0 s** at 8 MiB (n = 7 median; §7.2), because `url.Parse` runs on *every* raw match *before* the dedup map ([mongodb.go:L49], [mongodb.go:L58], [mongodb.go:L81]). So naïve repetition is **not** cheap (~34× baseline); the attacker does **not** need unique matches to force a large — but still linear and bounded — slowdown.
 2. **Unique matches defeat the cache.** A file of **unique** synthetic strings (each with a distinct username/host counter) produced **201,431** findings at 8 MiB and scanned in **~5.6 s** — and **402,901 findings / ~10.3 s** at 16 MiB (§7.4). The cost is **~0.66 s/MiB and grows linearly**.
 
 At **~62×** the equivalent‑size prefilter‑miss baseline (§6), this is the largest slowdown we could manufacture. It is a **linear resource‑consumption** effect: bounded, proportional to file size, and — because verification is off — composed entirely of *fabricated* findings. On a CI runner with a fixed per‑step timeout, a large enough committed file (tens of MiB of unique credential‑shaped lines) could plausibly push a scan past that timeout and would certainly flood the findings stream. This is a *degradation‑of‑service via linear amplification and output volume*, **not** a catastrophic‑backtracking hang.
@@ -164,8 +164,8 @@ Every timed candidate completes in **≤ ~3.1 s** on 8 MiB, and the size sweep (
 
 ### 6.2 Why the "match‑dense" attack is the real Q4 story, and its limits
 
-- **Identical matches are cheap.** A file repeating one connection string produced only **820** findings (LRU de‑duplication) at **135.84 ms** — barely above baseline. Naïve repetition does not amplify.
-- **Unique matches amplify — linearly.** Making each match unique defeats the cache: **201,431 findings / 5.56 s at 8 MiB**, **402,901 / 10.27 s at 16 MiB** — a clean doubling (~0.66 s/MiB). This is the residual CI‑availability concern of Q1, and it needs **no real secret** (verification is off, so every credential‑*shaped* line is reported as `unverified_secrets`).
+- **Identical matches still amplify — dedup limits *findings*, not *parse cost*.** A file repeating one connection string produces only **820** *emitted* findings (per‑chunk LRU de‑duplication collapses the output to one per chunk), but it still scans in **~3.0 s** at 8 MiB (n = 7 median; §7.2) — **~34× the `baseline_miss` control**. The reason: `mongodb.FromData` runs `connStrPat.FindAllStringSubmatch` and then a `url.Parse` (+ query re‑encode + `String()`) on **every raw match** ([mongodb.go:L49], [mongodb.go:L58], [mongodb.go:L79]) — on the order of the file's ~131,072 repeated lines — *before* the `uniqueMatches` map ([mongodb.go:L81]) de‑duplicates the emitted results. So naïve identical repetition is **not** cheap.
+- **Unique matches amplify *further* — also linearly.** Making each match unique defeats the de‑duplication on the *output* side, so every line becomes a distinct emitted finding: **201,431 findings / 5.56 s at 8 MiB**, **402,901 / 10.27 s at 16 MiB** — a clean doubling (~0.66 s/MiB). That is only **~2×** the identical‑repetition case (~0.375 s/MiB) at the same size — the *same order of magnitude* — because both are dominated by the per‑raw‑match `url.Parse` post‑processing that de‑duplication does **not** save; unique matches merely add distinct‑finding emission on top. This is the residual CI‑availability concern of Q1, and it needs **no real secret** (verification is off, so every credential‑*shaped* line is reported as `unverified_secrets`).
 - **It is bounded, not a hang.** Time is strictly proportional to file size; there is no point at which a fixed input causes unbounded work.
 
 ### 6.3 Cost attribution — end‑to‑end pipeline deltas, reconciled with pprof (Finding #8)
@@ -257,10 +257,10 @@ CONDITION: kw_nomatch   (flags: --no-verification --no-update )  tag=default
   run2: scan_duration=141.94542ms    chunks=820    bytes=10903552  verified=0    unverified=0
   run3: scan_duration=139.806683ms   chunks=820    bytes=10903552  verified=0    unverified=0
 
-CONDITION: match_dense (identical strings)  (flags: --no-verification --no-update )  tag=default
-  run1: scan_duration=135.840271ms   chunks=820    bytes=10903552  verified=0    unverified=820
-  run2: scan_duration=138.277946ms   chunks=820    bytes=10903552  verified=0    unverified=820
-  run3: scan_duration=134.987709ms   chunks=820    bytes=10903552  verified=0    unverified=820
+CONDITION: match_dense (identical strings; noisy — n=7 median below)  (flags: --no-verification --no-update )  tag=default
+  run1: scan_duration=2.770462061s   chunks=820    bytes=10903552  verified=0    unverified=820
+  run2: scan_duration=3.615154747s   chunks=820    bytes=10903552  verified=0    unverified=820
+  run3: scan_duration=2.853991632s   chunks=820    bytes=10903552  verified=0    unverified=820
 
 CONDITION: patho_mongodb_host  (nested-star host, MATCHES)  (flags: --no-verification --no-update )  tag=default
   run1: scan_duration=1.138205171s   chunks=820    bytes=10903552  verified=0    unverified=1624
@@ -328,6 +328,8 @@ CONDITION: patho_azuresas  (3 detectors hit, MATCHES)  (flags: --no-verification
 ```
 
 `patho_azentra` also exceeded the 25 % dispersion threshold and was re‑run at n = 7 (multi‑detector + GC noise on 4 cores): `median=1232.3ms min=689.9 max=1754.0 dispersion=86.4%; raw(ms): 689.9, 1232.3, 1178.5, 1754.0, 1160.5, 1424.9, 1238.1`. It remains bounded and shows no blow‑up.
+
+`match_dense` (one 64‑byte valid connection string repeated ×131,072) likewise exceeded the 25 % dispersion threshold and was re‑run at n = 7: `median=3001.4ms min=2126.2 max=3822.0 dispersion=56.5%; raw(s): 2.126, 2.769, 2.803, 3.001, 3.183, 3.497, 3.822`. Its 820 *emitted* findings (one per chunk after LRU de‑duplication) hide **~131,072 raw matches** — one per repeated line — and `mongodb.FromData` runs a `url.Parse` on **every** raw match *before* the dedup map ([mongodb.go:L49], [mongodb.go:L58], [mongodb.go:L81]). At **~0.375 s/MiB** (≈ 3001 ms ÷ 8 MiB) it is the **same order of magnitude** as `match_unique` (~0.66 s/MiB), grows linearly, and is **~34× the `baseline_miss` control (89.34 ms) and ~22× `kw_nomatch` (139.81 ms)** — i.e. far above baseline, *not* "barely above" it. (The earlier draft's 135.84 ms was non‑reproducible: it wrongly showed `match_dense` as *faster* than `kw_nomatch`, which is impossible since `match_dense` performs a strict *superset* of `kw_nomatch`'s work — the identical RE2 scan of every chunk **plus** ~131,072 `url.Parse` calls.)
 
 ### 7.3 Worst‑case single regex call — `--scan-entire-chunk` (Finding #4)
 
@@ -528,8 +530,8 @@ flowchart TD
     C -- Keyword present --> D[Detector regex via go-re2 RE2 in WASM, on a ±512/±1024 span]
     D --> E{Matches found?}
     E -- No matches --> F[Linear scan only: ~13 ms/MiB]
-    E -- Many UNIQUE matches --> G[Per-match url.Parse + result build + format/write]
-    G --> H[Linear in match count: ~0.66 s/MiB, bounded]
+    E -- Many matches identical or unique --> G[Per-match url.Parse + result build; +format/write scales with EMITTED findings]
+    G --> H[Linear in match count: ~0.375 s/MiB identical to ~0.66 s/MiB unique, bounded]
     D -. RE2 is non-backtracking .-> I[No exponential blow-up: ReDoS impossible]
     D --> J[context.WithTimeout 10s / 2s: cooperative defense-in-depth]
 ```
@@ -660,6 +662,9 @@ uri_noat_unit = b"https://" + b"a"*50 + b":" + b"b"*900 + b"\n"
 db_unit = b"dapi " + b"a" + b".a"*980 + b".invalidtld\n"
 # azuresas path nested-star (fits +/-1024 span) -> MATCHES
 az_unit = b"https://abcstorage.blob.core.windows.net/c" + b"/a"*980 + b"\n"
+# match_dense: ONE 64-byte VALID mongodb URI repeated 131,072 times -> exactly 8 MiB
+#   -> 820 emitted findings (per-chunk dedup) but ~131,072 raw matches, each a url.Parse
+match_dense_unit = b"mongodb://user0000:pass0000pw@host0000000000.example.net/dddddd\n"  # 64 bytes
 # unique synthetic mongodb URIs (defeat LRU dedup) -> finding-flood
 line = "mongodb://u%08d:p%08dpw@host%08d.example/\n" % (i, i, i)
 ```
