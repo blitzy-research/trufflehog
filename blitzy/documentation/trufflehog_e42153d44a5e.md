@@ -37,7 +37,7 @@ go version                          # => go version go1.24.2 linux/amd64
 [observed] **`--version` writes to stderr, not stdout.** Running `--version` emitted the string `trufflehog dev` to **stderr (15 bytes, including the trailing newline)** while **stdout was empty (0 bytes)** — the same stream discipline the scan itself uses (results → stdout, diagnostics → stderr):
 
 ```bash
-/tmp/thog_build/trufflehog --version 1>version.stdout 2>version.stderr
+"$BIN" --version 1>version.stdout 2>version.stderr   # $BIN = $WORK/trufflehog (see the workflow below)
 # version.stdout: 0 bytes   |   version.stderr: 15 bytes
 ```
 
@@ -91,18 +91,19 @@ git status --porcelain                       # expected: empty output (clean wor
 - [source-grounded] `--no-verification` (`main.go:L59`) sets `Verify: !*noVerification` to `false` (`main.go:L520`); that boolean — not the result count — is what makes the run a **safe dry-run** with no outbound provider API call (mechanism detailed under **No-verification safety** below).
 - [source-grounded] `--log-level` (`main.go:L50`, *"Logging verbosity on a scale of 0 (info) to 5 (trace)"*) selects which logr **V-levels** are emitted; the logger renders them as `info-N` labels. [observed] The engine-initialization and detector-preparation signals are emitted at V(4) and are **absent** from the `--log-level=2` capture, which is the decisive reason verbosity was escalated to `--log-level=4` — so those signals were *observed*, not inferred.
 
-**Disclosure of every transformation applied to the raw captures.** Each stderr log line is a single **TAB-separated** record of the form `<timestamp>⇥info-N⇥trufflehog⇥<message>⇥<json-fields>` (⇥ marks one literal TAB, which is preserved verbatim in the fenced blocks below). Exactly two volatile values are redacted and **no other byte is altered**:
+**Disclosure of every transformation applied to the raw captures.** Each stderr log line is a single **TAB-separated** record of the form `<timestamp>⇥info-N⇥trufflehog⇥<message>⇥<json-fields>` (⇥ marks one literal TAB, which is preserved verbatim in the fenced blocks below). Exactly three volatile values are normalized to stable placeholders and **no other byte is altered**:
 
 1. the leading RFC3339 **timestamp** → `<timestamp>`;
-2. the random **5-character worker IDs** (`source_manager_worker_id`, `scanner_worker_id`) → `<id>`.
+2. the random **5-character worker IDs** (`source_manager_worker_id`, `scanner_worker_id`) → `<id>`;
+3. the unpredictable `mktemp -d` working-directory prefix (e.g. `/tmp/tmp.XXXXXXXXXX`, the `$WORK` value from the workflow above) → the literal `$WORK`, so every absolute path shown is derivable from the documented `$TARGET = $WORK/scan_target` and `$BIN = $WORK/trufflehog`.
 
-Everything else is verbatim — the real absolute target path (`/tmp/thog_scan_target/...` on this host), the `scan_duration` value (a genuine per-run measurement, itself volatile), the field order, and the TAB separators. **One structural transformation is disclosed here and applied only to levels 4 and 5:** each of those captures contains **128 byte-identical** `finished scanning chunks` records (one per scanner worker; after worker-ID redaction they are indistinguishable). To avoid printing 128 identical lines, that block is shown **once, in its correct position**, and the total line count is stated so completeness stays verifiable. **Levels 2 and 3 are shown in full — every line.**
+Everything else is verbatim — the absolute target path appears as `$WORK/scan_target/...` (only the volatile `$WORK` prefix normalized as disclosed above), the `scan_duration` value (a genuine per-run measurement, itself volatile), the field order, and the TAB separators. **One structural transformation is disclosed here and applied only to levels 4 and 5:** each of those captures contains **128 byte-identical** `finished scanning chunks` records (one per scanner worker; after worker-ID redaction they are indistinguishable). To avoid printing 128 identical lines, that block is shown **once, in its correct position**, and the total line count is stated so completeness stays verifiable. **Levels 2 and 3 are shown in full — every line.**
 
 ---
 
 ## The complete captured evidence (levels 2–5)
 
-The blocks below are the **complete stderr captures** at each verbosity level, produced by the workflow above; the exact command is repeated with each. (In the captured run, the workflow variables resolved to `$BIN` = `/tmp/thog_build/trufflehog` and `$TARGET` = `/tmp/thog_scan_target`, both outside the checkout — which is why that absolute path appears verbatim in the records.) **stdout was empty (0 bytes) at every level** (no secrets found), so there is no stdout block to show. Observed stderr line counts: **level 2 → 10, level 3 → 14, level 4 → 146, level 5 → 148** (the level-4 count breaks down as 2 `info-0` + 6 `info-2` + 4 `info-3` + 132 `info-4`, the last comprising 4 signal lines and 128 `finished scanning chunks`).
+The blocks below are the **complete stderr captures** at each verbosity level, produced by the workflow above; the exact command is repeated with each. (In the captured run, `$WORK` was the single `mktemp -d` directory outside the checkout — e.g. `/tmp/tmp.XXXXXXXXXX` — so the workflow variables resolved to `$BIN` = `$WORK/trufflehog` and `$TARGET` = `$WORK/scan_target`, both sharing that one parent; the tool prints the target's real absolute path, and its unpredictable `$WORK` prefix is normalized to the literal `$WORK` in the records below, so every path shown is derivable from the documented `$TARGET`.) **stdout was empty (0 bytes) at every level** (no secrets found), so there is no stdout block to show. Observed stderr line counts: **level 2 → 10, level 3 → 14, level 4 → 146, level 5 → 148** (the level-4 count breaks down as 2 `info-0` + 6 `info-2` + 4 `info-3` + 132 `info-4`, the last comprising 4 signal lines and 128 `finished scanning chunks`).
 
 **`--log-level=2` — 10 stderr lines, shown in full:**
 
@@ -139,10 +140,10 @@ The blocks below are the **complete stderr captures** at each verbosity level, p
 <timestamp>	info-2	trufflehog	starting notifier workers	{"count": 128}
 <timestamp>	info-0	trufflehog	running source	{"source_manager_worker_id": "<id>", "with_units": true}
 <timestamp>	info-2	trufflehog	enumerating source	{"source_manager_worker_id": "<id>"}
-<timestamp>	info-3	trufflehog	chunking unit	{"source_manager_worker_id": "<id>", "unit_kind": "unit", "unit": "/tmp/thog_scan_target/config.ini"}
-<timestamp>	info-3	trufflehog	scanning file	{"source_manager_worker_id": "<id>", "unit_kind": "unit", "unit": "/tmp/thog_scan_target/config.ini", "path": "/tmp/thog_scan_target/config.ini"}
-<timestamp>	info-3	trufflehog	chunking unit	{"source_manager_worker_id": "<id>", "unit_kind": "unit", "unit": "/tmp/thog_scan_target/readme.txt"}
-<timestamp>	info-3	trufflehog	scanning file	{"source_manager_worker_id": "<id>", "unit_kind": "unit", "unit": "/tmp/thog_scan_target/readme.txt", "path": "/tmp/thog_scan_target/readme.txt"}
+<timestamp>	info-3	trufflehog	chunking unit	{"source_manager_worker_id": "<id>", "unit_kind": "unit", "unit": "$WORK/scan_target/config.ini"}
+<timestamp>	info-3	trufflehog	scanning file	{"source_manager_worker_id": "<id>", "unit_kind": "unit", "unit": "$WORK/scan_target/config.ini", "path": "$WORK/scan_target/config.ini"}
+<timestamp>	info-3	trufflehog	chunking unit	{"source_manager_worker_id": "<id>", "unit_kind": "unit", "unit": "$WORK/scan_target/readme.txt"}
+<timestamp>	info-3	trufflehog	scanning file	{"source_manager_worker_id": "<id>", "unit_kind": "unit", "unit": "$WORK/scan_target/readme.txt", "path": "$WORK/scan_target/readme.txt"}
 <timestamp>	info-0	trufflehog	finished scanning	{"chunks": 2, "bytes": 87, "verified_secrets": 0, "unverified_secrets": 0, "scan_duration": "4.336817ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
 ```
 
@@ -166,10 +167,10 @@ The blocks below are the **complete stderr captures** at each verbosity level, p
 <timestamp>	info-2	trufflehog	starting notifier workers	{"count": 128}
 <timestamp>	info-0	trufflehog	running source	{"source_manager_worker_id": "<id>", "with_units": true}
 <timestamp>	info-2	trufflehog	enumerating source	{"source_manager_worker_id": "<id>"}
-<timestamp>	info-3	trufflehog	chunking unit	{"source_manager_worker_id": "<id>", "unit_kind": "unit", "unit": "/tmp/thog_scan_target/config.ini"}
-<timestamp>	info-3	trufflehog	scanning file	{"source_manager_worker_id": "<id>", "unit_kind": "unit", "unit": "/tmp/thog_scan_target/config.ini", "path": "/tmp/thog_scan_target/config.ini"}
-<timestamp>	info-3	trufflehog	chunking unit	{"source_manager_worker_id": "<id>", "unit_kind": "unit", "unit": "/tmp/thog_scan_target/readme.txt"}
-<timestamp>	info-3	trufflehog	scanning file	{"source_manager_worker_id": "<id>", "unit_kind": "unit", "unit": "/tmp/thog_scan_target/readme.txt", "path": "/tmp/thog_scan_target/readme.txt"}
+<timestamp>	info-3	trufflehog	chunking unit	{"source_manager_worker_id": "<id>", "unit_kind": "unit", "unit": "$WORK/scan_target/config.ini"}
+<timestamp>	info-3	trufflehog	scanning file	{"source_manager_worker_id": "<id>", "unit_kind": "unit", "unit": "$WORK/scan_target/config.ini", "path": "$WORK/scan_target/config.ini"}
+<timestamp>	info-3	trufflehog	chunking unit	{"source_manager_worker_id": "<id>", "unit_kind": "unit", "unit": "$WORK/scan_target/readme.txt"}
+<timestamp>	info-3	trufflehog	scanning file	{"source_manager_worker_id": "<id>", "unit_kind": "unit", "unit": "$WORK/scan_target/readme.txt", "path": "$WORK/scan_target/readme.txt"}
 <timestamp>	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "<id>"}
 <timestamp>	info-0	trufflehog	finished scanning	{"chunks": 2, "bytes": 87, "verified_secrets": 0, "unverified_secrets": 0, "scan_duration": "4.777549ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
 ```
@@ -194,12 +195,12 @@ The blocks below are the **complete stderr captures** at each verbosity level, p
 <timestamp>	info-2	trufflehog	starting notifier workers	{"count": 128}
 <timestamp>	info-0	trufflehog	running source	{"source_manager_worker_id": "<id>", "with_units": true}
 <timestamp>	info-2	trufflehog	enumerating source	{"source_manager_worker_id": "<id>"}
-<timestamp>	info-3	trufflehog	chunking unit	{"source_manager_worker_id": "<id>", "unit_kind": "unit", "unit": "/tmp/thog_scan_target/readme.txt"}
-<timestamp>	info-3	trufflehog	chunking unit	{"source_manager_worker_id": "<id>", "unit_kind": "unit", "unit": "/tmp/thog_scan_target/config.ini"}
-<timestamp>	info-3	trufflehog	scanning file	{"source_manager_worker_id": "<id>", "unit_kind": "unit", "unit": "/tmp/thog_scan_target/readme.txt", "path": "/tmp/thog_scan_target/readme.txt"}
-<timestamp>	info-3	trufflehog	scanning file	{"source_manager_worker_id": "<id>", "unit_kind": "unit", "unit": "/tmp/thog_scan_target/config.ini", "path": "/tmp/thog_scan_target/config.ini"}
-<timestamp>	info-5	trufflehog	dataErrChan closed, all chunks processed	{"source_manager_worker_id": "<id>", "unit_kind": "unit", "unit": "/tmp/thog_scan_target/config.ini", "path": "/tmp/thog_scan_target/config.ini", "mime": "text/plain; charset=utf-8", "timeout": 60}
-<timestamp>	info-5	trufflehog	dataErrChan closed, all chunks processed	{"source_manager_worker_id": "<id>", "unit_kind": "unit", "unit": "/tmp/thog_scan_target/readme.txt", "path": "/tmp/thog_scan_target/readme.txt", "mime": "text/plain; charset=utf-8", "timeout": 60}
+<timestamp>	info-3	trufflehog	chunking unit	{"source_manager_worker_id": "<id>", "unit_kind": "unit", "unit": "$WORK/scan_target/readme.txt"}
+<timestamp>	info-3	trufflehog	chunking unit	{"source_manager_worker_id": "<id>", "unit_kind": "unit", "unit": "$WORK/scan_target/config.ini"}
+<timestamp>	info-3	trufflehog	scanning file	{"source_manager_worker_id": "<id>", "unit_kind": "unit", "unit": "$WORK/scan_target/readme.txt", "path": "$WORK/scan_target/readme.txt"}
+<timestamp>	info-3	trufflehog	scanning file	{"source_manager_worker_id": "<id>", "unit_kind": "unit", "unit": "$WORK/scan_target/config.ini", "path": "$WORK/scan_target/config.ini"}
+<timestamp>	info-5	trufflehog	dataErrChan closed, all chunks processed	{"source_manager_worker_id": "<id>", "unit_kind": "unit", "unit": "$WORK/scan_target/config.ini", "path": "$WORK/scan_target/config.ini", "mime": "text/plain; charset=utf-8", "timeout": 60}
+<timestamp>	info-5	trufflehog	dataErrChan closed, all chunks processed	{"source_manager_worker_id": "<id>", "unit_kind": "unit", "unit": "$WORK/scan_target/readme.txt", "path": "$WORK/scan_target/readme.txt", "mime": "text/plain; charset=utf-8", "timeout": 60}
 <timestamp>	info-4	trufflehog	finished scanning chunks	{"scanner_worker_id": "<id>"}
 <timestamp>	info-0	trufflehog	finished scanning	{"chunks": 2, "bytes": 87, "verified_secrets": 0, "unverified_secrets": 0, "scan_duration": "5.005877ms", "trufflehog_version": "dev", "verification_caching": {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
 ```
