@@ -266,7 +266,6 @@ The four subsystem sections below read this sequence top-to-bottom, mapping each
 
 **Observed non-event (traced to cause).** The line `No concurrency specified, defaulting to max` (`pkg/engine/engine.go:L339`) **never appeared** at any level (grep count `0` across levels 2–5). *Cause:* `--concurrency` is pre-set to `runtime.NumCPU()` by the CLI flag default (`main.go:L58`), so `e.concurrency` is already `128` (non-zero) when `setDefaults()` runs, and the `if e.concurrency == 0` fallback at `pkg/engine/engine.go:L337` is skipped. This is a clean example of tracing an observed behavior — and a meaningful *non*-event — back to its exact source cause.
 
-
 ---
 
 ## Subsystem 3 — Detector preparation
@@ -291,7 +290,6 @@ The four subsystem sections below read this sequence top-to-bottom, mapping each
 - **Aho-Corasick core.** [source-grounded] The prefilter is compiled by `e.AhoCorasickCore = ahocorasick.NewAhoCorasickCore(e.detectors, ahoCOptions...)` (`pkg/engine/engine.go:L530`), bracketed by `ctx.Logger().V(4).Info("setting up aho-corasick core")` (`pkg/engine/engine.go:L529`) and `ctx.Logger().V(4).Info("set up aho-corasick core")` (`pkg/engine/engine.go:L531`). *Effect:* [observed] the pair of `info-4` lines marks the keyword trie being built from every detector's keywords. [source-grounded] That the core is used to *pre-screen* chunks with fast keyword matching ahead of the detectors' regexes is proven directly by the local implementation, not by any external source: `scannerWorker` calls `e.AhoCorasickCore.FindDetectorMatches(decoded.Chunk.Data)` (`pkg/engine/engine.go:L795`) and enqueues **only** the matched detectors for detection (`pkg/engine/engine.go:L807-L816`).
 
 *This section deliberately stays at the mechanism level: it explains how the detector set is loaded, filtered, and compiled into the prefilter, and does not enumerate the individual default detectors.*
-
 
 ---
 
@@ -352,7 +350,6 @@ graph TD
     VW -->|"results"| NW
     NW --> OUT["output dispatcher -> stdout (empty in this dry-run)"]
 ```
-
 
 ---
 
@@ -433,4 +430,3 @@ Every claim above carries one of the four classifications from the legend. The r
 - `[inferred]` The large channel buffers exist to **let producers outpace consumers** — inferred from the source comments at `pkg/engine/engine.go:L497-L508`, not from runtime output.
 
 The **[observed]** items — the log lines, stream behavior, worker counts (the `{"count": …}` fields), and the non-event (`No concurrency specified` never firing) — are reproducible on this 128-CPU host. The **channel-buffer capacities** (6400 / 3200 / 6400) are **[computed]**, *not* observed: they never appear in any runtime line and are derived arithmetically from the observed concurrency (128) times fixed source multipliers. Internal mechanisms that the runtime output does **not** print — configuration parsing, the feature-flag stores, detector include/exclude filtering, the 512-entry LRU size, the channel capacities, and each worker's responsibilities — are labeled **[source-grounded]** (or **[computed]**) at their point of use above, never **[observed]**.
-
