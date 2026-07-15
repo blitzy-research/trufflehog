@@ -10,9 +10,9 @@
 
 ## 1. TL;DR — Executive Verdict
 
-- **ReDoS (catastrophic backtracking): NOT VULNERABLE.** TruffleHog compiles **865 production** detector patterns (plus 2 test files) with `github.com/wasilibs/go-re2` ([go.mod:L100]) and the remaining **3 production** detectors with Go's standard‑library `regexp`. Both are **RE2‑lineage engines that do not do unbounded backtracking**, so the "nested quantifier" constructs (`(x+)+`, overlapping alternation, `.*` around quantified groups) that are catastrophic under PCRE‑style engines cannot blow up here. This is confirmed three ways: (a) a size sweep showing **clean linear scaling** (§7.4); (b) maximally‑adversarial nested‑quantifier inputs completing in **sub‑second** time even at 8 MiB (§7.1–7.2); and (c) an engine‑contrast benchmark in which the two engines TruffleHog uses stay in the **microsecond** range while a genuine backtracking engine explodes exponentially (§7.6).
+- **ReDoS (catastrophic backtracking): NOT VULNERABLE.** TruffleHog's detector patterns are compiled by RE2‑lineage engines: **865 production detector `.go` files import** `regexp "github.com/wasilibs/go-re2"` ([go.mod:L100]) — plus 2 test files, 867 imports total (§4.1) — and the remaining **3 production** detectors use Go's standard‑library `regexp`. (The count is of importing *files*, not of distinct compiled patterns; a file may compile several patterns.) Both are **RE2‑lineage engines that do not do unbounded backtracking**, so the "nested quantifier" constructs (`(x+)+`, overlapping alternation, `.*` around quantified groups) that are catastrophic under PCRE‑style engines cannot blow up here. This is confirmed three ways: (a) a size sweep showing **clean linear scaling** (§7.4); (b) maximally‑adversarial nested‑quantifier inputs completing in **sub‑second** time even at 8 MiB (§7.1–7.2); and (c) an engine‑contrast benchmark in which the two engines TruffleHog uses stay in the **microsecond** range while a genuine backtracking engine explodes exponentially (§7.6).
 
-- **Residual, *linear* (non‑catastrophic) degradation: YES, and worth noting for CI.** Because a scan's cost grows with the number of *matches* it must extract and report, an attacker who commits a large file of **unique, synthetic, credential‑shaped strings** (no real secret required — verification is off) can force TruffleHog to do a lot of match‑extraction and finding‑emission work. Measured: an **8 MiB** such file produced **201,431 findings** in **~5.6 s**, and **16 MiB → 402,901 findings in ~10.3 s** — i.e. **~0.66 s/MiB, growing linearly**. That is **~62×** slower than an equivalent‑size file that misses the keyword prefilter (§6). This is *bounded and linear*, not a hang; but on a large enough committed file it could push a fixed CI step past its timeout, and it floods the findings output. Note that TruffleHog **de‑duplicates identical matches** only on the *output* side (collapsing emitted findings), **not** in cost: because `url.Parse` runs on every raw match *before* the dedup map ([mongodb.go:L49], [mongodb.go:L58], [mongodb.go:L81]), even naïve repetition of one string already amplifies (**~34×** baseline, **~3.0 s** at 8 MiB; §3, §6.2). Making each match *unique* amplifies *further* (~62×) by defeating the LRU cache on the reporting side, but it is **not required** to force a large (still linear, bounded) slowdown.
+- **Residual, *linear* (non‑catastrophic) degradation: YES, and worth noting for CI.** Because a scan's cost grows with the number of *matches* it must extract and report, an attacker who commits a large file of **unique, synthetic, credential‑shaped strings** (no real secret required — verification is off) can force TruffleHog to do a lot of match‑extraction and finding‑emission work. Measured: an **8 MiB** such file produced **201,431 findings** in **~5.6 s**, and **16 MiB → 402,901 findings in ~10.3 s** — i.e. **~0.66 s/MiB, growing linearly**. That is **~62×** slower than an equivalent‑size file that misses the keyword prefilter (§6). This is *bounded and linear*, not a hang; but on a large enough committed file it could push a fixed CI step past its timeout, and it floods the findings output. Note the de‑duplication mechanics: within each chunk the MongoDB detector collapses identical matches through a **local, per‑`FromData`‑call `uniqueMatches` map** ([mongodb.go:L48], [mongodb.go:L81]) — this bounds *emitted findings per chunk*, **not** cost, because `url.Parse` runs on **every raw match** *before* that map ([mongodb.go:L49], [mongodb.go:L58]). So even naïve repetition of one string already amplifies (**~34×** baseline, **~3.0 s** at 8 MiB; §3, §6.2). Making each match *unique* amplifies *further* (~62×) simply because distinct strings **cannot** be merged by that per‑chunk map — **not** because any cache is "defeated" (the engine's separate cross‑result `dedupeCache` is an LRU keyed partly on per‑line source metadata that **deliberately preserves same‑decoder duplicates**, [engine.go:L1216]–[engine.go:L1218]). Neither path is *required* to force a large (still linear, bounded) slowdown.
 
 - **Which patterns are exploitable for catastrophic blow‑up: NONE** (§5). The nested‑quantifier patterns an attacker would target — MongoDB `connStrPat` ([pkg/detectors/mongodb/mongodb.go:L32]), URI `keyPat` ([pkg/detectors/uri/uri.go:L33]), `databrickstoken` ([pkg/detectors/databrickstoken/databrickstoken.go:L27]), `azuresastoken` ([pkg/detectors/azuresastoken/azuresastoken.go:L32]) — all complete in **≤ ~1.1 s on 8 MiB** of purpose‑built adversarial input, whether the payload matches or fails, and whether or not the per‑keyword span window is bypassed with `--scan-entire-chunk`.
 
@@ -20,7 +20,7 @@
 
 | # | Question | Verdict |
 |---|----------|---------|
-| **Q1** | Can a crafted committed file **hang or time out** TruffleHog and block CI? | **No indefinite hang.** Pattern matching is linear‑time. The only achievable effect is a **linear, bounded** slowdown; a sufficiently large *unique‑match‑dense* file could exceed a fixed CI step timeout (~0.66 s/MiB) and flood findings — a linear resource cost, backstopped by per‑detector cooperative timeouts. |
+| **Q1** | Can a crafted committed file **hang or time out** TruffleHog and block CI? | **No indefinite hang.** Pattern matching is linear‑time. The only achievable effect is a **linear, bounded** slowdown; a sufficiently large *unique‑match‑dense* file could exceed a fixed CI step timeout (~0.66 s/MiB) and flood findings — a linear resource cost, backstopped by per‑detector cooperative timeouts. Two *unrelated* CLI caveats also bear on CI reliability — fatal filesystem‑source errors exit `0` even with `--fail`, and invalid `--concurrency` (0 / negative) hangs or panics — see §3.1. |
 | **Q2** | Is pattern matching **vulnerable to computational‑complexity (ReDoS)** attacks? | **No.** Detectors run on RE2‑lineage engines (`go-re2` WASM + stdlib `regexp`) with a documented **linear‑time** guarantee and no unbounded backtracking. Confirmed empirically. |
 | **Q3** | **Which detector patterns**, if any, are exploitable? | **None** for catastrophic blow‑up. Only a handful of detectors (6 of 845) even contain a genuine group‑repetition shape; the highest‑risk of them were measured directly and none blows up, and the engine‑level RE2 linear‑time guarantee covers the rest. |
 | **Q4** | **How much slower** vs. normal files of equivalent size? | A ReDoS‑*structured* (non‑matching) file is only **~1.2×** an equivalent‑size prefilter‑miss baseline. The maximum amplification — a **unique synthetic match‑dense** file — is **~62×** at 8 MiB, and it is **linear and bounded**. |
@@ -65,8 +65,8 @@ CGO_ENABLED=0 go build -o /tmp/trufflehog .
 
 **The realistic residual risk — a *linear* finding‑flood.** A scan's cost is dominated by how many *matches* it extracts and reports, not by regex execution. An attacker does **not** need a real secret: with `--no-verification` (the norm for a fast CI pass), every credential‑*shaped* string becomes an `unverified_secrets` finding. Two facts shape the attack:
 
-1. **Identical matches are de‑duplicated on *output*, but not in cost.** A file repeating the *same* connection string 131,072 times produces only **820** *emitted* findings (one per chunk after LRU de‑duplication) — yet it still scans in **~3.0 s** at 8 MiB (n = 7 median; §7.2), because `url.Parse` runs on *every* raw match *before* the dedup map ([mongodb.go:L49], [mongodb.go:L58], [mongodb.go:L81]). So naïve repetition is **not** cheap (~34× baseline); the attacker does **not** need unique matches to force a large — but still linear and bounded — slowdown.
-2. **Unique matches defeat the cache.** A file of **unique** synthetic strings (each with a distinct username/host counter) produced **201,431** findings at 8 MiB and scanned in **~5.6 s** — and **402,901 findings / ~10.3 s** at 16 MiB (§7.4). The cost is **~0.66 s/MiB and grows linearly**.
+1. **Identical matches collapse *per chunk*, but cost is not saved.** A file repeating the *same* connection string 131,072 times produces only **~820** *emitted* findings — roughly **one per chunk**, because the MongoDB detector's **local, per‑`FromData`‑call `uniqueMatches` map** ([mongodb.go:L48], [mongodb.go:L81]) merges identical strings *within* each chunk, after which each of the ~820 chunks emits its one result. Yet the file still scans in **~3.0 s** at 8 MiB (n = 7 median; §7.2), because `url.Parse` runs on *every* raw match *before* that map ([mongodb.go:L49], [mongodb.go:L58]). So naïve repetition is **not** cheap (~34× baseline); the attacker does **not** need unique matches to force a large — but still linear and bounded — slowdown.
+2. **Unique matches cannot be merged by the per‑chunk map.** A file of **unique** synthetic strings (each with a distinct username/host counter) produced **201,431** findings at 8 MiB and scanned in **~5.6 s** — and **402,901 findings / ~10.3 s** at 16 MiB (§7.4). Because every string is distinct, the per‑chunk `uniqueMatches` map cannot collapse any of them, so each becomes its own emitted finding (≈ one per input line); nothing about a cache is "defeated." The cost is **~0.66 s/MiB and grows linearly**.
 
 At **~62×** the equivalent‑size prefilter‑miss baseline (§6), this is the largest slowdown we could manufacture. It is a **linear resource‑consumption** effect: bounded, proportional to file size, and — because verification is off — composed entirely of *fabricated* findings. On a CI runner with a fixed per‑step timeout, a large enough committed file (tens of MiB of unique credential‑shaped lines) could plausibly push a scan past that timeout and would certainly flood the findings stream. This is a *degradation‑of‑service via linear amplification and output volume*, **not** a catastrophic‑backtracking hang.
 
@@ -76,6 +76,40 @@ At **~62×** the equivalent‑size prefilter‑miss baseline (§6), this is the 
 - On the **verification‑overlap** path, `verificationOverlapWorker` ([pkg/engine/engine.go:L924]) wraps `detector.FromData(...)` ([pkg/engine/engine.go:L940]) in a shorter `context.WithTimeout(ctx, time.Second*2)` ([pkg/engine/engine.go:L939]).
 
 Both deadlines are **cooperative**: the detector's regex call, `FindAllStringSubmatch`, takes **no context** ([pkg/detectors/uri/uri.go:L61], [pkg/detectors/mongodb/mongodb.go:L49]), so a single in‑flight regex match cannot be interrupted mid‑call, and the watchdog only emits a log line. This is precisely why **RE2's linear‑time guarantee — not the timeout — is the true protection**: the timeouts primarily bound slow *network verification*, and they do not (and need not) forcibly abort CPU‑bound matching, because matching cannot run away in the first place.
+
+### 3.1 Operational CI caveats — unchanged product behavior, disclosed for triage
+
+Two behaviours of the TruffleHog CLI *itself* (not attacker‑controlled, and **not** modified by this read‑only investigation) matter to anyone wiring it into a CI gate. They are unrelated to ReDoS but bear directly on Q1's "block our security scans" concern, so they are disclosed here for separate triage. Both were re‑confirmed on the canonical `/tmp/trufflehog` build.
+
+- **A fatal filesystem‑source error still exits `0` — even with `--fail`.** If the scan target cannot be read (e.g. a bad path, or a file the process cannot `lstat`), TruffleHog logs the error but the process still returns success. Observed:
+
+  ```
+  $ /tmp/trufflehog filesystem /tmp/does-not-exist --no-verification --no-update ; echo "exit=$?"
+  … error … encountered errors during scan  {"errors":["lstat /tmp/does-not-exist: no such file or directory"]}
+  … info-0 … finished scanning  {"chunks":0,"bytes":0,"verified_secrets":0,"unverified_secrets":0,…}
+  exit=0
+  $ /tmp/trufflehog filesystem /tmp/does-not-exist --no-verification --no-update --fail ; echo "exit=$?"
+  …                                       # same errors logged
+  exit=0                                  # --fail does NOT change this; --fail only flips exit on *findings*
+  ```
+
+  The filesystem source's run summary is returned unconditionally as success (`return metrics{…}, nil` after the errors are only *logged*, near [main.go:L968]); `--fail` governs the "verified/allowed findings" exit code, not source‑level scan errors. **Implication for CI:** an exit code of `0` does **not** prove the target was actually scanned. A malicious commit that makes the target unreadable (or a misconfigured path) would let a scan "pass" while scanning nothing. Gate on the `finished scanning` summary — assert `chunks > 0` / `bytes > 0` for a target you know is non‑empty — rather than on exit status alone.
+
+- **Invalid `--concurrency` values hang or panic.** `--concurrency` is wired to `runtime.NumCPU()` by default with **no lower‑bound validation** ([main.go:L58]). Observed on a trivial 24‑byte target:
+
+  ```
+  $ /tmp/trufflehog filesystem <dir> --concurrency=0  --no-verification --no-update
+  … info-0 … No concurrency specified, defaulting to max  {"cpu":128}
+  # …then never reaches "finished scanning"; the process HANGS and must be killed.
+  # Under a CI `timeout` wrapper this surfaces as a non‑zero timeout exit (124).
+
+  $ /tmp/trufflehog filesystem <dir> --concurrency=-1 --no-verification --no-update ; echo "exit=$?"
+  panic: semaphore limit must not be negative
+    github.com/marusama/semaphore/v2.(*semaphore).SetLimit  …/semaphore/v2@v2.5.0/semaphore.go:193
+  exit=2
+  ```
+
+  This is a self‑inflicted misconfiguration (the attacker does not control CI flags), but it is a sharp edge: a `0` or negative value does not fall back to a safe default. **Use a positive `--concurrency`** (omit the flag to accept the default). Every measurement in this report was taken with a valid positive concurrency and with the `finished scanning` summary showing non‑zero `chunks`, so these caveats do not affect any number herein.
 
 ---
 
@@ -90,7 +124,7 @@ The following are facts observed **in this checkout**, kept separate from the ex
 - **Primary engine — `go-re2`.** **865 production** detector `.go` files import `regexp "github.com/wasilibs/go-re2"` (plus **2 test** files: `pkg/detectors/azure_storage/storage_integration_test.go` and `pkg/detectors/detectors_test.go`) — **867 total**. The dependency is pinned at `github.com/wasilibs/go-re2 v1.9.0` ([go.mod:L100]).
 - **Secondary engine — Go stdlib `regexp`.** Exactly **3 production** detectors use the standard library instead: `pkg/detectors/azure_entra/serviceprincipal/v2/spv2.go` ([spv2.go:L7]), `pkg/detectors/azure_cosmosdb/azure_cosmosdb.go` ([azure_cosmosdb.go:L13]), and `pkg/detectors/jdbc/jdbc.go` ([jdbc.go:L8]).
 - **The WASM RE2 variant is what runs.** The project `Dockerfile` builds with `CGO_ENABLED=0`; with cgo disabled, `go-re2` runs RE2 as a **WebAssembly module** hosted by the pure‑Go `wazero` runtime (`github.com/tetratelabs/wazero v1.9.0`, [go.mod:L285]). This is visible in the CPU profile as `runtime._ExternalCode` (the WASM sandbox is opaque to Go's profiler — §7.5).
-- **A backtracking engine is present but unused for detection.** `github.com/dlclark/regexp2 v1.4.0` appears as an **`// indirect`** dependency ([go.mod:L187]) but is imported by **0 files under `pkg/`** — it never compiles a detector pattern, and it **never appears in the CPU profile** of a real scan (§7.5). It is used *only* in our out‑of‑tree engine‑contrast harness (§7.6) to demonstrate what a vulnerable engine would look like.
+- **A backtracking engine is present, but it never compiles a detector pattern.** `github.com/dlclark/regexp2 v1.4.0` appears as an **`// indirect`** dependency ([go.mod:L187]) and is imported by **0 files under `pkg/detectors/` or `pkg/engine/`** — it never compiles a detector pattern and **never appears in the CPU profile** of a real scan (§7.5). It is **not**, however, confined to our test harness: it is **linked into the production binary** and is *reachable* through the terminal‑UI dependency chain `pkg/tui/common` → `charmbracelet/glamour` → `alecthomas/chroma/v2` → `dlclark/regexp2` (confirmed by `go mod why` and `go version -m`). Our out‑of‑tree engine‑contrast harness (§7.6) additionally drives it directly to show what a vulnerable engine looks like. **Neither fact changes the filesystem‑scan verdict** — the mechanism and the associated advisory are detailed in §4.2.1.
 
 ### 4.2 Why that is ReDoS‑safe (engine safety contracts — external)
 
@@ -101,6 +135,15 @@ These are the documented guarantees of the engines above, cited to primary sourc
 - **Go's standard‑library `regexp`** is RE2‑derived and carries the same linear‑time guarantee: its documentation states matching runs in time linear in the size of the input, and it deliberately does **not** implement backtracking. (Go package documentation — <https://pkg.go.dev/regexp>; background: <https://swtch.com/~rsc/regexp/>.)
 
 **On "backtracking" in the Go standard library — a precise correction.** Go's `regexp` *does* contain a routine literally named `backtrack` (`regexp.(*Regexp).backtrack` / `tryBacktrack`), and it appears — at **~1.5 % cumulative** — in our CPU profile (§7.5). This is **not** PCRE‑style catastrophic backtracking. It is a **bounded bit‑state backtracker**: before using it, the engine checks `shouldBacktrack(prog)`, which only permits it for small programs (`maxBacktrackProg = 500` instructions), and it allocates a *visited* bit‑vector of `(len input) × (len prog)` bits capped at `maxBacktrackVector = 256 * 1024`, guaranteeing it **never revisits a (position, instruction) state** and therefore still runs in **time linear in the input** (Go source `src/regexp/backtrack.go`). So the accurate statement is: **Go's engine performs *no unbounded/catastrophic* backtracking and retains a linear‑time guarantee** — not the looser "it never backtracks," and not the earlier mischaracterisation of these frames as a "one‑pass executor" (the one‑pass executor is a *separate* code path).
+
+### 4.2.1 The bundled `regexp2` and advisory GHSA‑wq9v‑j77v‑qr26 (does *not* change the filesystem verdict)
+
+For completeness — and because a naïve dependency scan will flag it — the **backtracking** engine `github.com/dlclark/regexp2 v1.4.0` is present in the module graph and **compiled into the production binary**. Its reachability, the associated advisory, and the reason it is nonetheless irrelevant to this assessment:
+
+- **Reachability (observed).** `go mod why -m github.com/dlclark/regexp2` resolves the chain `…/pkg/tui/common` → `github.com/charmbracelet/glamour/ansi` → `github.com/alecthomas/chroma/v2` → `github.com/dlclark/regexp2`, and `go version -m /tmp/trufflehog` lists `dep github.com/dlclark/regexp2 v1.4.0`, `github.com/alecthomas/chroma/v2 v2.8.0`, and `github.com/charmbracelet/glamour v0.7.0`. So it is a real, linked, production dependency — **not** a test‑only import.
+- **Known advisory.** `regexp2 < 2.3.0` is subject to **GHSA‑wq9v‑j77v‑qr26** (HIGH, CVSS 7.5): a crafted pattern using a large repetition count `{m}` over a zero‑width subexpression can force excessive memory allocation, and `regexp2`'s `MatchTimeout` does **not** bound that allocation. The bundled **v1.4.0** predates the **2.3.0** fix, so the *library* is technically affected.
+- **Why it does not change the filesystem‑scan verdict (mechanism).** The advisory — like ReDoS generally — requires the attacker to control the **pattern**. On the scan path, attacker‑committed bytes are the **haystack**, never the pattern: every detector pattern is a trusted compile‑time constant compiled by RE2‑lineage engines (§4.1). `regexp2` is reached **only** through Chroma's syntax‑highlighting lexers inside the interactive TUI, where Chroma compiles its own **trusted, fixed lexer patterns** — and it does so in **`regexp2.RE2` (non‑backtracking) mode** (`alecthomas/chroma/v2@v2.8.0/regexp.go:333` → `regexp2.Compile(pattern, regexp2.RE2)`), not the vulnerable default. Moreover the `filesystem` subcommand **never invokes the TUI**: the TUI is gated on `isatty.IsTerminal(os.Stdout.Fd()) && (len(os.Args) <= 1 || os.Args[1] == analyzeCmd.FullCommand())` ([main.go:L280]), which `trufflehog filesystem …` does not satisfy. So on the code path this assessment measures, `regexp2` is never constructed and never runs — consistent with its total absence from the CPU profile (§7.5).
+- **Recommendation (operational, not a code change).** Independently of ReDoS, upgrading the transitive `regexp2` to ≥ 2.3.0 (via a newer `chroma`/`glamour`) would clear the advisory from a dependency scan. This is recorded as an observation only; per the read‑only scope, no source is modified here.
 
 ### 4.3 Empirical confirmation
 
@@ -134,7 +177,7 @@ A naïve `grep` for the tokens `)*` or `)+` across the Go source is **misleading
 
 | Detector | Adversarial construct | Matches? | scan_duration (median) | Findings |
 |----------|-----------------------|----------|------------------------|----------|
-| `mongodb` `connStrPat` | nested‑star host `,a`×480 (fits ±512 span) | **Yes** | **1130.97 ms** | 1,624 |
+| `mongodb` `connStrPat` | nested‑star host `,a`×480 (fits ±512 span) | **Yes** | **1103.53 ms** | 1,623 |
 | `uri` `keyPat` | 50‑char class + `:` + 900 chars, **no** `@` | No (near‑miss) | **109.70 ms** | 0 |
 | `azuresastoken` `urlPat` | `.blob.core.windows.net/` + `/a`×980 (fits ±1024) | Yes | **367.97 ms** | 0 |
 | `databrickstoken` `domain` | `dapi ` + `.a`×980 + bad TLD (fits ±1024) | No (near‑miss) | **128.32 ms** | 0 |
@@ -142,7 +185,7 @@ A naïve `grep` for the tokens `)*` or `)+` across the Go source is **misleading
 | `jdbc` (**stdlib** engine) | `jdbc:…` `{0,512}` maxed | Yes | **605.62 ms** | 20,796 |
 | `azure_cosmosdb` (**stdlib** engine) | account‑URL bait (7 dets) | No | **3099.24 ms** | 0 |
 
-Every timed candidate completes in **≤ ~3.1 s** on 8 MiB, and the size sweep (§7.4) shows each grows **linearly**. The `mongodb` host construct **matches** (1,624 findings) — so it is a *successful‑match stress test*, not a "late‑failure catastrophic‑backtracking" case; the guaranteed **non‑matching** near‑misses (`uri` no‑`@`, `mongodb` no‑`@`) are the cheapest of all (~110 ms, ~1.2× baseline), which is the exact opposite of a backtracking signature (a backtracker is *slowest* on non‑matching input).
+Every timed candidate completes in **≤ ~3.1 s** on 8 MiB, and the size sweep (§7.4) shows each grows **linearly**. The `mongodb` host construct **matches** (1,623 findings) — so it is a *successful‑match stress test*, not a "late‑failure catastrophic‑backtracking" case; the guaranteed **non‑matching** near‑misses (`uri` no‑`@`, `mongodb` no‑`@`) are the cheapest of all (~110 ms, ~1.2× baseline), which is the exact opposite of a backtracking signature (a backtracker is *slowest* on non‑matching input).
 
 ---
 
@@ -157,35 +200,58 @@ Every timed candidate completes in **≤ ~3.1 s** on 8 MiB, and the size sweep (
 | `baseline_miss` (proven prefilter MISS, §7.1) | regex **never runs** | **89.34 ms** | **1.00×** (control) |
 | `patho_uri_noat` (evil nested‑quantifier, **non‑match**) | RE2 scans + fails | 109.70 ms | **1.23×** |
 | `kw_nomatch` (keyword present, 0 matches) | RE2 scans every chunk, 0 extract | 139.81 ms | **1.56×** |
-| `patho_mongodb_host` (nested‑star, **successful match**) | RE2 scans + extracts + `FromData` | 1130.97 ms | **12.66×** |
+| `patho_mongodb_host` (nested‑star, **successful match**) | RE2 scans + extracts + `FromData` | 1103.53 ms | **12.35×** |
+| `dense_uri` (valid `https://` URIs, **match‑dense**) | RE2 scans + extracts + `url.Parse` per match | 1962.13 ms | **21.96×** |
 | `match_unique` (unique synthetic matches, **finding‑flood**) | max extraction + result build + output | 5558.10 ms (n=7) | **62.2×** ← max |
 
-> **Arithmetic & aggregation (Finding #10 corrected).** Every figure above is a **median** (n = 3, or **n = 7** for the noisy `match_unique` series), with dispersion reported in §7. The **maximum median amplification is 62.2×** (the earlier draft's "≈28×/≈34.7×" understated it and mixed aggregation methods). The `match_unique` n = 3 median gives 55.25×; we adopt the **n = 7** value (62.2×) as the headline because that series exceeded the 25 % dispersion threshold and was re‑run. We do **not** subtract `kw_nomatch` from `match` and call the remainder "post‑processing time" — the pipeline does not permit that clean isolation (see §6.3).
+> **Arithmetic & aggregation (Finding #10 corrected).** Every figure above is a **median** (n = 3, or **n = 7** for the noisy `match_unique` series), with the full raw run series shown in §7.2 and dispersion reported there. The **maximum median amplification is 62.2×** (the earlier draft's "≈28×/≈34.7×" understated it and mixed aggregation methods). We adopt the **n = 7** value (62.2×) as the headline for `match_unique` because that series exceeded the 25 % dispersion threshold and was re‑run at higher n; the complete seven‑run series that yields it is printed verbatim in §7.2 — `raw(s): 5.180, 6.267, 5.542, 5.788, 4.943, 5.558, 5.717` → median **5558.1 ms** ÷ **89.34 ms** baseline = **62.2×** *(derived)*. A noisier three‑run aggregation of the same condition lands lower (≈55–56× — e.g. an independent n = 3 recapture gave `7.530 / 4.550 / 5.008 s` → median 5.008 s ÷ 90.04 ms = 55.6×), which is exactly why the higher‑n value is used as the headline. We do **not** subtract `kw_nomatch` from `match` and call the remainder "post‑processing time" — the pipeline does not permit that clean isolation (see §6.3).
 
 ### 6.2 Why the "match‑dense" attack is the real Q4 story, and its limits
 
-- **Identical matches still amplify — dedup limits *findings*, not *parse cost*.** A file repeating one connection string produces only **820** *emitted* findings (per‑chunk LRU de‑duplication collapses the output to one per chunk), but it still scans in **~3.0 s** at 8 MiB (n = 7 median; §7.2) — **~34× the `baseline_miss` control**. The reason: `mongodb.FromData` runs `connStrPat.FindAllStringSubmatch` and then a `url.Parse` (+ query re‑encode + `String()`) on **every raw match** ([mongodb.go:L49], [mongodb.go:L58], [mongodb.go:L79]) — on the order of the file's ~131,072 repeated lines — *before* the `uniqueMatches` map ([mongodb.go:L81]) de‑duplicates the emitted results. So naïve identical repetition is **not** cheap.
-- **Unique matches amplify *further* — also linearly.** Making each match unique defeats the de‑duplication on the *output* side, so every line becomes a distinct emitted finding: **201,431 findings / 5.56 s at 8 MiB**, **402,901 / 10.27 s at 16 MiB** — a clean doubling (~0.66 s/MiB). That is only **~2×** the identical‑repetition case (~0.375 s/MiB) at the same size — the *same order of magnitude* — because both are dominated by the per‑raw‑match `url.Parse` post‑processing that de‑duplication does **not** save; unique matches merely add distinct‑finding emission on top. This is the residual CI‑availability concern of Q1, and it needs **no real secret** (verification is off, so every credential‑*shaped* line is reported as `unverified_secrets`).
+- **Identical matches still amplify — the per‑chunk map limits *findings*, not *parse cost*.** A file repeating one connection string produces only **~820** *emitted* findings — the detector's **local, per‑`FromData`‑call** `uniqueMatches` map ([mongodb.go:L48], [mongodb.go:L81]) collapses identical strings *within* each chunk, and the ~820 chunks each emit one — but it still scans in **~3.0 s** at 8 MiB (n = 7 median; §7.2) — **~34× the `baseline_miss` control**. The reason: `mongodb.FromData` runs `connStrPat.FindAllStringSubmatch` and then a `url.Parse` (+ query re‑encode + `String()`) on **every raw match** ([mongodb.go:L49], [mongodb.go:L58], [mongodb.go:L79]) — on the order of the file's ~131,072 repeated lines — *before* that map de‑duplicates the emitted results. So naïve identical repetition is **not** cheap.
+- **Unique matches amplify *further* — also linearly.** Making each match unique means the per‑chunk `uniqueMatches` map cannot merge any of them, so every line becomes a distinct emitted finding: **201,431 findings / 5.56 s at 8 MiB**, **402,901 / 10.27 s at 16 MiB** — a clean doubling (~0.66 s/MiB). That is only **~2×** the identical‑repetition case (~0.375 s/MiB) at the same size — the *same order of magnitude* — because both are dominated by the per‑raw‑match `url.Parse` post‑processing that de‑duplication does **not** save; unique matches merely add distinct‑finding emission on top. This is the residual CI‑availability concern of Q1, and it needs **no real secret** (verification is off, so every credential‑*shaped* line is reported as `unverified_secrets`).
+- **The engine's cross‑result cache does not change this, and chunk overlap can *add* findings.** Separately from the detector‑local map, the engine keeps a cross‑result `dedupeCache` — an LRU (`cacheSize = 512`, [engine.go:L491]–[engine.go:L493], `hashicorp/golang-lru/v2` [engine.go:L18]). It is **not** a de‑duplicator an attacker "defeats": its key includes per‑line source metadata ([engine.go:L1216]) and it **deliberately preserves same‑decoder duplicates** (it skips a result only when the cached entry's decoder differs, or the source is Postman — [engine.go:L1217]–[engine.go:L1218]), so distinct‑line findings are never merged by it. Moreover, the chunker's **3 KiB peek overlap** ([chunker.go:L14]–[chunker.go:L18]) means a secret straddling a chunk boundary is scanned by *two* chunks and can be emitted **twice** — empirically confirmed: a single secret placed at the `ChunkSize` boundary (byte offset 10,240) yields **2** findings, one at offset 10,239 yields **1**, and one at 20,480 yields **2**. This is a small *additive* effect, not a super‑linear one.
 - **It is bounded, not a hang.** Time is strictly proportional to file size; there is no point at which a fixed input causes unbounded work.
 
 ### 6.3 Cost attribution — end‑to‑end pipeline deltas, reconciled with pprof (Finding #8)
 
 The comparison of conditions is best read as **end‑to‑end incremental deltas of the whole pipeline**, not as an experiment that isolates "regex vs. post‑processing" (changing the input also changes Aho matches, span processing, submatch extraction, map/dedup, result construction, line‑number computation, and output volume simultaneously). Reconciled with the CPU profile (§7.5), the dominant costs on a match‑dense scan are:
 
-1. **RE2 matching *and submatch extraction*, executed in the WASM sandbox** — `runtime._ExternalCode` at **57.25 % flat** (called from `wazero … CallWithStack`, the Go→WASM boundary for `go-re2`). This is the single largest cost and it is **linear** in input/match volume. (Note: this *includes* extraction, so it is inaccurate to say "regex execution is not the cost" — it is the largest cost.)
-2. **Output / finding‑flood** — `notifierWorker` **20.88 % cum** → `PlainPrinter.Print` **15.53 %** → `os.File.Write` **5.26 %**. Formatting and writing hundreds of thousands of findings is a first‑class cost, directly corroborating the Q1 finding‑flood concern.
-3. **Per‑match detector post‑processing** — `mongodb.Scanner.FromData` **7.86 % cum**, dominated by `url.Parse` (710 ms), `connUrl.String()` (520 ms), and query re‑encoding — all **linear per match**.
+1. **RE2 matching *and submatch extraction*, executed in the WASM sandbox** — `runtime._ExternalCode` at **54.15 % flat** (reached through `go-re2/internal.(*lazyFunction).callWithStack` → `wazero … callWithStack`, the Go→WASM boundary for `go-re2`; see the embedded `-peek` in §7.5). This is the single largest cost and it is **linear** in input/match volume. (Note: this *includes* extraction, so it is inaccurate to say "regex execution is not the cost" — it is the largest cost.)
+2. **Output / finding‑flood** — `notifierWorker` **21.72 % cum** → `PlainPrinter.Print` **16.26 % cum** → `os.File.Write` **5.15 % cum**. Formatting and writing hundreds of thousands of findings is a first‑class cost, directly corroborating the Q1 finding‑flood concern.
+3. **Per‑match detector post‑processing** — `mongodb.Scanner.FromData` **8.65 % cum**, dominated by `url.Parse` (640 ms), `connUrl.String()` (420 ms), and query re‑encoding — all **linear per match**.
 
 ### 6.4 A note on `--print-avg-detector-time` (metric semantics, Finding #9)
 
 TruffleHog's `--print-avg-detector-time` reports, per detector, the **arithmetic mean of `time.Since(start)`** over invocations that *returned at least one result* — the elapsed time is appended only on result‑returning calls at [pkg/engine/engine.go:L1093] (`elapsed := time.Since(start)`), [pkg/engine/engine.go:L1103] (`append`), [pkg/engine/engine.go:L1104] (`Store`), and displayed by `printAverageDetectorTime` ([main.go:L1021]–[main.go:L1029]). The tool's **own** output line states this explicitly: *"Average detector time is the measurement of average time spent on each detector when results are returned."* ([main.go:L1024]). These are therefore **per‑result‑returning averages**, **not** additive shares of the total scan. It is therefore incorrect to add or subtract them (e.g. "MongoDB 571 ms + URI 130 ms") to account for a multi‑second scan; we report them only as per‑call averages and rely on the CPU profile (§7.5) for actual whole‑scan CPU attribution.
+
+The verbatim aggregate footer that `--print-avg-detector-time` prints (one line per detector), captured on four keyword‑bearing 8 MiB inputs, is:
+
+```
+# match_unique (unique valid MongoDB URIs; 201,431 results):
+Average detector time is the measurement of average time spent on each detector when results are returned.
+MongoDB: 794.816358ms          (scan_duration 5.246079931s)
+
+# match_dense (one identical valid MongoDB URI x131,072; 820 emitted):
+MongoDB: 163.475369ms          (scan_duration 2.329004039s)
+
+# patho_mongodb_host (nested-STAR "evil" MongoDB pattern; 1,623 results):
+MongoDB: 9.013853ms            (scan_duration 1.123193968s)
+
+# dense_uri (valid https:// URIs; 820 emitted):
+URI: 146.513857ms              (scan_duration 1.795834695s)
+```
+
+The ordering is itself a Q3 result: the **nested‑star "evil" pattern** (`patho_mongodb_host`, **9.01 ms** average) is the **cheapest** of the four — roughly two orders of magnitude below the finding‑flood case — because RE2 matches it in linear time. The expensive averages belong to the *valid‑match‑dense* inputs, whose cost is per‑match `url.Parse` / result‑building (§7.5 `-list`), **not** regex backtracking. (Per the semantics above, these are per‑result‑returning wall‑clock means inflated by 128‑worker contention on 4 cores, and are **not** additive into the scan total — e.g. `MongoDB: 794.8 ms` × 820 calls ≠ the 5.25 s scan.)
 
 
 ---
 
 ## 7. Q5 — Evidence (timing measurements + CPU profiling)
 
-All output below is reproduced **verbatim** from the captured logs. Fields are not elided. Environment: `go1.24.3`, host `nproc = 4` / `runtime.NumCPU() = 128`, canonical binary built `CGO_ENABLED=0`. Each condition ran `--no-verification --no-update`. Every input file is exactly its stated power‑of‑two size in bytes (8 MiB = 8,388,608 bytes → 820 chunks at `TotalChunkSize = 13 KiB`).
+**Yes — both required evidence types are provided:** timing measurements (§7.1–§7.4, with per‑detector `--print-avg-detector-time` output in §6.4) **and** CPU‑profiling data (§7.5, a `go tool pprof` capture of the canonical `--profile` server), with an out‑of‑tree engine‑contrast benchmark as labeled corroboration (§7.6).
+
+**How to read the blocks below (raw vs. derived).** Blocks introduced as *"verbatim"* are the unmodified bytes of a captured log or `pprof` view (any `<-` annotation is called out explicitly and lives *outside* the verbatim fence). The per‑condition timing blocks report the **`scan_duration` summary line** that TruffleHog itself emits at the end of each run — extracted from each run's complete log with `grep 'finished scanning'`. That is the tool's own reported metric; it is **not** the multi‑megabyte finding stdout, which for a finding‑flood run is far too large to embed (e.g. `match_unique` at 8 MiB prints all 201,431 findings, tens of MiB of text) and is instead summarized by its `unverified` count. All medians, ratios, and per‑MiB slopes are **derived** from those raw `scan_duration` values and are labeled *(derived)*. Environment: `go1.24.3`, host `nproc = 4` / `runtime.NumCPU() = 128`, canonical binary built `CGO_ENABLED=0`. Each condition ran `--no-verification --no-update`. Every input file is exactly its stated power‑of‑two size in bytes (8 MiB = 8,388,608 bytes → 820 chunks at `TotalChunkSize = 13 KiB`).
 
 ### 7.1 Prefilter verification — proving the baseline (Finding #5)
 
@@ -262,10 +328,15 @@ CONDITION: match_dense (identical strings; noisy — n=7 median below)  (flags: 
   run2: scan_duration=3.615154747s   chunks=820    bytes=10903552  verified=0    unverified=820
   run3: scan_duration=2.853991632s   chunks=820    bytes=10903552  verified=0    unverified=820
 
+CONDITION: dense_uri (valid https:// URIs, one per line — Q4 dense-VALID-URI control, URI detector)  (flags: --no-verification --no-update )  tag=default
+  run1: scan_duration=1.962133403s   chunks=820    bytes=10903552  verified=0    unverified=820
+  run2: scan_duration=1.523652521s   chunks=820    bytes=10903552  verified=0    unverified=820
+  run3: scan_duration=1.999527011s   chunks=820    bytes=10903552  verified=0    unverified=820
+
 CONDITION: patho_mongodb_host  (nested-star host, MATCHES)  (flags: --no-verification --no-update )  tag=default
-  run1: scan_duration=1.138205171s   chunks=820    bytes=10903552  verified=0    unverified=1624
-  run2: scan_duration=1.12263411s    chunks=820    bytes=10903552  verified=0    unverified=1624
-  run3: scan_duration=1.130972856s   chunks=820    bytes=10903552  verified=0    unverified=1624
+  run1: scan_duration=1.099791037s   chunks=820    bytes=10903552  verified=0    unverified=1623
+  run2: scan_duration=1.111743563s   chunks=820    bytes=10903552  verified=0    unverified=1623
+  run3: scan_duration=1.103531172s   chunks=820    bytes=10903552  verified=0    unverified=1623
 
 CONDITION: patho_mongodb_userpass  (no '@', NON-match)  (flags: --no-verification --no-update )  tag=default
   run1: scan_duration=117.516915ms   chunks=820    bytes=10903552  verified=0    unverified=0
@@ -329,7 +400,7 @@ CONDITION: patho_azuresas  (3 detectors hit, MATCHES)  (flags: --no-verification
 
 `patho_azentra` also exceeded the 25 % dispersion threshold and was re‑run at n = 7 (multi‑detector + GC noise on 4 cores): `median=1232.3ms min=689.9 max=1754.0 dispersion=86.4%; raw(ms): 689.9, 1232.3, 1178.5, 1754.0, 1160.5, 1424.9, 1238.1`. It remains bounded and shows no blow‑up.
 
-`match_dense` (one 64‑byte valid connection string repeated ×131,072) likewise exceeded the 25 % dispersion threshold and was re‑run at n = 7: `median=3001.4ms min=2126.2 max=3822.0 dispersion=56.5%; raw(s): 2.126, 2.769, 2.803, 3.001, 3.183, 3.497, 3.822`. Its 820 *emitted* findings (one per chunk after LRU de‑duplication) hide **~131,072 raw matches** — one per repeated line — and `mongodb.FromData` runs a `url.Parse` on **every** raw match *before* the dedup map ([mongodb.go:L49], [mongodb.go:L58], [mongodb.go:L81]). At **~0.375 s/MiB** (≈ 3001 ms ÷ 8 MiB) it is the **same order of magnitude** as `match_unique` (~0.66 s/MiB), grows linearly, and is **~34× the `baseline_miss` control (89.34 ms) and ~22× `kw_nomatch` (139.81 ms)** — i.e. far above baseline, *not* "barely above" it. (The earlier draft's 135.84 ms was non‑reproducible: it wrongly showed `match_dense` as *faster* than `kw_nomatch`, which is impossible since `match_dense` performs a strict *superset* of `kw_nomatch`'s work — the identical RE2 scan of every chunk **plus** ~131,072 `url.Parse` calls.)
+`match_dense` (one 64‑byte valid connection string repeated ×131,072) likewise exceeded the 25 % dispersion threshold and was re‑run at n = 7: `median=3001.4ms min=2126.2 max=3822.0 dispersion=56.5%; raw(s): 2.126, 2.769, 2.803, 3.001, 3.183, 3.497, 3.822`. Its 820 *emitted* findings (≈ one per chunk, collapsed by the detector's **local per‑`FromData`** `uniqueMatches` map — [mongodb.go:L48], [mongodb.go:L81], not the engine LRU) hide **~131,072 raw matches** — one per repeated line — and `mongodb.FromData` runs a `url.Parse` on **every** raw match *before* that map ([mongodb.go:L49], [mongodb.go:L58]). At **~0.375 s/MiB** (≈ 3001 ms ÷ 8 MiB) it is the **same order of magnitude** as `match_unique` (~0.66 s/MiB), grows linearly, and is **~34× the `baseline_miss` control (89.34 ms) and ~22× `kw_nomatch` (139.81 ms)** — i.e. far above baseline, *not* "barely above" it. (The earlier draft's 135.84 ms was non‑reproducible: it wrongly showed `match_dense` as *faster* than `kw_nomatch`, which is impossible since `match_dense` performs a strict *superset* of `kw_nomatch`'s work — the identical RE2 scan of every chunk **plus** ~131,072 `url.Parse` calls.)
 
 ### 7.3 Worst‑case single regex call — `--scan-entire-chunk` (Finding #4)
 
@@ -342,8 +413,8 @@ By default the prefilter hands each detector only a **±512** (or **±1024** for
   run1: 111.844353ms   run2: 112.238738ms   run3: 109.174245ms   unverified=0
 --- patho_mongodb_userpass (--scan-entire-chunk) --- default was 116.35 ms
   run1: 114.567362ms   run2: 126.70675ms    run3: 120.260416ms   unverified=0
---- patho_mongodb_host (--scan-entire-chunk) ---     default was 1130.97 ms
-  run1: 1.148272984s   run2: 1.120263037s   run3: 1.140620792s   unverified=1624
+--- patho_mongodb_host (--scan-entire-chunk) ---     default was 1103.53 ms
+  run1: 1.111543278s   run2: 1.132660035s   run3: 1.108265677s   unverified=1622
 --- patho_databricks (--scan-entire-chunk) ---       default was 128.32 ms
   run1: 127.896715ms   run2: 128.917857ms   run3: 127.380749ms   unverified=0
 --- patho_azuresas (--scan-entire-chunk) ---         default was 367.97 ms
@@ -367,108 +438,182 @@ Each doubling of input size roughly **doubles** the time — the signature of **
    1MiB  144.30ms  (findings=206)                   1MiB   663.4ms  (findings=25159)
    2MiB  279.96ms  (x1.94, 410)                     2MiB  1401.0ms  (x2.11, 50320)
    4MiB  557.92ms  (x1.99, 820)                     4MiB  2792.6ms  (x1.99, 100697)
-   8MiB 1107.46ms  (x1.98, 1624)                    8MiB  5558.1ms  (x1.99, 201431)
+   8MiB 1107.46ms  (x1.98, 1623)                    8MiB  5558.1ms  (x1.99, 201431)
   16MiB 2220.32ms  (x2.00, 3260)                   16MiB 10267.9ms  (x1.85, 402901)
    => ~138 ms/MiB                                    => ~640-660 ms/MiB
 ```
 
 All four series are cleanly linear (doubling ratios cluster at ~2.0). There is **no** super‑linear term at any size.
 
-> The sweep is an **independent measurement batch** from the 8 MiB conditions table in §7.2, so its 8 MiB rows differ by run‑to‑run noise (~2 %): e.g. `baseline_miss` 89.22 ms here vs. 89.34 ms in §7.2; `patho_mongodb_host` 1107.46 ms here vs. 1130.97 ms in §7.2. The Q4 ratios in §6.1 are computed **within** the §7.2 conditions batch (so numerator and denominator share the same batch); the sweep exists only to establish the *scaling law*, not to re‑derive those ratios.
+> The sweep is an **independent measurement batch** from the 8 MiB conditions table in §7.2, so its 8 MiB rows differ by sub‑percent run‑to‑run noise: e.g. `baseline_miss` 89.22 ms here vs. 89.34 ms in §7.2; `patho_mongodb_host` 1107.46 ms here vs. 1103.53 ms in §7.2. The Q4 ratios in §6.1 are computed **within** the §7.2 conditions batch (so numerator and denominator share the same batch); the sweep exists only to establish the *scaling law*, not to re‑derive those ratios.
+
+**Complete per‑run sweep series (n = 3 at every size; medians and `log2` slope over 1→16 MiB are *derived*).** A `log2` slope of `1.0` is perfectly linear; a super‑linear (ReDoS) blow‑up would drive it well above 1.0 and grow with size. Every series stays at ~0.9–1.0:
+
+```
+baseline_miss (prefilter MISS):
+   1 MiB:  14.480, 14.305, 15.317 ms   median  14.480
+   2 MiB:  24.266, 23.998, 24.268 ms   median  24.266   (x1.68)
+   4 MiB:  44.616, 45.434, 43.593 ms   median  44.616   (x1.84)
+   8 MiB:  89.012, 88.389, 88.485 ms   median  88.485   (x1.98)
+  16 MiB: 168.798,169.270,167.900 ms   median 168.798   (x1.91)     => log2-slope 0.8858
+
+patho_uri_noat (evil nested-quantifier, NON-match):
+   1 MiB:  16.366, 17.447, 16.445 ms   median  16.445
+   2 MiB:  30.890, 30.153, 29.778 ms   median  30.153   (x1.83)
+   4 MiB:  53.118, 55.744, 55.550 ms   median  55.550   (x1.84)
+   8 MiB: 104.699,118.852,106.418 ms   median 106.418   (x1.92)
+  16 MiB: 212.632,214.361,214.370 ms   median 214.361   (x2.01)     => log2-slope 0.9261
+
+patho_mongodb_host (nested-STAR, successful match; findings double too):
+   1 MiB: 158.771,144.899,145.882 ms   median 145.882   (findings=206)
+   2 MiB: 281.775,287.275,283.785 ms   median 283.785   (x1.95, findings=410)
+   4 MiB: 571.199,566.630,554.044 ms   median 566.630   (x2.00, findings=820)
+   8 MiB:1107.291,1102.166,1110.440 ms  median1107.291   (x1.95, findings=1623)
+  16 MiB:2274.158,2274.112,2416.033 ms  median2274.158   (x2.05, findings=3260)   => log2-slope 0.9906
+
+match_unique (finding-flood; findings double too):
+   1 MiB: 628.662,679.693,640.804 ms   median 640.804   (findings=25159)
+   2 MiB: 910.792,1519.423,1264.052 ms  median1264.052   (x1.97, findings=50320)
+   4 MiB:2284.748,2021.437,2516.126 ms  median2284.748   (x1.81, findings=100697)
+   8 MiB:5712.214,5010.978,4623.697 ms  median5010.978   (x2.19, findings=201431)
+  16 MiB:9078.248,10786.810,9120.337 ms median9120.337   (x1.82, findings=402901)  => log2-slope 0.9578
+```
 
 ### 7.5 CPU profile (canonical `--profile` server)
 
-Captured with the safe lifecycle in §9.5 while scanning a **48 MiB** unique‑match file. Scan metadata (verbatim `finished scanning` line):
+Captured with the safe lifecycle in §9.5 while scanning a **56 MiB** (58,720,256‑byte) unique‑match file — deliberately sized so the scan runs **> 25 s**, keeping the entire bounded 20 s profiling window inside the active scan. Scan metadata (verbatim `finished scanning` line):
 
 ```
-finished scanning  {"chunks": 4916, "bytes": 65429504, "verified_secrets": 0,
- "unverified_secrets": 1208744, "scan_duration": "24.665820201s",
+finished scanning  {"chunks": 5735, "bytes": 76335104, "verified_secrets": 0,
+ "unverified_secrets": 1410214, "scan_duration": "34.228778881s",
  "trufflehog_version": "dev", "verification_caching":
  {"Hits":0,"Misses":0,"HitsWasted":0,"AttemptsSaved":0,"VerificationTimeSpentMS":0}}
 ```
 
-`go tool pprof -top` over a bounded 20 s window (**Total samples = 77.89 s = 387.11 % CPU ≈ 3.9 cores**, consistent with `nproc = 4`). Complete top‑25 by **flat**, verbatim:
+`go tool pprof -top` over a bounded 20 s window (**Duration = 20.13 s, Total samples = 73.45 s = 364.93 % CPU ≈ 3.6 cores**, consistent with `nproc = 4`). Complete top‑25 by **flat**, **verbatim** (no annotations added inside the fence):
 
 ```
-Duration: 20.12s, Total samples = 77.89s (387.11%)
-Showing nodes accounting for 59.45s, 76.33% of 77.89s total
+Duration: 20.13s, Total samples = 73.45s (364.93%)
+Showing nodes accounting for 53.97s, 73.48% of 73.45s total
+Dropped 710 nodes (cum <= 0.37s)
+Showing top 25 nodes out of 154
       flat  flat%   sum%        cum   cum%
-    44.59s 57.25% 57.25%     44.59s 57.25%  runtime._ExternalCode          <- RE2 in wazero WASM
-     3.21s  4.12% 61.37%      3.21s  4.12%  internal/runtime/syscall.Syscall6
-     1.64s  2.11% 63.47%      1.64s  2.11%  indexbytebody
-     1.25s  1.60% 65.08%      1.25s  1.60%  runtime.memmove
-     1.10s  1.41% 66.49%      3.30s  4.24%  bytes.Index                    <- Aho-Corasick prefilter
-     0.86s  1.10% 67.60%      1.89s  2.43%  runtime.scanobject
-     0.82s  1.05% 68.65%      0.82s  1.05%  runtime.memclrNoHeapPointers
-     0.73s  0.94% 69.59%      0.73s  0.94%  runtime.nextFreeFast (inline)
-     0.47s   0.6% 70.19%      0.47s   0.6%  aeshashbody
-     0.41s  0.53% 70.72%      0.41s  0.53%  runtime.(*mspan).base (inline)
-     0.41s  0.53% 71.24%      0.44s  0.56%  runtime.(*mspan).writeHeapBitsSmall
-     0.39s   0.5% 71.74%      0.47s   0.6%  runtime.casgstatus
-     0.38s  0.49% 72.23%      0.80s  1.03%  wazero/internal/engine/wazevo.(*callEngine).callWithStack
-     0.38s  0.49% 72.72%      0.49s  0.63%  runtime.findObject
-     0.31s   0.4% 73.12%      2.52s  3.24%  runtime.mallocgcSmallScanNoHeader
-     0.29s  0.37% 73.49%      0.89s  1.14%  internal/sync.(*Mutex).Lock (inline)
-     0.27s  0.35% 73.83%      1.97s  2.53%  bytes.IndexByte (inline)
-     0.27s  0.35% 74.18%      3.25s  4.17%  fmt.(*pp).doPrintf
-     0.27s  0.35% 74.53%      0.84s  1.08%  regexp.(*Regexp).tryBacktrack  <- Go BOUNDED bit-state backtracker
-     0.27s  0.35% 74.87%      4.64s  5.96%  runtime.mallocgc
-     0.26s  0.33% 75.21%      0.52s  0.67%  internal/sync.(*Mutex).Unlock (inline)
-     0.24s  0.31% 75.52%      2.96s  3.80%  fmt.(*pp).printArg
-     0.21s  0.27% 75.79%      0.92s  1.18%  wazero/internal/engine/wazevo.(*callEngine).CallWithStack
-     0.21s  0.27% 76.06%     12.10s 15.53%  output.(*PlainPrinter).Print   <- finding-flood output
-     0.21s  0.27% 76.33%      1.17s  1.50%  regexp.(*Regexp).backtrack
+    39.77s 54.15% 54.15%     39.77s 54.15%  runtime._ExternalCode
+        3s  4.08% 58.23%         3s  4.08%  internal/runtime/syscall.Syscall6
+     1.54s  2.10% 60.33%      1.54s  2.10%  indexbytebody
+     1.35s  1.84% 62.16%      1.35s  1.84%  runtime.memmove
+     0.84s  1.14% 63.31%      3.03s  4.13%  bytes.Index
+     0.77s  1.05% 64.36%      1.68s  2.29%  runtime.scanobject
+     0.56s  0.76% 65.12%      0.56s  0.76%  runtime.memclrNoHeapPointers
+     0.54s  0.74% 65.85%      1.06s  1.44%  github.com/tetratelabs/wazero/internal/engine/wazevo.(*callEngine).callWithStack
+     0.53s  0.72% 66.58%      0.53s  0.72%  runtime.nextFreeFast (inline)
+     0.51s  0.69% 67.27%      0.58s  0.79%  runtime.casgstatus
+     0.41s  0.56% 67.83%      0.41s  0.56%  runtime.(*mspan).base (inline)
+     0.40s  0.54% 68.37%      1.54s  2.10%  internal/sync.(*Mutex).Lock (inline)
+     0.39s  0.53% 68.90%     11.94s 16.26%  github.com/trufflesecurity/trufflehog/v3/pkg/output.(*PlainPrinter).Print
+     0.38s  0.52% 69.42%      1.06s  1.44%  internal/sync.(*Mutex).Unlock (inline)
+     0.38s  0.52% 69.94%      0.43s  0.59%  runtime.findObject
+     0.37s   0.5% 70.44%      0.90s  1.23%  regexp.(*Regexp).tryBacktrack
+     0.37s   0.5% 70.95%      0.53s  0.72%  runtime.fpTracebackPartialExpand
+     0.36s  0.49% 71.44%      2.12s  2.89%  runtime.mallocgcSmallScanNoHeader
+     0.26s  0.35% 71.79%      1.92s  2.61%  bytes.IndexByte (inline)
+     0.24s  0.33% 72.12%      1.30s  1.77%  regexp.(*Regexp).backtrack
+     0.24s  0.33% 72.44%      3.75s  5.11%  runtime.mallocgc
+     0.21s  0.29% 72.73%      2.73s  3.72%  fmt.(*pp).doPrintf
+     0.19s  0.26% 72.99%     15.95s 21.72%  github.com/trufflesecurity/trufflehog/v3/pkg/engine.(*Engine).notifierWorker
+     0.18s  0.25% 73.23%      0.41s  0.56%  encoding/json.checkValid
+     0.18s  0.25% 73.48%      1.14s  1.55%  internal/sync.(*Mutex).lockSlow
 ```
 
-Complete top‑15 by **cumulative** (the call‑tree view), verbatim:
+Complete top by **cumulative** (the call‑tree view), **verbatim**:
 
 ```
       flat  flat%   sum%        cum   cum%
-    44.59s 57.25% 57.25%     44.59s 57.25%  runtime._ExternalCode
-         0     0% 57.25%     44.59s 57.25%  runtime._System                (parent of _ExternalCode)
-     0.09s  0.12% 57.36%     16.26s 20.88%  engine.(*Engine).notifierWorker            <- output pipeline
-         0     0% 57.36%     16.26s 20.88%  engine.(*Engine).startNotifierWorkers.func1
-         0     0% 57.36%     12.18s 15.64%  engine.(*PrinterDispatcher).Dispatch
-     0.21s  0.27% 57.63%     12.10s 15.53%  output.(*PlainPrinter).Print
-         0     0% 57.63%     11.86s 15.23%  engine.(*Engine).detectorWorker
-         0     0% 57.63%     11.86s 15.23%  engine.(*Engine).startDetectorWorkers.func1
-     0.15s  0.19% 57.83%     11.85s 15.21%  engine.(*Engine).detectChunk
-     0.09s  0.12% 57.94%      6.12s  7.86%  detectors/mongodb.Scanner.FromData          <- per-match post-processing
-         0     0% 57.94%      6.01s  7.72%  verificationcache.(*VerificationCache).FromData
-     0.06s 0.077% 58.02%      5.50s  7.06%  engine.(*Engine).processResult
-     0.27s  0.35% 58.36%      4.64s  5.96%  runtime.mallocgc
-     0.02s 0.026% 58.39%      4.10s  5.26%  os.(*File).Write                            <- writing findings
-     0.01s 0.013% 58.63%      3.51s  4.51%  engine.SetResultLineNumber (inline)
+    39.77s 54.15% 54.15%     39.77s 54.15%  runtime._ExternalCode
+         0     0% 54.15%     39.77s 54.15%  runtime._System
+     0.19s  0.26% 54.40%     15.95s 21.72%  github.com/trufflesecurity/trufflehog/v3/pkg/engine.(*Engine).notifierWorker
+         0     0% 54.40%     15.95s 21.72%  github.com/trufflesecurity/trufflehog/v3/pkg/engine.(*Engine).startNotifierWorkers.func1
+     0.03s 0.041% 54.45%     12.05s 16.41%  github.com/trufflesecurity/trufflehog/v3/pkg/engine.(*PrinterDispatcher).Dispatch
+     0.39s  0.53% 54.98%     11.94s 16.26%  github.com/trufflesecurity/trufflehog/v3/pkg/output.(*PlainPrinter).Print
+     0.09s  0.12% 55.10%     11.64s 15.85%  github.com/trufflesecurity/trufflehog/v3/pkg/engine.(*Engine).detectChunk
+         0     0% 55.10%     11.64s 15.85%  github.com/trufflesecurity/trufflehog/v3/pkg/engine.(*Engine).detectorWorker
+         0     0% 55.10%     11.64s 15.85%  github.com/trufflesecurity/trufflehog/v3/pkg/engine.(*Engine).startDetectorWorkers.func1
+     0.13s  0.18% 55.28%      6.35s  8.65%  github.com/trufflesecurity/trufflehog/v3/pkg/detectors/mongodb.Scanner.FromData
+         0     0% 55.28%      6.24s  8.50%  github.com/trufflesecurity/trufflehog/v3/pkg/verificationcache.(*VerificationCache).FromData
+     0.06s 0.082% 55.36%      5.11s  6.96%  github.com/trufflesecurity/trufflehog/v3/pkg/engine.(*Engine).processResult
+     0.02s 0.027% 55.38%      3.78s  5.15%  os.(*File).Write
 ```
 
-**Interpretation (reconciled with Finding #8):** CPU is dominated by **linear RE2 matching + submatch extraction running in WASM** (`runtime._ExternalCode`, 57.25 % — confirmed via `-peek` to be reached through `go-re2/internal.(*lazyFunction).callWithStack` → `wazero … CallWithStack`). Output/finding‑flood is the second cost (~21 % cum). Per‑match `FromData` post‑processing is third (~8 %). **There is no catastrophic‑backtracking frame.**
+**Annotation key (derived — my labels for the verbatim frames above, *not* part of `pprof` output):**
 
-Two profiler facts settle the engine question directly:
+| Frame | flat / cum | What it is |
+|---|---|---|
+| `runtime._ExternalCode` | 54.15 % flat | RE2 executing inside the `wazero` WASM sandbox — **inferred**, see the `-peek` below |
+| `engine.(*Engine).notifierWorker` | 21.72 % cum | Output pipeline dispatching 1.41 M findings |
+| `output.(*PlainPrinter).Print` | 16.26 % cum | Formatting the finding‑flood |
+| `detectChunk` / detector workers | 15.85 % cum | The detection path (Aho prefilter + go‑re2 calls) |
+| `mongodb.Scanner.FromData` | 8.65 % cum | Per‑match `url.Parse` / result‑building |
+| `os.(*File).Write` | 5.15 % cum | Writing findings to stdout |
+| `bytes.Index` / `bytes.IndexByte` | 4.13 % / 2.61 % cum | Aho‑Corasick prefilter substring scans |
+| `regexp.(*Regexp).backtrack` | 1.77 % cum | Go stdlib **bounded** bit‑state executor (the 3 stdlib detectors) |
+| `wazevo.(*callEngine).callWithStack` | 1.44 % cum | Go→WASM boundary into RE2 |
+
+**Interpretation (reconciled with Finding #8):** CPU is dominated by **linear RE2 matching + submatch extraction running in WASM** (`runtime._ExternalCode`, 54.15 % flat). Output/finding‑flood is the second cost (`notifierWorker` ~21.7 % cum). Per‑match `FromData` post‑processing is third (~8.65 % cum). **There is no catastrophic‑backtracking frame.**
+
+**Why the RE2 attribution of `_ExternalCode` is an *inference*, and what grounds it (Finding #1).** `pprof` cannot see *inside* the WebAssembly sandbox: WASM execution surfaces as the opaque runtime leaf `runtime._ExternalCode`. The `-peek` below shows it is a **detached leaf** — its only caller is `runtime._System` and it has **zero callees** — so the profiler itself does **not** prove "this 54 % is RE2." That attribution is a **source/build‑backed inference**: the `CGO_ENABLED=0` build compiles `go-re2` to a WASM RE2 module run by `wazero` (§2, [go.mod:L100], [go.mod:L285]), and the *Go‑side* boundary is directly visible in the profile — `go-re2/internal.(*lazyFunction).callWithStack` (3.23 s cum) crosses into `wazero … callWithStack` immediately before control disappears into the sandbox. Raw `-peek` of the leaf and of that boundary, **verbatim**:
 
 ```
-=== is dlclark/regexp2 (backtracking engine) anywhere in the profile? ===
-NOT PRESENT — dlclark/regexp2 never executes (confirms it is unused)
-
-=== Go stdlib backtrack frames (the BOUNDED bit-state backtracker) ===
-     0.27s  0.35%  regexp.(*Regexp).tryBacktrack
-     0.21s  0.27%  regexp.(*Regexp).backtrack
-         0     0%  regexp.(*Regexp).doExecute
-         0     0%  regexp.(*Regexp).doMatch
+# go tool pprof -peek='runtime\._ExternalCode$'  (the WASM leaf — no callees)
+                                            39.77s   100% |   runtime._System
+    39.77s 54.15% 54.15%     39.77s 54.15%                | runtime._ExternalCode
 ```
 
-The backtracking engine `regexp2` is **absent** (never runs). The only `backtrack` frames are Go stdlib's **bounded bit‑state** backtracker at **~1.5 % cumulative** — reached via `doExecute → doMatch` (not a one‑pass path), bounded by construction, and still linear (§4.2).
-
-**Per‑match cost inside `mongodb.Scanner.FromData` (`pprof -list`, verbatim line attributions):**
-
 ```
-      10ms      2.44s     49:  for _, match := range connStrPat.FindAllStringSubmatch(dataStr, -1) {
-         .      1.47s     52:      if password == "" || placeholderPasswordPat.MatchString(password) {
-         .      710ms     58:      connUrl, err := url.Parse(connStr)
-         .      100ms     65:      for k, v := range connUrl.Query() {
-         .      520ms     79:      connStr = connUrl.String()
+# go tool pprof -peek='callWithStack'  (Go-side boundary: go-re2 -> wazero -> [WASM])
+     0.04s 0.054%  0.79%      3.23s  4.40%                | github.com/wasilibs/go-re2/internal.(*lazyFunction).callWithStack
+                                             1.15s 35.60% |   github.com/tetratelabs/wazero/internal/engine/wazevo.(*callEngine).CallWithStack
+                                             0.96s 29.72% |   github.com/wasilibs/go-re2/internal.getChildModule
+                                             0.95s 29.41% |   github.com/wasilibs/go-re2/internal.putChildModule
 ```
 
-Every one of these is **linear per match** — regex submatch extraction (L49), a placeholder check (L52), and URL parse/re‑encode (L58/L79) — confirming the amplification is match‑count‑proportional, never super‑linear.
+Two profiler facts then settle the engine question directly. First, the backtracking engine `dlclark/regexp2` is **absent** from the entire node list (confirmed by grepping all 154 nodes) — it never executes on the canonical scan path. Second, the *only* `backtrack` frames are Go stdlib's **bounded bit‑state** executor (from the 3 stdlib‑`regexp` detectors), at **1.77 % cumulative**. Raw `-peek`, **verbatim**:
+
+```
+# go tool pprof -peek='regexp\.\(\*Regexp\)\.(backtrack|tryBacktrack)'
+                                             0.90s   100% |   regexp.(*Regexp).backtrack
+     0.37s   0.5%   0.5%      0.90s  1.23%                | regexp.(*Regexp).tryBacktrack
+                                             0.27s 30.00% |   regexp.(*bitState).push (inline)
+                                             0.10s 11.11% |   regexp.lazyFlag.match
+                                             0.08s  8.89% |   regexp.(*inputBytes).context
+                                             0.05s  5.56% |   regexp.(*bitState).shouldVisit (inline)
+                                             0.03s  3.33% |   regexp.(*inputBytes).step
+----------------------------------------------------------+-------------
+                                             1.30s   100% |   regexp.(*Regexp).doExecute
+     0.24s  0.33%  0.83%      1.30s  1.77%                | regexp.(*Regexp).backtrack
+                                             0.90s 69.23% |   regexp.(*Regexp).tryBacktrack
+                                             0.16s 12.31% |   regexp.(*inputBytes).step
+```
+
+That `backtrack` is reached via `doExecute → backtrack → tryBacktrack → bitState.push/shouldVisit` — the standard library's **`bitState`** one‑pass executor, whose memory (and therefore work) is **capped by construction** (it falls back to the linear NFA when the bound is exceeded). It is **not** PCRE‑style catastrophic backtracking (§4.2).
+
+**Per‑match cost inside `mongodb.Scanner.FromData` (`go tool pprof -list`, verbatim line attributions from this same profile):**
+
+```
+     130ms      6.35s (flat, cum)  8.65% of Total
+      10ms       10ms     44:func (s Scanner) FromData(ctx context.Context, verify bool, data []byte) (results []detectors.Result, err error) {
+         .          .     48:	uniqueMatches := make(map[string]string)
+      10ms      2.54s     49:	for _, match := range connStrPat.FindAllStringSubmatch(dataStr, -1) {
+      60ms       60ms     51:		password := match[3]
+         .      1.69s     52:		if password == "" || placeholderPasswordPat.MatchString(password) {
+      30ms      100ms     57:		connStr := strings.Replace(strings.TrimSpace(match[1]), "&amp;", "&", -1)
+         .      640ms     58:		connUrl, err := url.Parse(connStr)
+      10ms      100ms     65:		for k, v := range connUrl.Query() {
+         .      420ms     79:		connStr = connUrl.String()
+         .      270ms     81:		uniqueMatches[connStr] = password
+      10ms       10ms     84:	for connStr, password := range uniqueMatches {
+```
+
+Every one of these is **linear per match** — regex submatch extraction (L49, 2.54 s), a placeholder check (L52, 1.69 s), URL parse/re‑encode (L58 640 ms / L79 420 ms) — confirming the amplification is match‑count‑proportional, never super‑linear. Note the two‑stage structure that grounds §6.2's de‑duplication mechanics: `url.Parse` (L58) runs on **every raw match**, and only *afterward* is the result written into the **local, per‑`FromData`‑call** `uniqueMatches` map (L48/L81) that the emit loop (L84) drains — so the map bounds *emitted findings per chunk*, never the parse cost.
 
 ### 7.6 Engine‑contrast benchmark — CORROBORATION (NON‑CANONICAL)
 
@@ -527,13 +672,18 @@ flowchart TD
     A[Crafted / benign file committed to repo] --> B[trufflehog filesystem: chunker 10 KiB + 3 KiB peek]
     B --> C{Aho-Corasick keyword prefilter}
     C -- No detector keyword --> Z[Chunk skipped: ~free, ~11 ms/MiB]
-    C -- Keyword present --> D[Detector regex via go-re2 RE2 in WASM, on a ±512/±1024 span]
-    D --> E{Matches found?}
+    C -- Keyword present --> D{Which engine compiled this detector's pattern?}
+    D -- "865 production detectors" --> D1[go-re2: RE2 in wazero WASM, on a ±512/±1024 span]
+    D -- "3 detectors: jdbc, azure_cosmosdb, azure_entra/spv2" --> D2[Go stdlib regexp: RE2-lineage, bounded bit-state]
+    D1 --> E{Matches found?}
+    D2 --> E
     E -- No matches --> F[Linear scan only: ~13 ms/MiB]
     E -- Many matches identical or unique --> G[Per-match url.Parse + result build; +format/write scales with EMITTED findings]
     G --> H[Linear in match count: ~0.375 s/MiB identical to ~0.66 s/MiB unique, bounded]
-    D -. RE2 is non-backtracking .-> I[No exponential blow-up: ReDoS impossible]
-    D --> J[context.WithTimeout 10s / 2s: cooperative defense-in-depth]
+    D1 -. RE2 is non-backtracking .-> I[No exponential blow-up: ReDoS impossible]
+    D2 -. bounded bit-state, also linear .-> I
+    D1 --> J[context.WithTimeout 10s / 2s: cooperative defense-in-depth]
+    D2 --> J
 ```
 
 ---
@@ -636,44 +786,105 @@ func main() {
 ```
 
 ```
-# workspace so the helper compiles against the local checkout without editing it
-$ mkdir -p /tmp/redos_lab/kwcheck
-$ printf 'go 1.24.2\nuse (\n  %s\n  ./kwcheck\n  ./enginetest\n)\n' \
+# Workspace so BOTH out-of-tree helpers compile against the local checkout without
+# editing it. IMPORTANT: go.work `use`s ./enginetest (its main.go is added in §9.4),
+# so its go.mod must exist *now* — otherwise `go build` fails with
+# "directory ./enginetest ... does not contain a module".
+$ mkdir -p /tmp/redos_lab/kwcheck /tmp/redos_lab/enginetest
+$ printf 'go 1.24.2\n\nuse (\n\t%s\n\t./kwcheck\n\t./enginetest\n)\n' \
     /tmp/blitzy/trufflehog/blitzy-5f362aa7-e21b-49ac-9b19-ada176a8c834_04c077 > /tmp/redos_lab/go.work
-$ ( cd /tmp/redos_lab/kwcheck && printf 'module redoslab/kwcheck\n\ngo 1.24.2\n\nrequire github.com/trufflesecurity/trufflehog/v3 v3.90.0\n' > go.mod )
-$ cd /tmp/redos_lab/kwcheck && GOWORK=/tmp/redos_lab/go.work CGO_ENABLED=0 go build -o /tmp/redos_lab/kwcheck_bin .
-$ /tmp/redos_lab/kwcheck_bin inputs/baseline_miss.txt      # -> PREFILTER MISS (0 hits)
+# kwcheck module (the workspace resolves the trufflehog import to the local checkout):
+$ printf 'module redoslab/kwcheck\n\ngo 1.24.2\n\nrequire github.com/trufflesecurity/trufflehog/v3 v3.90.0\n' \
+    > /tmp/redos_lab/kwcheck/go.mod
+# enginetest module (REQUIRED so `use ./enginetest` resolves; main.go added in §9.4):
+$ printf 'module redoslab/enginetest\n\ngo 1.24.2\n\nrequire (\n\tgithub.com/dlclark/regexp2 v1.4.0\n\tgithub.com/wasilibs/go-re2 v1.9.0\n)\n' \
+    > /tmp/redos_lab/enginetest/go.mod
+# Build kwcheck. GOPROXY=off => offline, cache-only (deps are already in the module
+# cache); do NOT pass -mod=mod, which is rejected in workspace mode.
+$ cd /tmp/redos_lab/kwcheck && GOWORK=/tmp/redos_lab/go.work GOPROXY=off CGO_ENABLED=0 \
+    go build -o /tmp/redos_lab/kwcheck_bin .
+build exit=0
+$ /tmp/redos_lab/kwcheck_bin --list-keywords | head -1
+total_detectors=831 total_unique_keywords=914
+# (after §9.3 has generated inputs) prove the keyword-free control is a prefilter MISS:
+$ /tmp/redos_lab/kwcheck_bin /tmp/redos_lab/inputs/baseline_miss.txt
+RESULT: PREFILTER MISS - zero detectors triggered; no detector regex would run on this file.
 ```
 
 ### 9.3 Generate inputs & run the canonical scans
 
-The generator (`/tmp/redos_lab/gen_inputs.py`) tiles per‑detector "evil units" sized to the **real** default span window; `/tmp/redos_lab/gen_unique_match.py` builds the unique‑match finding‑flood file. Key unit definitions (verbatim):
+The single generator (`/tmp/redos_lab/gen_inputs.py`) writes all 11 inputs at an **exact** byte size: it tiles each per-detector "evil unit" (sized to the **real** default span window) and pads the remainder with benign keyword-free `z` filler, then writes the unique-match finding-flood file via `write_unique()`. Complete, runnable source (no undefined names — the earlier draft's stray `line = … % (i, i, i)` is shown below inside its proper loop):
 
 ```python
-# baseline_miss: 64-byte lines of 'z' (verified keyword-free)
-baseline_unit = b"z"*63 + b"\n"
-# kw_nomatch: keyword present, guaranteed no full match
-kw_nomatch_unit = b"mongodb https:// " + b"z"*47 + b"\n"
-# mongodb nested-star host (fits +/-512 span) -> MATCHES (successful-match stress)
-mongo_unit = b"mongodb://usr:abcdefabc@h" + b",a"*480 + b"/\n"
-# uri no trailing '@' (guaranteed NON-match near-miss)
-uri_noat_unit = b"https://" + b"a"*50 + b":" + b"b"*900 + b"\n"
-# databricks domain nested-star (fits +/-1024 span), bad TLD -> NON-match
-db_unit = b"dapi " + b"a" + b".a"*980 + b".invalidtld\n"
-# azuresas path nested-star (fits +/-1024 span) -> MATCHES
-az_unit = b"https://abcstorage.blob.core.windows.net/c" + b"/a"*980 + b"\n"
-# match_dense: ONE 64-byte VALID mongodb URI repeated 131,072 times -> exactly 8 MiB
-#   -> 820 emitted findings (per-chunk dedup) but ~131,072 raw matches, each a url.Parse
-match_dense_unit = b"mongodb://user0000:pass0000pw@host0000000000.example.net/dddddd\n"  # 64 bytes
-# unique synthetic mongodb URIs (defeat LRU dedup) -> finding-flood
-line = "mongodb://u%08d:p%08dpw@host%08d.example/\n" % (i, i, i)
+#!/usr/bin/env python3
+"""Generate exact-byte-size adversarial/benign inputs for the TruffleHog ReDoS lab.
+
+Usage: python3 gen_inputs.py <size_bytes> <out_dir>
+Every file is written to EXACTLY <size_bytes> bytes (tile the unit line, then pad
+the remainder with benign keyword-free 'z' filler). All content is synthetic.
+"""
+import os
+import sys
+
+def write_exact(path, unit, size):
+    """Tile `unit`, then pad with benign 'z' to hit EXACTLY `size` bytes."""
+    body = unit * (size // len(unit))
+    body += b"z" * (size - len(body))
+    assert len(body) == size, (len(body), size)
+    with open(path, "wb") as f:
+        f.write(body)
+
+def write_unique(path, size):
+    """Unique valid MongoDB URIs (distinct user/host counter) -> finding flood."""
+    buf = bytearray()
+    i = 0
+    while len(buf) < size:
+        line = ("mongodb://u%08d:p%08dpw@host%08d.example/\n" % (i, i, i)).encode()
+        buf += line
+        i += 1
+    del buf[size:]              # exact truncate (last line partial -> no match)
+    with open(path, "wb") as f:
+        f.write(buf)
+
+def main():
+    size = int(sys.argv[1]); out = sys.argv[2]
+    os.makedirs(out, exist_ok=True)
+    baseline_unit       = b"z" * 63 + b"\n"                                              # keyword-free control
+    kw_nomatch_unit     = b"mongodb https:// " + b"z" * 47 + b"\n"                        # keyword hit, no full match
+    match_dense_unit    = b"mongodb://user0000:pass0000pw@host0000000000.example.net/dddddd\n"  # 1 valid URI, repeated
+    dense_uri_unit      = b"https://u:pw3456@h.example.com/" + b"a" * 32 + b"\n"          # valid https URIs (dense)
+    mongo_host_unit     = b"mongodb://usr:abcdefabc@h" + b",a" * 480 + b"/\n"             # nested-star host (fits +/-512)
+    uri_noat_unit       = b"https://" + b"a" * 50 + b":" + b"b" * 900 + b"\n"             # no trailing '@' (near-miss)
+    mongo_userpass_unit = b"mongodb://" + b"a:" * 500 + b"\n"                             # user:pass spam (no '@')
+    uri_atspam_unit     = b"https://" + b"a:@" * 900 + b"\n"                              # '@' spam
+    databricks_unit     = b"dapi " + b"a" + b".a" * 980 + b".invalidtld\n"               # domain nested-star, bad TLD
+    azuresas_unit       = b"https://abcstorage.blob.core.windows.net/c" + b"/a" * 980 + b"\n"  # path nested-star
+    files = {
+        "baseline_miss": baseline_unit,          "kw_nomatch": kw_nomatch_unit,
+        "match_dense": match_dense_unit,          "dense_uri": dense_uri_unit,
+        "patho_mongodb_host": mongo_host_unit,    "patho_uri_noat": uri_noat_unit,
+        "patho_mongodb_userpass": mongo_userpass_unit, "patho_uri_atspam": uri_atspam_unit,
+        "patho_databricks": databricks_unit,      "patho_azuresas": azuresas_unit,
+    }
+    for name, unit in files.items():
+        write_exact(os.path.join(out, name + ".txt"), unit, size)
+    write_unique(os.path.join(out, "match_unique.txt"), size)
+    print("wrote %d inputs of exactly %d bytes to %s" % (len(files) + 1, size, out))
+
+if __name__ == "__main__":
+    main()
 ```
 
 ```
 # 8 MiB inputs, then scan each (3 runs) through the canonical entry point:
 $ python3 /tmp/redos_lab/gen_inputs.py $((8*1024*1024)) /tmp/redos_lab/inputs
-$ for f in baseline_miss kw_nomatch match_dense patho_mongodb_host patho_mongodb_userpass \
-           patho_uri_noat patho_uri_atspam patho_databricks patho_azuresas; do
+wrote 11 inputs of exactly 8388608 bytes to /tmp/redos_lab/inputs
+# exact-byte validation (all inputs identical in size => valid same-size controls):
+$ for f in /tmp/redos_lab/inputs/*.txt; do wc -c "$f"; done | awk '{print $1}' | sort -u
+8388608
+$ for f in baseline_miss kw_nomatch match_dense dense_uri match_unique \
+           patho_mongodb_host patho_mongodb_userpass patho_uri_noat \
+           patho_uri_atspam patho_databricks patho_azuresas; do
     mkdir -p /tmp/redos_lab/scandirs/$f && cp /tmp/redos_lab/inputs/$f.txt /tmp/redos_lab/scandirs/$f/
     for r in 1 2 3; do
       /tmp/trufflehog filesystem /tmp/redos_lab/scandirs/$f --no-verification --no-update 2>&1 \
@@ -686,7 +897,7 @@ $ for f in baseline_miss kw_nomatch match_dense patho_mongodb_host patho_mongodb
 
 ### 9.4 Engine‑contrast harness (corroboration)
 
-Full source at `/tmp/redos_lab/enginetest/main.go` (built via the same `go.work`):
+Full source at `/tmp/redos_lab/enginetest/main.go` (save the block below to that path; its `go.mod` was already created in §9.2, and it is built via the same `go.work`):
 
 ```go
 package main
@@ -712,7 +923,9 @@ func main() {
 ```
 
 ```
-$ cd /tmp/redos_lab/enginetest && GOWORK=/tmp/redos_lab/go.work CGO_ENABLED=0 go build -o /tmp/redos_lab/enginetest_bin .
+$ cd /tmp/redos_lab/enginetest && GOWORK=/tmp/redos_lab/go.work GOPROXY=off CGO_ENABLED=0 \
+    go build -o /tmp/redos_lab/enginetest_bin .
+build exit=0
 $ /tmp/redos_lab/enginetest_bin        # (run 3x; output in §7.6)
 ```
 
@@ -721,6 +934,12 @@ $ /tmp/redos_lab/enginetest_bin        # (run 3x; output in §7.6)
 `--profile` starts an **unauthenticated** pprof/fgprof server on `:18066` ([main.go:L53]; server bound at [main.go:L433]–[main.go:L434]) — it should only be used on an **isolated host/loopback**, never exposed. The capture script polls readiness, captures only the spawned PID, bounds the profile window, waits for natural exit, and targets only that PID (never `pkill`/`killall`):
 
 ```bash
+# $DIR must point at an input large enough that the scan outlives the 20 s profile
+# window. A ~56 MiB unique-match file scans in ~32 s on this host:
+$ python3 /tmp/redos_lab/gen_inputs.py $((56*1024*1024)) /tmp/redos_lab/inputs56
+$ mkdir -p /tmp/redos_lab/scandirs/prof56
+$ cp /tmp/redos_lab/inputs56/match_unique.txt /tmp/redos_lab/scandirs/prof56/
+$ DIR=/tmp/redos_lab/scandirs/prof56                   # <-- define $DIR (was undefined)
 $ /tmp/trufflehog filesystem "$DIR" --no-verification --no-update --profile > scan.log 2>&1 &
 $ THPID=$!                                             # capture ONLY our PID
 $ for n in $(seq 1 50); do                             # readiness poll on loopback (max ~10s)
@@ -747,7 +966,7 @@ $ git status --porcelain | grep -v 'blitzy/documentation/' | wc -l
 0
 ```
 
-No `.go`, `go.mod`, `go.sum`, `Dockerfile`, CI, or any other source file is created, modified, or deleted — the sole change is this Markdown document.
+The ` M` line above is the *mid‑investigation* working‑tree snapshot — the answer document has been written but not yet committed — and it is the **only** entry; the `grep -v … | wc -l` guard proves **zero** other paths differ. After this document is committed (the final step of the deliverable), `git status --porcelain` is empty and the tree is clean. Either way, no `.go`, `go.mod`, `go.sum`, `Dockerfile`, CI, or any other source file is created, modified, or deleted — the sole change is this Markdown document.
 
 
 ---
