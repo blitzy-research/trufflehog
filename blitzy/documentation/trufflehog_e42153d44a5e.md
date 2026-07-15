@@ -573,30 +573,42 @@ Every distinct sub-question and every named item (including the user's `169.254.
 
 ## Appendix — lab harness (for independent reproduction)
 
-All artifacts below lived **outside** the repository checkout, under `/tmp/lab`, and were deleted after the investigation; the source tree was left byte-for-byte unchanged (verified with `git status --porcelain` returning empty). The binary was built outside the checkout with `CGO_ENABLED=0 go build -o /tmp/lab/th .` (Go 1.24.2). Mock servers bind **loopback only** (or, for the RFC1918 test, the container's own private address); ports are parameterized by `CLONE_INDEX` (`PORT_BASE = 18100 + CLONE_INDEX*200`) so parallel agents never collide; each writes a **readiness sentinel** after `bind()`, uses a large listen backlog (`request_queue_size = 1024`) so the harness never masquerades as product behavior, caps request bodies at 1 MiB, and is torn down by an **owned-PID `EXIT`/`INT`/`TERM` trap** (no broad `pkill`).
+All artifacts below lived **outside** the repository checkout, under `/tmp/lab`, and were deleted after the investigation; the source tree was left byte-for-byte unchanged (verified with `git status --porcelain` returning empty). The binary was built outside the checkout with `CGO_ENABLED=0 go build -o /tmp/lab/th .` (Go 1.24.2). Mock servers bind **loopback only** (or, for the RFC1918 test, the container's own private address); ports are parameterized by `CLONE_INDEX` (`PORT_BASE = 18100 + CLONE_INDEX*200`) so parallel agents never collide; each writes a **readiness sentinel** after `bind()`. The two concurrency-sensitive mocks (`mock_http.py`, `mock_https.py`) use a large listen backlog (`request_queue_size = 1024`) so the harness never masquerades as product behavior during multiplicity counting, while the single-preflight `fake_imds.py` uses a smaller backlog (`request_queue_size = 128`); each caps request bodies at 1 MiB and is torn down by an **owned-PID `EXIT`/`INT`/`TERM` trap** (no broad `pkill`).
 
 **`lib.sh`** — shared helpers (owned-PID teardown trap, `CLONE_INDEX` ports, readiness wait):
 
 ```bash
 #!/usr/bin/env bash
 # Shared safe-harness helpers. Mocks bind loopback (or the container's own
-# private IP for the RFC1918 test). Every spawned PID is tracked and killed by
-# an EXIT trap. Ports are parameterised by CLONE_INDEX. Backgrounded mocks
-# redirect stdout/stderr to a file so they never hold a command-substitution
-# pipe open.
+# private IP for the RFC1918 test). Every spawned PID is recorded in a durable
+# per-PID file under "$PID_DIR", so the parent shell's EXIT/INT/TERM trap reaps
+# it even when a start_* helper is invoked via command substitution
+# (pid=$(start_http ...)) — a case where a plain shell-array append would be
+# lost inside the $(...) subshell and leave the parent with nothing to kill.
+# Ports are parameterised by CLONE_INDEX. Backgrounded mocks redirect
+# stdout/stderr to a file so they never hold a command-substitution pipe open.
 set -u
 LAB=/tmp/lab
 TH=/tmp/lab/th
 PORT_BASE=$(( 18100 + ( ${CLONE_INDEX:-0} * 200 ) ))
-OWNED_PIDS=()
+PID_DIR="$LAB/pids"; mkdir -p "$PID_DIR"
+
+_track_pid() {  # record a spawned PID durably (survives a $(...) subshell)
+  echo "$1" > "$PID_DIR/$1.pid"
+}
 
 _cleanup() {
-  local pid
-  for pid in "${OWNED_PIDS[@]:-}"; do
+  local f pid
+  for f in "$PID_DIR"/*.pid; do
+    [ -e "$f" ] || continue
+    pid=$(cat "$f" 2>/dev/null) || continue
     [ -n "${pid:-}" ] && kill "$pid" 2>/dev/null || true
   done
-  for pid in "${OWNED_PIDS[@]:-}"; do
+  for f in "$PID_DIR"/*.pid; do
+    [ -e "$f" ] || continue
+    pid=$(cat "$f" 2>/dev/null) || continue
     [ -n "${pid:-}" ] && wait "$pid" 2>/dev/null || true
+    rm -f "$f"
   done
 }
 trap _cleanup EXIT INT TERM
@@ -615,7 +627,7 @@ start_http() {  # start_http HOST PORT LOG READY [STATUS] [BODYLEN] -> prints PI
   : > "$log"; rm -f "$ready"
   python3 "$LAB/mock_http.py" "$host" "$port" "$log" "$ready" "$status" "$bodylen" \
       >"$log.err" 2>&1 </dev/null &
-  local pid=$!; OWNED_PIDS+=("$pid")
+  local pid=$!; _track_pid "$pid"
   wait_ready "$ready" || return 1
   echo "$pid"
 }
@@ -625,12 +637,12 @@ start_https() {  # start_https HOST PORT LOG READY COUNTER CERT KEY [STATUS] -> 
   : > "$log"; rm -f "$ready" "$counter"
   python3 "$LAB/mock_https.py" "$host" "$port" "$log" "$ready" "$counter" "$cert" "$key" "$status" \
       >"$log.err" 2>&1 </dev/null &
-  local pid=$!; OWNED_PIDS+=("$pid")
+  local pid=$!; _track_pid "$pid"
   wait_ready "$ready" || return 1
   echo "$pid"
 }
 
-stop_pid() { kill "$1" 2>/dev/null || true; wait "$1" 2>/dev/null || true; }
+stop_pid() { kill "$1" 2>/dev/null || true; wait "$1" 2>/dev/null || true; rm -f "$PID_DIR/$1.pid" 2>/dev/null || true; }
 ```
 
 **`mock_http.py`** — threaded plaintext mock (records method/path/headers/body; configurable status + body length):
@@ -820,7 +832,7 @@ FAKE = (b'{"Code":"Success","Type":"AWS-HMAC",'
         b'"AccessKeyId":"FAKE-SYNTHETIC-LAB-ONLY-AKIA0000",'
         b'"SecretAccessKey":"FAKE-SYNTHETIC-LAB-ONLY-DO-NOT-USE-000000000000",'
         b'"Token":"FAKE-SYNTHETIC-SESSION-TOKEN-LAB-ONLY-abcdefghijklmnopqrstuvwxyz",'
-        b'"Expiration":"2099-01-01T00:00:00Z"}')  # 286 bytes, all synthetic
+        b'"Expiration":"2099-01-01T00:00:00Z"}')  # 264 bytes, all synthetic
 class H(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     def _h(self):
